@@ -1,0 +1,121 @@
+# =============================================================================
+# Claude Code 适配器清单（内置参考实现）
+#
+# 本文件是声明式清单的「唯一范本」：后续给其他 agent 写清单时,以这里的
+# 字段、词汇表和注释为准,不要另行发明字段。
+#
+# ── 顶层结构 ─────────────────────────────────────────────────────────────
+#   [agent]        agent 身份:id(稳定标识,小写字母/数字/连字符)+ display_name
+#   [probe]        安装探测:路径存在性 + 可选二进制名 + 可选版本命令
+#   [[resource]]   资源声明,每类资源一节,可重复
+#
+# ── [probe] 词汇表 ───────────────────────────────────────────────────────
+#   any_of      = ["~/x", ...]   任一路径存在即视为已安装
+#   all_of      = ["~/x", ...]   全部路径存在才视为已安装(与 any_of 可并用,均满足)
+#   binary      = "claude"       可选:PATH 里应能找到的二进制名
+#   version_cmd = ["claude", "--version"]
+#                                可选:取版本号的命令(argv 形式)。M0 只存不执行。
+#   至少要声明 any_of / all_of / binary 之一,否则清单无从探测。
+#
+# ── [[resource]] 词汇表 ──────────────────────────────────────────────────
+#   kind         = mcp | skill | memory | session | artifact
+#   scope        = global | project     (M0 内置清单只用 global;
+#                                        项目级资源如 ./CLAUDE.md 暂不入清单)
+#   path         = "~/..."              文件或目录。一律以 `~` 开头的字符串,
+#                                       清单层不做展开,由运行时解析。
+#   json_pointer = "/mcpServers"        可选:JSON 文件内定位(RFC 6901)
+#   toml_key     = "mcp_servers"        可选:TOML 文件内定位(点路径),
+#                                       与 json_pointer 互斥
+#   mapper       = 见下方封闭词汇表     格式树 <-> UARM 的映射器
+#   glob         = "*/SKILL.md"         可选:目录型资源的条目匹配模式
+#   clean_level  = l0 | l1 | l2 | l4    可选,仅 artifact 资源:
+#                                       l0 随删随生(缓存) … l4 不可再生(数据)
+#
+# ── mapper 封闭词汇表(清单里只能写这七个)──────────────────────────────
+#   mcp/standard-json      标准 JSON mcpServers 映射(Claude Code / 多数 agent)
+#   mcp/codex-toml         Codex config.toml 的 mcp_servers 表
+#   skill/frontmatter-md   SKILL.md YAML frontmatter(name/description)
+#   memory/markdown        Markdown 记忆文件(CLAUDE.md / AGENTS.md 等)
+#   native/claude-session  Claude Code JSONL 会话(原生适配器逃生舱)
+#   native/codex-session   Codex JSONL 会话(原生适配器逃生舱)
+#   stats-only             不解析内容,只做体积/数量统计(artifact、配置文件)
+# =============================================================================
+
+[agent]
+id = "claude-code"
+display_name = "Claude Code"
+
+[probe]
+# ~/.claude(数据目录)或 ~/.claude.json(全局配置)任一存在即认为已安装。
+any_of = ["~/.claude", "~/.claude.json"]
+binary = "claude"
+# M0 只存不执行;后续 probe 阶段用它取版本号。
+version_cmd = ["claude", "--version"]
+
+# ── MCP:全局 MCP 服务器注册在 ~/.claude.json 的 /mcpServers 下 ──────────
+[[resource]]
+kind = "mcp"
+scope = "global"
+path = "~/.claude.json"
+json_pointer = "/mcpServers"
+mapper = "mcp/standard-json"
+
+# ── Skill:每个技能一个目录,目录下 SKILL.md 是元数据载体 ────────────────
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.claude/skills"
+glob = "*/SKILL.md"
+mapper = "skill/frontmatter-md"
+
+# ── Memory:全局记忆 ~/.claude/CLAUDE.md ─────────────────────────────────
+# 注意:项目级 CLAUDE.md 属 project scope,由项目扫描发现,暂不入清单。
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.claude/CLAUDE.md"
+mapper = "memory/markdown"
+
+# ── Memory:全局设置 ~/.claude/settings.json(hooks/权限等,只统计不解析)──
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.claude/settings.json"
+mapper = "stats-only"
+
+# ── Session:JSONL 会话库,按项目分目录 ──────────────────────────────────
+[[resource]]
+kind = "session"
+scope = "global"
+path = "~/.claude/projects"
+glob = "*/*.jsonl"
+mapper = "native/claude-session"
+
+# ── Artifact:可清理产物,clean_level 标注再生成本 ───────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.claude/plugins"
+mapper = "stats-only"
+clean_level = "l2"   # 删了要重新安装插件,有代价
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.claude/cache"
+mapper = "stats-only"
+clean_level = "l1"   # 纯缓存,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.claude/paste-cache"
+mapper = "stats-only"
+clean_level = "l1"   # 粘贴缓存,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.claude/shell-snapshots"
+mapper = "stats-only"
+clean_level = "l1"   # shell 环境快照,下次启动重建

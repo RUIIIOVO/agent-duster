@@ -278,6 +278,8 @@ dependencies = [
  "anyhow",
  "clap",
  "duster-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

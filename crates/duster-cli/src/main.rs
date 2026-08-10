@@ -2,6 +2,8 @@
 
 use clap::{Parser, Subcommand};
 
+mod output;
+
 #[derive(Parser)]
 #[command(name = "duster", version, about = "AI Agent 的资源管理器")]
 struct Cli {
