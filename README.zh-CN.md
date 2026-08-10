@@ -89,7 +89,7 @@ duster clean --level L0,L1 --dry-run
 
 ## 支持的 Agent
 
-Claude Code · Codex · oh-my-pi (omp) · Gemini CLI · Cursor · GitHub Copilot CLI · Kimi CLI · OpenCode · Qoder · 通用 MCP 客户端（VS Code / Windsurf / Cline）
+Claude Code · Codex · oh-my-pi (omp) · Gemini CLI · Cursor · GitHub Copilot CLI · Kimi CLI · OpenCode · Qoder · 通用 MCP 客户端（VS Code / Windsurf / Cline，*规划中*）
 
 新增一个 agent 通常只需要**一个声明式 TOML 清单——不写代码、不重新编译**。
 

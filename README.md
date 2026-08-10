@@ -89,7 +89,7 @@ Global flags: `--dry-run` (default for destructive ops) · `--yes` · `--json` �
 
 ## Supported Agents
 
-Claude Code · Codex · oh-my-pi (omp) · Gemini CLI · Cursor · GitHub Copilot CLI · Kimi CLI · OpenCode · Qoder · generic MCP clients (VS Code / Windsurf / Cline)
+Claude Code · Codex · oh-my-pi (omp) · Gemini CLI · Cursor · GitHub Copilot CLI · Kimi CLI · OpenCode · Qoder · generic MCP clients (VS Code / Windsurf / Cline, *planned*)
 
 Adding a new agent usually takes **one declarative TOML manifest — no code, no recompile**.
 
