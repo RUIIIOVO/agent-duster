@@ -4,8 +4,10 @@
 //! - [`walk_stats`]：聚合整棵树的字节数与文件数，并给出一级子目录的聚合体积；
 //! - [`walk_files`]：逐文件回调，供上层（指纹、索引）消费。
 //!
-//! 体积一律按 `symlink_metadata().len()` 累计：不跟随符号链接，链接本身
-//! 按自身大小计，天然无环。
+//! 体积一律按 `symlink_metadata().len()` 累计：树内不跟随符号链接，链接本身
+//! 按自身大小计，天然无环。**根路径本身是指向目录的符号链接时例外**：解析到
+//! 真实目录再遍历（符号链接安装的 skill 是合法形态），环风险由上层的
+//! 路径所有权白名单兜底。
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -42,14 +44,24 @@ type StatsWalk = WalkDirGeneric<((), Option<u64>)>;
 /// 带每条目元数据的逐文件遍历器。
 type FilesWalk = WalkDirGeneric<((), Option<Metadata>)>;
 
-/// 校验根路径存在且为目录。
-fn ensure_dir_root(root: &Path) -> anyhow::Result<()> {
+/// 校验根路径并解析:普通目录原样返回;指向目录的符号链接解析为真实路径;
+/// 其余(文件、断链)报错。
+fn resolve_dir_root(root: &Path) -> anyhow::Result<PathBuf> {
     let meta = std::fs::symlink_metadata(root)
         .with_context(|| format!("无法读取根路径: {}", root.display()))?;
-    if !meta.is_dir() {
-        bail!("根路径不是目录: {}", root.display());
+    if meta.is_dir() {
+        return Ok(root.to_path_buf());
     }
-    Ok(())
+    if meta.is_symlink() {
+        let target = std::fs::metadata(root)
+            .with_context(|| format!("根路径是断开的符号链接: {}", root.display()))?;
+        if target.is_dir() {
+            return root
+                .canonicalize()
+                .with_context(|| format!("无法解析符号链接根: {}", root.display()));
+        }
+    }
+    bail!("根路径不是目录: {}", root.display());
 }
 
 /// 并行统计 `root` 子树：总字节数、文件数、一级子目录聚合体积（降序）。
@@ -58,7 +70,7 @@ fn ensure_dir_root(root: &Path) -> anyhow::Result<()> {
 /// prune 只影响 [`walk_files`] 的逐文件上报。遍历中单条读取失败
 /// （权限不足等）跳过该条目，不中断整体统计。
 pub fn walk_stats(root: &Path, opts: &WalkOptions) -> anyhow::Result<DirStats> {
-    ensure_dir_root(root)?;
+    let root = &resolve_dir_root(root)?;
     // follow_links 恒 false、prune 不改变聚合值，opts 在此无额外分支。
     let _ = opts;
 
@@ -123,7 +135,7 @@ pub fn walk_files(
     opts: &WalkOptions,
     mut f: impl FnMut(&Path, &Metadata),
 ) -> anyhow::Result<()> {
-    ensure_dir_root(root)?;
+    let root = &resolve_dir_root(root)?;
     let prune: Vec<OsString> = opts.prune_dirs.iter().map(OsString::from).collect();
 
     let walker = FilesWalk::new(root)
@@ -253,5 +265,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-dir");
         assert!(walk_stats(&missing, &WalkOptions::default()).is_err());
+    }
+
+    #[test]
+    fn walk_stats_follows_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-skill");
+        fs::create_dir_all(&real).unwrap();
+        write(&real.join("SKILL.md"), 300);
+        let link = tmp.path().join("linked-skill");
+        symlink(&real, &link).unwrap();
+
+        // 根是指向目录的符号链接:解析后正常统计(符号链接安装的 skill)。
+        let stats = walk_stats(&link, &WalkOptions::default()).unwrap();
+        assert_eq!(stats.total_bytes, 300);
+        assert_eq!(stats.file_count, 1);
+
+        // 断链依旧报错。
+        let broken = tmp.path().join("broken");
+        symlink(tmp.path().join("gone"), &broken).unwrap();
+        assert!(walk_stats(&broken, &WalkOptions::default()).is_err());
     }
 }
