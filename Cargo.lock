@@ -313,6 +313,7 @@ dependencies = [
  "duster-model",
  "rusqlite",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

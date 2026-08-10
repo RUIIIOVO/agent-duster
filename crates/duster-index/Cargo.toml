@@ -9,6 +9,7 @@ license.workspace = true
 duster-model = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

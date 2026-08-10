@@ -1,0 +1,14 @@
+{"timestamp":"2026-08-01T12:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000002","timestamp":"2026-08-01T12:00:00.000Z","cwd":"/Users/tester/projects/demo","originator":"codex_exec","cli_version":"0.146.0","instructions":null}}
+{"timestamp":"2026-08-01T12:00:00.100Z","type":"turn_context","payload":{"cwd":"/Users/tester/projects/demo","approval_policy":"never","sandbox_policy":{"mode":"danger-full-access"},"model":"gpt-placeholder","summary":"auto"}}
+{"timestamp":"2026-08-01T12:00:00.200Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"lorem developer instructions placeholder"}]}}
+{"timestamp":"2026-08-01T12:00:00.300Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>lorem 占位说明</user_instructions>"}]}}
+{"timestamp":"2026-08-01T12:00:00.400Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/Users/tester/projects/demo</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-08-01T12:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"请修复构建脚本"}]}}
+{"timestamp":"2026-08-01T12:00:02.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"lorem reasoning placeholder"}],"content":null,"encrypted_content":"UkVEQUNURUQ="}}
+{"timestamp":"2026-08-01T12:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"echo lorem\"]}","call_id":"call_placeholder_1"}}
+{"timestamp":"2026-08-01T12:00:03.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_placeholder_1","output":"{\"output\":\"lorem\",\"metadata\":{\"exit_code\":0}}"}}
+{"timestamp":"2026-08-01T12:00:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1}}}}
+this line is intentionally broken to prove bad lines are skipped
+{"timestamp":"2026-08-01T12:00:05.250Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"已修复,lorem ipsum。"}]}}
+{"timestamp":"2026-08-01T12:00:05.300Z","type":"event_msg","payload":{"type":"agent_message","message":"已修复,lorem ipsum。"}}
+{"timestamp":"2026-08-01T12:00:05.400Z","type":"compacted","payload":{"message":"lorem compaction placeholder"}}
