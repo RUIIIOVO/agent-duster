@@ -1,0 +1,38 @@
+# =============================================================================
+# Pi 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
+# ~/.pi 下只有 agent/ 子目录。会话格式未证实,一律只统计。
+# 刻意不声明 ~/.pi/agent/auth.json:凭据文件,连统计都不碰。
+# =============================================================================
+
+[agent]
+id = "pi"
+display_name = "Pi"
+
+[probe]
+# ~/.pi 数据目录存在即视为已安装。
+any_of = ["~/.pi"]
+binary = "pi"
+# M0 只存不执行。
+version_cmd = ["pi", "--version"]
+
+# ── Session:按项目路径分目录,内部格式未证实,只统计 ─────────────────────
+[[resource]]
+kind = "session"
+scope = "global"
+path = "~/.pi/agent/sessions"
+mapper = "stats-only"
+
+# ── Memory:全局设置(只统计不解析)──────────────────────────────────────
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.pi/agent/settings.json"
+mapper = "stats-only"
+
+# ── Artifact:随附工具二进制(fd/rg 等,可重新下载)───────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.pi/agent/bin"
+mapper = "stats-only"
+clean_level = "l1"   # 辅助工具,自动重新下载

@@ -1,0 +1,44 @@
+# =============================================================================
+# CC Switch 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
+# 桌面切换器应用,无 CLI 二进制,probe 只看目录。
+# =============================================================================
+
+[agent]
+id = "cc-switch"
+display_name = "CC Switch"
+
+[probe]
+# ~/.cc-switch 数据目录存在即视为已安装。
+any_of = ["~/.cc-switch"]
+
+# ── Skill:托管技能库,每技能一个子目录,SKILL.md 承载元数据 ──────────────
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.cc-switch/skills"
+glob = "*/SKILL.md"
+mapper = "skill/frontmatter-md"
+
+# ── Artifact:主数据库(供应商配置等,删了丢配置)─────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.cc-switch/cc-switch.db"
+mapper = "stats-only"
+clean_level = "l4"   # 应用主数据,不可再生
+
+# ── Artifact:数据库自动备份(可从主库再备份)────────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.cc-switch/backups"
+mapper = "stats-only"
+clean_level = "l1"   # 自动备份,主库在即可重建
+
+# ── Artifact:日志目录 ───────────────────────────────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.cc-switch/logs"
+mapper = "stats-only"
+clean_level = "l1"   # 日志,自动重建

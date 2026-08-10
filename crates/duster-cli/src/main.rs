@@ -171,12 +171,13 @@ fn render_scan_human(report: &ScanReport, warnings: &[String]) {
     println!("{}", table.render());
 
     if !report.unclassified.is_empty() {
-        let mut t = Table::new(vec!["未认领目录", "体积"]);
+        let mut t = Table::new(vec!["待适配目录", "体积"]);
         for u in &report.unclassified {
             t.push_row(vec![u.path.clone(), human_bytes(u.bytes)]);
         }
         println!();
         println!("{}", t.render());
+        println!("(以上目录尚无适配器,仅统计体积,未纳入资源管理)");
     }
 
     println!();

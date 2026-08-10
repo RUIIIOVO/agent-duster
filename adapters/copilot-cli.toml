@@ -1,0 +1,23 @@
+# =============================================================================
+# GitHub Copilot CLI 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
+# 无 mcp 节:本机 ~/.copilot/config.json 无 mcpServers 键,MCP 配置位置未证实。
+# =============================================================================
+
+[agent]
+id = "copilot-cli"
+display_name = "GitHub Copilot CLI"
+
+[probe]
+# ~/.copilot 数据目录存在即视为已安装。
+any_of = ["~/.copilot"]
+binary = "copilot"
+# M0 只存不执行。
+version_cmd = ["copilot", "--version"]
+
+# ── Artifact:日志目录 ───────────────────────────────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.copilot/logs"
+mapper = "stats-only"
+clean_level = "l1"   # 日志,自动重建

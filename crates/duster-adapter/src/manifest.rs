@@ -14,15 +14,34 @@ use std::path::Path;
 /// 内置清单：编译期嵌入。新增 agent 只需在此加一行。
 const BUILTIN: &[(&str, &str)] = &[
     (
+        "cc-switch.toml",
+        include_str!("../../../adapters/cc-switch.toml"),
+    ),
+    (
         "claude-code.toml",
         include_str!("../../../adapters/claude-code.toml"),
     ),
     ("codex.toml", include_str!("../../../adapters/codex.toml")),
     (
+        "copilot-cli.toml",
+        include_str!("../../../adapters/copilot-cli.toml"),
+    ),
+    ("cursor.toml", include_str!("../../../adapters/cursor.toml")),
+    (
         "gemini-cli.toml",
         include_str!("../../../adapters/gemini-cli.toml"),
     ),
+    (
+        "kimi-cli.toml",
+        include_str!("../../../adapters/kimi-cli.toml"),
+    ),
     ("omp.toml", include_str!("../../../adapters/omp.toml")),
+    (
+        "opencode.toml",
+        include_str!("../../../adapters/opencode.toml"),
+    ),
+    ("pi.toml", include_str!("../../../adapters/pi.toml")),
+    ("qoder.toml", include_str!("../../../adapters/qoder.toml")),
 ];
 
 /// 一份完整的适配器清单。
@@ -349,10 +368,25 @@ any_of = ["~/.demo"]
     }
 
     #[test]
-    fn builtin_has_all_four_agents_in_order() {
+    fn builtin_has_all_eleven_agents_in_order() {
         let manifests = load_builtin();
         let ids: Vec<_> = manifests.iter().map(|m| m.agent.id.as_str()).collect();
-        assert_eq!(ids, ["claude-code", "codex", "gemini-cli", "omp"]);
+        assert_eq!(
+            ids,
+            [
+                "cc-switch",
+                "claude-code",
+                "codex",
+                "copilot-cli",
+                "cursor",
+                "gemini-cli",
+                "kimi-cli",
+                "omp",
+                "opencode",
+                "pi",
+                "qoder"
+            ]
+        );
     }
 
     #[test]

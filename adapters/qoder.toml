@@ -1,0 +1,62 @@
+# =============================================================================
+# Qoder 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
+# 无 mcp 节:本机 ~/.qoder/settings.json 无 mcpServers 键,MCP 配置位置未证实。
+# =============================================================================
+
+[agent]
+id = "qoder"
+display_name = "Qoder"
+
+[probe]
+# ~/.qoder 数据目录存在即视为已安装。
+any_of = ["~/.qoder"]
+
+# ── Memory:记忆库(按 workspace 哈希分目录,内部格式未证实,只统计)──────
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.qoder/memories"
+mapper = "stats-only"
+
+# ── Memory:全局设置(只统计不解析)──────────────────────────────────────
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.qoder/settings.json"
+mapper = "stats-only"
+
+# ── Artifact:可清理产物 ─────────────────────────────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.qoder/extensions"
+mapper = "stats-only"
+clean_level = "l2"   # 删了要重新安装扩展,有代价
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.qoder/plugins"
+mapper = "stats-only"
+clean_level = "l2"   # 删了要重新安装插件,有代价
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.qoder/cache"
+mapper = "stats-only"
+clean_level = "l1"   # 纯缓存,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.qoder/logs"
+mapper = "stats-only"
+clean_level = "l1"   # 日志,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.qoder/canvas"
+mapper = "stats-only"
+clean_level = "l4"   # 看板/画布用户内容,不可再生

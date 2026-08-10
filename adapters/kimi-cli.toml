@@ -1,0 +1,32 @@
+# =============================================================================
+# Kimi CLI 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
+# 无 mcp 节:本机 ~/.kimi/config.toml 只有 [mcp.client] 超时配置,
+#           未见 mcp_servers 表,格式未证实。
+# 刻意不声明 ~/.kimi/credentials:凭据目录,连统计都不碰。
+# =============================================================================
+
+[agent]
+id = "kimi-cli"
+display_name = "Kimi CLI"
+
+[probe]
+# ~/.kimi 数据目录存在即视为已安装。
+any_of = ["~/.kimi"]
+binary = "kimi"
+# M0 只存不执行。
+version_cmd = ["kimi", "--version"]
+
+# ── Session:<workdir-hash>/<uuid>/context.jsonl,非 Codex 格式,只统计 ───
+[[resource]]
+kind = "session"
+scope = "global"
+path = "~/.kimi/sessions"
+mapper = "stats-only"
+
+# ── Artifact:日志目录 ───────────────────────────────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.kimi/logs"
+mapper = "stats-only"
+clean_level = "l1"   # 日志,自动重建
