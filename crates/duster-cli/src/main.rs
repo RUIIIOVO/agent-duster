@@ -155,18 +155,22 @@ fn cmd_scan(mode: OutputMode, index: Option<&Path>, full: bool) -> i32 {
 }
 
 fn render_scan_human(report: &ScanReport, warnings: &[String]) {
-    let mut table = Table::new(vec!["agent", "resources", "体积", "sessions", "warnings"]);
+    let mut headers = vec!["agent", "体积"];
+    headers.extend(ALL_KINDS);
+    headers.extend(["新解析", "warnings"]);
+    let mut table = Table::new(headers);
     for a in &report.agents {
         if !a.installed {
             continue; // 未安装的 agent 无数据,人类模式不占版面(JSON 里仍完整)。
         }
-        table.push_row(vec![
-            a.agent_id.clone(),
-            a.resources.to_string(),
-            human_bytes(a.bytes),
-            a.sessions_indexed.to_string(),
-            a.warnings.len().to_string(),
-        ]);
+        let mut row = vec![a.agent_id.clone(), human_bytes(a.bytes)];
+        row.extend(ALL_KINDS.iter().map(|k| match a.kind_counts.get(*k) {
+            Some(n) if *n > 0 => n.to_string(),
+            _ => "-".to_string(),
+        }));
+        row.push(a.sessions_indexed.to_string());
+        row.push(a.warnings.len().to_string());
+        table.push_row(row);
     }
     println!("{}", table.render());
 

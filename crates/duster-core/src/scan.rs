@@ -45,12 +45,23 @@ pub struct AgentReport {
     pub installed: bool,
     /// 本轮 upsert 的资源行数(mcp server / skill / 会话文件 / ...)。
     pub resources: usize,
+    /// 各资源类的行数(kind -> 数量),零计数的 kind 不出现。
+    pub kind_counts: BTreeMap<String, usize>,
     /// 本轮资源体积合计(mcp 配置行计 0,见 [`ResourceRow`] 约定)。
     pub bytes: u64,
     /// 本轮真正重解析入索引的会话文件数(增量短路的不算)。
     pub sessions_indexed: usize,
     /// 采集过程中的非致命失败(单个文件损坏、格式不符等)。
     pub warnings: Vec<String>,
+}
+
+impl AgentReport {
+    /// 记一行资源:总数、分类计数、体积一次记齐。
+    fn tally(&mut self, kind: &str, bytes: u64) {
+        self.resources += 1;
+        *self.kind_counts.entry(kind.to_string()).or_insert(0) += 1;
+        self.bytes += bytes;
+    }
 }
 
 /// 未被任何清单认领的候选目录。
@@ -161,6 +172,7 @@ fn scan_agent(idx: &Index, m: &Manifest, home: &Path, full: bool) -> Result<Agen
         agent_id: agent_id.clone(),
         installed: outcome.installed,
         resources: 0,
+        kind_counts: BTreeMap::new(),
         bytes: 0,
         sessions_indexed: 0,
         warnings: Vec::new(),
@@ -285,7 +297,7 @@ fn scan_mcp(
         upsert::upsert_resource(idx.conn(), &row)
             .with_context(|| format!("upsert mcp `{}` 失败", s.name))?;
         seen.push(s.name.clone());
-        report.resources += 1;
+        report.tally("mcp", 0);
     }
     Ok(())
 }
@@ -318,8 +330,7 @@ fn scan_skills(
             };
             upsert::upsert_resource(idx.conn(), &row)?;
             seen.push(s.name.clone());
-            report.resources += 1;
-            report.bytes += stats.total_bytes;
+            report.tally("skill", stats.total_bytes);
             Ok(())
         })();
         if let Err(e) = result {
@@ -359,8 +370,7 @@ fn scan_memory(
     };
     upsert::upsert_resource(idx.conn(), &row)?;
     seen.push(key);
-    report.resources += 1;
-    report.bytes += meta.len();
+    report.tally("memory", meta.len());
     Ok(())
 }
 
@@ -435,8 +445,7 @@ fn index_session_file(
     };
     let outcome = upsert::upsert_resource(idx.conn(), &row)?;
     seen.push(key);
-    report.resources += 1;
-    report.bytes += cp.size;
+    report.tally("session", cp.size);
 
     if outcome.changed || full {
         let (_meta, turns) = if is_codex {
@@ -484,8 +493,7 @@ fn scan_stats_only(
     };
     upsert::upsert_resource(idx.conn(), &row)?;
     seen.push(key);
-    report.resources += 1;
-    report.bytes += size;
+    report.tally(kind_str(r.kind), size);
     Ok(())
 }
 
@@ -705,6 +713,9 @@ any_of = ["~/.ghost-nowhere"]
         assert!(fake.installed);
         assert!(fake.warnings.is_empty(), "warnings: {:?}", fake.warnings);
         assert_eq!(fake.resources, 4, "mcp+skill+session+artifact 各 1 行");
+        for k in ["mcp", "skill", "session", "artifact"] {
+            assert_eq!(fake.kind_counts.get(k), Some(&1), "kind_counts[{k}]");
+        }
         assert!(fake.bytes > 0);
         assert_eq!(fake.sessions_indexed, 1);
         assert!(report.total_bytes > 0);
