@@ -1,0 +1,11 @@
+[package]
+name = "duster-index"
+description = "索引与检索：SQLite schema、FTS5（trigram）、增量索引。"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duster-model = { workspace = true }
+anyhow = { workspace = true }
+rusqlite = { workspace = true }

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/duster-model",
+    "crates/duster-fs",
+    "crates/duster-index",
+    "crates/duster-adapter",
+    "crates/duster-core",
+    "crates/duster-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/laibu/agent-duster"
+rust-version = "1.85"
+
+[workspace.dependencies]
+duster-model = { path = "crates/duster-model" }
+duster-fs = { path = "crates/duster-fs" }
+duster-index = { path = "crates/duster-index" }
+duster-adapter = { path = "crates/duster-adapter" }
+duster-core = { path = "crates/duster-core" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+toml_edit = "0.22"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
+jwalk = "0.8"
+
+# 体积与性能预算（PRD §3.2）：二进制 ≤10MB、冷启动 ≤50ms
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

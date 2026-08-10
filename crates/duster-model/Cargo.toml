@@ -1,0 +1,10 @@
+[package]
+name = "duster-model"
+description = "UARM 统一资源模型：类型、能力矩阵、错误定义。纯类型，零 I/O。"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

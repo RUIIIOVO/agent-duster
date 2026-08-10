@@ -1,0 +1,15 @@
+[package]
+name = "duster-cli"
+description = "duster 命令行外壳（clap）。"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "duster"
+path = "src/main.rs"
+
+[dependencies]
+duster-core = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

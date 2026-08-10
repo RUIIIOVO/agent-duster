@@ -1,0 +1,13 @@
+# Rust
+/target
+**/*.rs.bk
+
+# 本地索引 / 调试产物
+*.db
+*.db-wal
+*.db-shm
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,12 @@
+[package]
+name = "duster-fs"
+description = "文件系统基座：并行遍历、指纹哈希、原子写、锁探测、回收站。"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duster-model = { workspace = true }
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+jwalk = { workspace = true }

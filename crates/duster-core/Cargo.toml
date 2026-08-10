@@ -1,0 +1,13 @@
+[package]
+name = "duster-core"
+description = "用例编排：scan / status / search / clean / migrate / doctor。"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duster-model = { workspace = true }
+duster-fs = { workspace = true }
+duster-index = { workspace = true }
+duster-adapter = { workspace = true }
+anyhow = { workspace = true }
