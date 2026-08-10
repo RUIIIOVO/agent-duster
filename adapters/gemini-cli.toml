@@ -1,0 +1,46 @@
+# =============================================================================
+# Gemini CLI 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
+# 无 skill 节:Gemini 的 extension 模型与 SKILL.md 不兼容。
+# 无 session 节:M0 暂不解析其会话格式。
+# =============================================================================
+
+[agent]
+id = "gemini-cli"
+display_name = "Gemini CLI"
+
+[probe]
+# ~/.gemini 数据目录存在即视为已安装。
+any_of = ["~/.gemini"]
+binary = "gemini"
+# M0 只存不执行。
+version_cmd = ["gemini", "--version"]
+
+# ── MCP:settings.json 的 /mcpServers(标准 JSON 形态)────────────────────
+[[resource]]
+kind = "mcp"
+scope = "global"
+path = "~/.gemini/settings.json"
+json_pointer = "/mcpServers"
+mapper = "mcp/standard-json"
+
+# ── Memory:全局记忆 ~/.gemini/GEMINI.md ─────────────────────────────────
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.gemini/GEMINI.md"
+mapper = "memory/markdown"
+
+# ── Artifact:可清理产物 ─────────────────────────────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.gemini/tmp"
+mapper = "stats-only"
+clean_level = "l1"   # 临时目录,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.gemini/history"
+mapper = "stats-only"
+clean_level = "l1"   # 命令历史,可再生

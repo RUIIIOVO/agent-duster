@@ -12,10 +12,18 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// 内置清单：编译期嵌入。新增 agent 只需在此加一行。
-const BUILTIN: &[(&str, &str)] = &[(
-    "claude-code.toml",
-    include_str!("../../../adapters/claude-code.toml"),
-)];
+const BUILTIN: &[(&str, &str)] = &[
+    (
+        "claude-code.toml",
+        include_str!("../../../adapters/claude-code.toml"),
+    ),
+    ("codex.toml", include_str!("../../../adapters/codex.toml")),
+    (
+        "gemini-cli.toml",
+        include_str!("../../../adapters/gemini-cli.toml"),
+    ),
+    ("omp.toml", include_str!("../../../adapters/omp.toml")),
+];
 
 /// 一份完整的适配器清单。
 #[derive(Debug, Clone, Deserialize)]
@@ -336,6 +344,13 @@ any_of = ["~/.demo"]
             levels,
             [CleanLevel::L2, CleanLevel::L1, CleanLevel::L1, CleanLevel::L1]
         );
+    }
+
+    #[test]
+    fn builtin_has_all_four_agents_in_order() {
+        let manifests = load_builtin();
+        let ids: Vec<_> = manifests.iter().map(|m| m.agent.id.as_str()).collect();
+        assert_eq!(ids, ["claude-code", "codex", "gemini-cli", "omp"]);
     }
 
     #[test]

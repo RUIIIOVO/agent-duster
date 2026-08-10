@@ -11,3 +11,5 @@ duster-fs = { workspace = true }
 duster-index = { workspace = true }
 duster-adapter = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

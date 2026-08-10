@@ -1,0 +1,73 @@
+# =============================================================================
+# Codex 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
+# =============================================================================
+
+[agent]
+id = "codex"
+display_name = "Codex"
+
+[probe]
+# ~/.codex 数据目录存在即视为已安装。
+any_of = ["~/.codex"]
+binary = "codex"
+# M0 只存不执行。
+version_cmd = ["codex", "--version"]
+
+# ── MCP:config.toml 的 mcp_servers 表(TOML 点路径定位)──────────────────
+[[resource]]
+kind = "mcp"
+scope = "global"
+path = "~/.codex/config.toml"
+toml_key = "mcp_servers"
+mapper = "mcp/codex-toml"
+
+# ── Skill:每个技能一个目录,SKILL.md 承载元数据 ─────────────────────────
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.codex/skills"
+glob = "*/SKILL.md"
+mapper = "skill/frontmatter-md"
+
+# ── Memory:全局记忆 ~/.codex/AGENTS.md ──────────────────────────────────
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.codex/AGENTS.md"
+mapper = "memory/markdown"
+
+# ── Session:JSONL 会话库 ────────────────────────────────────────────────
+[[resource]]
+kind = "session"
+scope = "global"
+path = "~/.codex/sessions"
+mapper = "native/codex-session"
+
+# ── Artifact:可清理产物,clean_level 标注再生成本 ───────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.codex/logs_2.sqlite"
+mapper = "stats-only"
+clean_level = "l1"   # 日志库,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.codex/plugins"
+mapper = "stats-only"
+clean_level = "l2"   # 删了要重新安装插件,有代价
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.codex/cache"
+mapper = "stats-only"
+clean_level = "l1"   # 纯缓存,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.codex/archived_sessions"
+mapper = "stats-only"
+clean_level = "l1"   # 归档会话,可从 sessions 再归档

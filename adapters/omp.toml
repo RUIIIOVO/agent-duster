@@ -1,0 +1,45 @@
+# =============================================================================
+# Oh My Pi(omp)适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
+# 无 mcp 节:v1 按无 MCP 处理。
+# =============================================================================
+
+[agent]
+id = "omp"
+display_name = "Oh My Pi"
+
+[probe]
+# ~/.omp 数据目录存在即视为已安装。
+any_of = ["~/.omp"]
+binary = "omp"
+# M0 只存不执行。
+version_cmd = ["omp", "--version"]
+
+# ── Skill:托管技能目录,每技能一个子目录 ────────────────────────────────
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.omp/agent/managed-skills"
+glob = "*/SKILL.md"
+mapper = "skill/frontmatter-md"
+
+# ── Session:只做体积/数量统计(history.db 的解析留 M2)───────────────────
+[[resource]]
+kind = "session"
+scope = "global"
+path = "~/.omp/agent/sessions"
+mapper = "stats-only"
+
+# ── Artifact:可清理产物 ─────────────────────────────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.omp/run"
+mapper = "stats-only"
+clean_level = "l1"   # 运行时产物,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.omp/puppeteer"
+mapper = "stats-only"
+clean_level = "l2"   # 浏览器 profile,删了丢登录态,有代价

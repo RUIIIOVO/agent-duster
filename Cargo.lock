@@ -291,6 +291,8 @@ dependencies = [
  "duster-fs",
  "duster-index",
  "duster-model",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

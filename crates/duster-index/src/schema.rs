@@ -16,6 +16,8 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// - `ix_res_hash` 是部分索引（hash 非空才进），供内容去重反查。
 /// - `fts_turn` 用 FTS5 contentless（`content=''`）+ `trigram` 分词，
 ///   保证 CJK 子串可搜；正文不落库，rowid 与 `turn.tid` 对齐由写入方负责。
+///   `contentless_delete=1`（SQLite ≥ 3.43，bundled 满足）使 contentless 表
+///   支持 DELETE，供 upsert 层重建/清理时同步删除 FTS 行。
 const V1_DDL: &str = "
 CREATE TABLE agent(
   agent_id     TEXT PRIMARY KEY,
@@ -55,6 +57,7 @@ CREATE VIRTUAL TABLE fts_turn USING fts5(
   body,
   tid UNINDEXED,
   content='',
+  contentless_delete=1,
   tokenize='trigram'
 );
 ";
