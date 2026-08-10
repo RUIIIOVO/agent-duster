@@ -76,7 +76,10 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
         && let Some(incoming) = &row.cheap_print
         && stored.as_slice() == incoming.as_slice()
     {
-        return Ok(UpsertOutcome { rid: *rid, changed: false });
+        return Ok(UpsertOutcome {
+            rid: *rid,
+            changed: false,
+        });
     }
 
     let rid: i64 = conn
@@ -120,7 +123,9 @@ pub fn replace_turns(
     rid: i64,
     turns: &[duster_model::TurnRecord],
 ) -> Result<()> {
-    let tx = conn.unchecked_transaction().context("开启 replace_turns 事务失败")?;
+    let tx = conn
+        .unchecked_transaction()
+        .context("开启 replace_turns 事务失败")?;
 
     // 先删 FTS(依赖 turn.tid 反查),再删 turn——顺序不能反。
     tx.execute(
@@ -176,14 +181,15 @@ pub fn delete_stale_resources(
 ) -> Result<u64> {
     let seen: HashSet<&str> = seen_keys.iter().map(String::as_str).collect();
 
-    let tx = conn.unchecked_transaction().context("开启 delete_stale 事务失败")?;
+    let tx = conn
+        .unchecked_transaction()
+        .context("开启 delete_stale 事务失败")?;
 
     // 全量拉该 (agent, kind) 的 key 在 Rust 侧过滤:seen_keys 可能上千,
     // 拼 IN 子句既有长度上限又难以参数化。
     let stale: Vec<i64> = {
-        let mut stmt = tx.prepare(
-            "SELECT rid, key FROM resource WHERE agent_id = ?1 AND kind = ?2",
-        )?;
+        let mut stmt =
+            tx.prepare("SELECT rid, key FROM resource WHERE agent_id = ?1 AND kind = ?2")?;
         let rows = stmt.query_map(params![agent_id, kind], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -286,7 +292,11 @@ mod tests {
         assert_eq!(second.rid, first.rid);
 
         let path: String = conn
-            .query_row("SELECT path FROM resource WHERE rid = ?1", [first.rid], |r| r.get(0))
+            .query_row(
+                "SELECT path FROM resource WHERE rid = ?1",
+                [first.rid],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(path, "/tmp/s1.jsonl", "命中指纹不得写任何列");
     }
@@ -320,14 +330,19 @@ mod tests {
         let mut r = row("s1", 100, [1u8; 24]);
         r.cheap_print = None;
         assert!(upsert_resource(&conn, &r).unwrap().changed);
-        assert!(upsert_resource(&conn, &r).unwrap().changed, "None 指纹不得判为命中");
+        assert!(
+            upsert_resource(&conn, &r).unwrap().changed,
+            "None 指纹不得判为命中"
+        );
     }
 
     /// replace_turns:新正文可 MATCH,旧正文彻底消失,tid/rowid 对齐。
     #[test]
     fn replace_turns_swaps_fts_content() {
         let conn = open();
-        let rid = upsert_resource(&conn, &row("s1", 100, [1u8; 24])).unwrap().rid;
+        let rid = upsert_resource(&conn, &row("s1", 100, [1u8; 24]))
+            .unwrap()
+            .rid;
 
         replace_turns(&conn, rid, &[turn(0, Role::User, "旧的中文正文内容")]).unwrap();
         assert!(fts_hit(&conn, "中文正文").is_some());
@@ -350,8 +365,11 @@ mod tests {
 
         // turn 表三行全在;fts rowid 与 tid 一致。
         // 注:contentless 表读列值一律返回 NULL,只有 rowid 真实,故对齐只能凭 rowid 验证。
-        let turn_count: i64 =
-            conn.query_row("SELECT count(*) FROM turn WHERE rid = ?1", [rid], |r| r.get(0)).unwrap();
+        let turn_count: i64 = conn
+            .query_row("SELECT count(*) FROM turn WHERE rid = ?1", [rid], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(turn_count, 3);
         let aligned: i64 = conn
             .query_row(
@@ -367,7 +385,9 @@ mod tests {
     #[test]
     fn oversized_body_truncates_at_char_boundary() {
         let conn = open();
-        let rid = upsert_resource(&conn, &row("s1", 100, [1u8; 24])).unwrap().rid;
+        let rid = upsert_resource(&conn, &row("s1", 100, [1u8; 24]))
+            .unwrap()
+            .rid;
 
         // "汉" 3 字节 x 5462 = 16386 字节:16384 落在第 5462 个字符中间。
         let body = "汉".repeat(5462);
@@ -377,7 +397,9 @@ mod tests {
         replace_turns(&conn, rid, &[turn(0, Role::User, &body)]).unwrap();
 
         let stored_len: i64 = conn
-            .query_row("SELECT length(CAST(body AS BLOB)) FROM fts_turn", [], |r| r.get(0))
+            .query_row("SELECT length(CAST(body AS BLOB)) FROM fts_turn", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
         // contentless 表不回存正文,长度查询可能为 0;关键断言是不 panic 且可检索。
         let _ = stored_len;
@@ -393,8 +415,12 @@ mod tests {
     #[test]
     fn delete_stale_cascades_turn_and_fts() {
         let conn = open();
-        let keep = upsert_resource(&conn, &row("keep", 1, [1u8; 24])).unwrap().rid;
-        let gone = upsert_resource(&conn, &row("gone", 2, [2u8; 24])).unwrap().rid;
+        let keep = upsert_resource(&conn, &row("keep", 1, [1u8; 24]))
+            .unwrap()
+            .rid;
+        let gone = upsert_resource(&conn, &row("gone", 2, [2u8; 24]))
+            .unwrap()
+            .rid;
         replace_turns(&conn, keep, &[turn(0, Role::User, "保留的正文段落")]).unwrap();
         replace_turns(&conn, gone, &[turn(0, Role::User, "将被清理的正文")]).unwrap();
 
@@ -402,11 +428,14 @@ mod tests {
             delete_stale_resources(&conn, "claude-code", "session", &["keep".into()]).unwrap();
         assert_eq!(removed, 1);
 
-        let res_count: i64 =
-            conn.query_row("SELECT count(*) FROM resource", [], |r| r.get(0)).unwrap();
+        let res_count: i64 = conn
+            .query_row("SELECT count(*) FROM resource", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(res_count, 1);
         let turn_count: i64 = conn
-            .query_row("SELECT count(*) FROM turn WHERE rid = ?1", [gone], |r| r.get(0))
+            .query_row("SELECT count(*) FROM turn WHERE rid = ?1", [gone], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(turn_count, 0, "外键级联应清掉 turn");
         assert!(fts_hit(&conn, "被清理").is_none(), "fts 行必须手动清干净");
@@ -415,7 +444,10 @@ mod tests {
         // 不同 kind 不受波及。
         let other = upsert_resource(
             &conn,
-            &ResourceRow { kind: "skill".into(), ..row("gone", 3, [3u8; 24]) },
+            &ResourceRow {
+                kind: "skill".into(),
+                ..row("gone", 3, [3u8; 24])
+            },
         )
         .unwrap();
         assert!(other.changed);

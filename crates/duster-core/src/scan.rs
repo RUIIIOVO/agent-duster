@@ -237,8 +237,8 @@ fn scan_mcp(
     if !cfg.is_file() {
         return Ok(()); // 装了 agent 但没配过 MCP,不算异常。
     }
-    let meta = std::fs::metadata(cfg)
-        .with_context(|| format!("读取元数据失败: {}", cfg.display()))?;
+    let meta =
+        std::fs::metadata(cfg).with_context(|| format!("读取元数据失败: {}", cfg.display()))?;
     let mtime_ns = mtime_ns_of(&meta);
     let doc = codec::read_file(cfg)?;
 
@@ -249,14 +249,18 @@ fn scan_mcp(
                 None => Some(v),
             };
             // pointer 落空 = 文件里还没有 mcpServers 段,视为零个 server。
-            node.map(mcp::from_standard_json).transpose()?.unwrap_or_default()
+            node.map(mcp::from_standard_json)
+                .transpose()?
+                .unwrap_or_default()
         }
         (MapperName::McpCodexToml, Doc::Toml(v)) => {
             let node = match &r.toml_key {
                 Some(key) => codec::toml_path(v, key),
                 None => Some(v),
             };
-            node.map(mcp::from_codex_toml).transpose()?.unwrap_or_default()
+            node.map(mcp::from_codex_toml)
+                .transpose()?
+                .unwrap_or_default()
         }
         _ => bail!(
             "mapper `{}` 与文件实际格式不匹配: {}",
@@ -339,8 +343,8 @@ fn scan_memory(
     if !file.is_file() {
         return Ok(());
     }
-    let meta = std::fs::metadata(file)
-        .with_context(|| format!("读取元数据失败: {}", file.display()))?;
+    let meta =
+        std::fs::metadata(file).with_context(|| format!("读取元数据失败: {}", file.display()))?;
     let key = file_name_of(file);
     let row = ResourceRow {
         agent_id: agent_id.to_string(),
@@ -577,10 +581,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "duster-core-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("duster-core-{tag}-{}-{nanos}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -749,11 +751,18 @@ any_of = ["~/.ghost-nowhere"]
             .iter()
             .find(|a| a.agent_id == "fake-agent")
             .unwrap();
-        assert_eq!(fake2.sessions_indexed, 0, "增量短路失效: {:?}", fake2.warnings);
+        assert_eq!(
+            fake2.sessions_indexed, 0,
+            "增量短路失效: {:?}",
+            fake2.warnings
+        );
         assert_eq!(fake2.resources, 4);
 
         // full=true:忽略短路,强制重解析。
-        let full_opts = ScanOptions { full: true, ..opts.clone() };
+        let full_opts = ScanOptions {
+            full: true,
+            ..opts.clone()
+        };
         let report3 = scan(&full_opts).unwrap();
         let fake3 = report3
             .agents

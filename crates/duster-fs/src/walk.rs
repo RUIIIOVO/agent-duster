@@ -69,8 +69,9 @@ pub fn walk_stats(root: &Path, opts: &WalkOptions) -> anyhow::Result<DirStats> {
             // 在 jwalk 的读目录线程里并行取 len，避免消费端串行 stat。
             for child in children.iter_mut().flatten() {
                 if !child.file_type.is_dir() {
-                    child.client_state =
-                        std::fs::symlink_metadata(child.path()).map(|m| m.len()).ok();
+                    child.client_state = std::fs::symlink_metadata(child.path())
+                        .map(|m| m.len())
+                        .ok();
                 }
             }
         });
@@ -105,7 +106,11 @@ pub fn walk_stats(root: &Path, opts: &WalkOptions) -> anyhow::Result<DirStats> {
     let mut children: Vec<(PathBuf, u64)> = by_child.into_iter().collect();
     children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    Ok(DirStats { total_bytes, file_count, children })
+    Ok(DirStats {
+        total_bytes,
+        file_count,
+        children,
+    })
 }
 
 /// 并行遍历 `root` 子树，对每个非目录条目（文件 + 符号链接）调用
@@ -127,7 +132,7 @@ pub fn walk_files(
         .process_read_dir(move |_depth, _dir, _state, children| {
             for child in children.iter_mut().flatten() {
                 if child.file_type.is_dir() {
-                    if prune.iter().any(|p| *p == child.file_name) {
+                    if prune.contains(&child.file_name) {
                         // 命中 prune：不深入该目录。
                         child.read_children_path = None;
                     }
@@ -142,7 +147,9 @@ pub fn walk_files(
         if entry.file_type.is_dir() {
             continue;
         }
-        let Some(meta) = entry.client_state.take() else { continue };
+        let Some(meta) = entry.client_state.take() else {
+            continue;
+        };
         f(&entry.path(), &meta);
     }
     Ok(())
@@ -215,7 +222,11 @@ mod tests {
         };
         let mut seen: Vec<(String, u64)> = Vec::new();
         walk_files(root, &opts, |path, meta| {
-            let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             seen.push((rel, meta.len()));
         })
         .unwrap();
@@ -226,9 +237,15 @@ mod tests {
         // 指向目录的符号链接不深入：只上报链接自身，不上报 dirlink/ 下的文件。
         assert!(seen.iter().all(|(rel, _)| !rel.starts_with("dirlink/")));
         let rels: Vec<&str> = seen.iter().map(|(rel, _)| rel.as_str()).collect();
-        assert_eq!(rels, ["a.txt", "dirlink", "link", "sub/b.bin", "sub/deep/c"]);
+        assert_eq!(
+            rels,
+            ["a.txt", "dirlink", "link", "sub/b.bin", "sub/deep/c"]
+        );
         // 回调携带的是 symlink_metadata:普通文件长度精确。
-        assert!(seen.iter().any(|(rel, len)| rel == "sub/b.bin" && *len == 2048));
+        assert!(
+            seen.iter()
+                .any(|(rel, len)| rel == "sub/b.bin" && *len == 2048)
+        );
     }
 
     #[test]

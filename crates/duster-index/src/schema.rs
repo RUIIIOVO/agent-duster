@@ -69,8 +69,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .context("读取 user_version 失败")?;
 
     if current < 1 {
-        conn.execute_batch(&format!("BEGIN;\n{V1_DDL}\nPRAGMA user_version = 1;\nCOMMIT;"))
-            .context("应用 schema v1 失败")?;
+        conn.execute_batch(&format!(
+            "BEGIN;\n{V1_DDL}\nPRAGMA user_version = 1;\nCOMMIT;"
+        ))
+        .context("应用 schema v1 失败")?;
     }
 
     Ok(())

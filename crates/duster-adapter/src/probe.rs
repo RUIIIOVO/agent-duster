@@ -154,12 +154,19 @@ mod tests {
             all_of: vec!["~/.codex".into(), "~/.codex/config.toml".into()],
             ..Default::default()
         };
-        assert!(!probe(&spec, home.path()).installed, "缺 config.toml 时不算安装");
+        assert!(
+            !probe(&spec, home.path()).installed,
+            "缺 config.toml 时不算安装"
+        );
 
         fs::write(home.path().join(".codex/config.toml"), "").unwrap();
         let out = probe(&spec, home.path());
         assert!(out.installed);
-        assert_eq!(out.root, Some(home.path().join(".codex")), "root 取第一个存在的目录");
+        assert_eq!(
+            out.root,
+            Some(home.path().join(".codex")),
+            "root 取第一个存在的目录"
+        );
     }
 
     /// 什么都不存在（空 spec 或路径全缺失）-> not installed、无 root。

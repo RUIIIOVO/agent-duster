@@ -42,8 +42,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 
     // fsync 父目录,让 rename 产生的目录项变更真正落盘。
-    let dir_fd =
-        File::open(&dir).with_context(|| format!("打开父目录 {} 失败", dir.display()))?;
+    let dir_fd = File::open(&dir).with_context(|| format!("打开父目录 {} 失败", dir.display()))?;
     dir_fd
         .sync_all()
         .with_context(|| format!("fsync 父目录 {} 失败", dir.display()))?;

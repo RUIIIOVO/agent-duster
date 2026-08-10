@@ -1,9 +1,9 @@
 //! BLAKE3 指纹:bytes hash(流式)+ cheap print(size, mtime_ns, inode)。
 //!
-//! - [`hash_file`]:流式计算单文件内容哈希,大文件不整读内存。
-//! - [`CheapPrint`]:廉价指纹(size + mtime_ns + inode),用于索引层快速判断
+//! - [`hash_file`][]:流式计算单文件内容哈希,大文件不整读内存。
+//! - [`CheapPrint`][]:廉价指纹(size + mtime_ns + inode),用于索引层快速判断
 //!   文件是否可能变化;编码为定长 24 字节 BLOB。
-//! - [`hash_tree`]:目录语义哈希,按相对路径字典序 feed(路径, 内容哈希),
+//! - [`hash_tree`][]:目录语义哈希,按相对路径字典序 feed(路径, 内容哈希),
 //!   与 mtime/遍历顺序无关,用于 skill 目录去重。
 
 use std::fs::{self, File};
@@ -59,8 +59,7 @@ impl CheapPrint {
 
 /// 读取文件的廉价指纹(Unix 专用,依赖 `MetadataExt`)。
 pub fn cheap_print(path: &Path) -> anyhow::Result<CheapPrint> {
-    let meta =
-        fs::metadata(path).with_context(|| format!("读取元数据失败: {}", path.display()))?;
+    let meta = fs::metadata(path).with_context(|| format!("读取元数据失败: {}", path.display()))?;
     Ok(CheapPrint {
         size: meta.size(),
         mtime_ns: meta
@@ -101,8 +100,7 @@ fn collect_files(
     prune: &[String],
     out: &mut Vec<(String, std::path::PathBuf)>,
 ) -> anyhow::Result<()> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("读取目录失败: {}", dir.display()))?;
+    let entries = fs::read_dir(dir).with_context(|| format!("读取目录失败: {}", dir.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("读取目录项失败: {}", dir.display()))?;
         let path = entry.path();
@@ -210,7 +208,11 @@ mod tests {
         assert_eq!(print, CheapPrint::from_bytes(&print.to_bytes()));
 
         // 人工构造的极端值也必须 roundtrip。
-        let extreme = CheapPrint { size: u64::MAX, mtime_ns: i64::MIN, ino: 0 };
+        let extreme = CheapPrint {
+            size: u64::MAX,
+            mtime_ns: i64::MIN,
+            ino: 0,
+        };
         assert_eq!(extreme, CheapPrint::from_bytes(&extreme.to_bytes()));
     }
 }

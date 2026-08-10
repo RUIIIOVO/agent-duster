@@ -160,7 +160,8 @@ mod tests {
         assert_eq!(meta.root, root);
         assert!(meta.tree_hash.is_none());
         // 其余字段进 extra，JSON 可回读。
-        let extra: serde_json::Value = serde_json::from_str(meta.extra.as_deref().unwrap()).unwrap();
+        let extra: serde_json::Value =
+            serde_json::from_str(meta.extra.as_deref().unwrap()).unwrap();
         assert_eq!(extra["version"], 2);
         assert_eq!(extra["tags"][0], "doc");
     }
@@ -187,7 +188,8 @@ mod tests {
         // 降级为无 frontmatter：目录名兜底 + extra 记录错误。
         assert_eq!(meta.name, "broken");
         assert!(meta.description.is_none());
-        let extra: serde_json::Value = serde_json::from_str(meta.extra.as_deref().unwrap()).unwrap();
+        let extra: serde_json::Value =
+            serde_json::from_str(meta.extra.as_deref().unwrap()).unwrap();
         assert!(extra["_parse_error"].is_string());
     }
 
@@ -213,6 +215,10 @@ mod tests {
         assert_eq!(names, ["alpha", "beta"]); // 按 name 排序稳定。
 
         // 目录不存在视为空。
-        assert!(discover_skills(&tmp.path().join("nope")).unwrap().is_empty());
+        assert!(
+            discover_skills(&tmp.path().join("nope"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -192,7 +192,10 @@ fn parse_codex_entry(name: &str, v: &toml::Value) -> anyhow::Result<McpServerSpe
     })
 }
 
-fn take_toml_str(m: &mut toml::map::Map<String, toml::Value>, key: &str) -> anyhow::Result<Option<String>> {
+fn take_toml_str(
+    m: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
     match m.remove(key) {
         None => Ok(None),
         Some(toml::Value::String(s)) => Ok(Some(s)),

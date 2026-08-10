@@ -34,7 +34,8 @@ use serde_json::Value;
 /// `byte_off` / `byte_len` 是该轮次**整行 JSON** 在文件中的区间
 /// (不含行尾 `\n`/`\r\n`),用偏移回读该区间可重新解析出同一行。
 pub fn parse(path: &Path) -> anyhow::Result<(SessionMeta, Vec<TurnRecord>)> {
-    let file = File::open(path).with_context(|| format!("打开 Codex 会话文件失败: {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("打开 Codex 会话文件失败: {}", path.display()))?;
     let mut reader = BufReader::new(file);
 
     let mut turns: Vec<TurnRecord> = Vec::new();
@@ -74,7 +75,9 @@ pub fn parse(path: &Path) -> anyhow::Result<(SessionMeta, Vec<TurnRecord>)> {
                 }
             }
             Some("response_item") => {
-                let Some(payload) = v.get("payload") else { continue };
+                let Some(payload) = v.get("payload") else {
+                    continue;
+                };
                 if payload.get("type").and_then(Value::as_str) != Some("message") {
                     continue;
                 }
@@ -83,7 +86,9 @@ pub fn parse(path: &Path) -> anyhow::Result<(SessionMeta, Vec<TurnRecord>)> {
                     Some("assistant") => Role::Assistant,
                     _ => continue, // developer 等注入指令排除
                 };
-                let Some(content) = payload.get("content") else { continue };
+                let Some(content) = payload.get("content") else {
+                    continue;
+                };
                 let text = extract_text(content);
                 let trimmed = text.trim();
                 if trimmed.is_empty() || is_injected_control(trimmed) {
@@ -92,7 +97,10 @@ pub fn parse(path: &Path) -> anyhow::Result<(SessionMeta, Vec<TurnRecord>)> {
                 turns.push(TurnRecord {
                     seq: turns.len() as u32,
                     role,
-                    ts_ms: v.get("timestamp").and_then(Value::as_str).and_then(iso8601_to_ms),
+                    ts_ms: v
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .and_then(iso8601_to_ms),
                     byte_off: line_off,
                     byte_len: line.len() as u64,
                     text,

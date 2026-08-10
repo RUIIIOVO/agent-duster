@@ -181,19 +181,19 @@ impl Manifest {
         for path in p.any_of.iter().chain(&p.all_of) {
             ensure_tilde(id, "probe 路径", path)?;
         }
-        if let Some(cmd) = &p.version_cmd {
-            if cmd.is_empty() {
-                bail!("[{id}] probe.version_cmd 不能是空数组");
-            }
+        if let Some(cmd) = &p.version_cmd
+            && cmd.is_empty()
+        {
+            bail!("[{id}] probe.version_cmd 不能是空数组");
         }
 
         for (i, r) in self.resources.iter().enumerate() {
             let at = format!("[{id}] 第 {} 个 resource（path = {}）", i + 1, r.path);
             ensure_tilde(id, "resource.path", &r.path)?;
-            if let Some(ptr) = &r.json_pointer {
-                if !ptr.starts_with('/') {
-                    bail!("{at}：json_pointer `{ptr}` 必须以 `/` 开头（RFC 6901）");
-                }
+            if let Some(ptr) = &r.json_pointer
+                && !ptr.starts_with('/')
+            {
+                bail!("{at}：json_pointer `{ptr}` 必须以 `/` 开头（RFC 6901）");
             }
             if r.json_pointer.is_some() && r.toml_key.is_some() {
                 bail!("{at}：json_pointer 与 toml_key 互斥，只能声明其一");
@@ -326,12 +326,9 @@ any_of = ["~/.demo"]
         assert_eq!(skill.mapper, MapperName::SkillFrontmatterMd);
 
         // Session：原生逃生舱。
-        assert!(
-            m.resources
-                .iter()
-                .any(|r| r.kind == ResourceKind::Session
-                    && r.mapper == MapperName::NativeClaudeSession)
-        );
+        assert!(m.resources.iter().any(
+            |r| r.kind == ResourceKind::Session && r.mapper == MapperName::NativeClaudeSession
+        ));
 
         // Artifact ×4：clean_level 依次 l2/l1/l1/l1。
         let levels: Vec<_> = m
@@ -342,7 +339,12 @@ any_of = ["~/.demo"]
             .collect();
         assert_eq!(
             levels,
-            [CleanLevel::L2, CleanLevel::L1, CleanLevel::L1, CleanLevel::L1]
+            [
+                CleanLevel::L2,
+                CleanLevel::L1,
+                CleanLevel::L1,
+                CleanLevel::L1
+            ]
         );
     }
 
@@ -357,7 +359,10 @@ any_of = ["~/.demo"]
     fn unknown_field_is_rejected() {
         let src = minimal("").replace("[probe]", "[probe]\ntypo_field = 1");
         let err = parse(&src).unwrap_err();
-        assert!(err.to_string().contains("typo_field"), "错误应点名未知字段: {err}");
+        assert!(
+            err.to_string().contains("typo_field"),
+            "错误应点名未知字段: {err}"
+        );
     }
 
     #[test]

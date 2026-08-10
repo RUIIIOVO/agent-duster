@@ -348,7 +348,13 @@ mod tests {
     fn deleted_source_degrades_gracefully() {
         let dir = tempfile::tempdir().unwrap();
         let conn = open_db();
-        seed(&conn, dir.path(), "claude", "gone.jsonl", &["即将消失的正文"]);
+        seed(
+            &conn,
+            dir.path(),
+            "claude",
+            "gone.jsonl",
+            &["即将消失的正文"],
+        );
         std::fs::remove_file(dir.path().join("gone.jsonl")).unwrap();
 
         let hits = search_turns(&conn, "消失的正文", &all(10)).unwrap();

@@ -49,8 +49,8 @@ pub fn status(index_path: Option<&Path>) -> Result<StatusReport> {
 
     let mut agents: Vec<AgentStatus> = Vec::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT agent_id, display_name, last_scan_ms FROM agent ORDER BY agent_id")?;
+        let mut stmt = conn
+            .prepare("SELECT agent_id, display_name, last_scan_ms FROM agent ORDER BY agent_id")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -91,7 +91,10 @@ pub fn status(index_path: Option<&Path>) -> Result<StatusReport> {
         total_bytes += a.bytes;
     }
 
-    Ok(StatusReport { agents, total_bytes })
+    Ok(StatusReport {
+        agents,
+        total_bytes,
+    })
 }
 
 #[cfg(test)]

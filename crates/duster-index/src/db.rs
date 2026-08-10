@@ -5,8 +5,8 @@
 //! - 不能锁 `index.db` 自身——EXCLUSIVE 会把持有者自己的主连接也挡在外面;
 //! - 不用裸 lock 文件(O_EXCL)——进程崩溃会残留死锁文件,需要脆弱的清理逻辑;
 //! - SQLite 事务锁在进程崩溃/被 kill 时由内核自动释放,零残留。
-//! 第二个 duster 进程 `BEGIN EXCLUSIVE` 立即失败(busy_timeout=0),
-//! CLI 据此映射为退出码 5(锁冲突)。代价:多一个 `<db>.lock` 旁路小文件。
+//!   第二个 duster 进程 `BEGIN EXCLUSIVE` 立即失败(busy_timeout=0),
+//!   CLI 据此映射为退出码 5(锁冲突)。代价:多一个 `<db>.lock` 旁路小文件。
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -51,7 +51,10 @@ impl Index {
             .with_context(|| format!("索引库: {}", path.display()))?;
 
         schema::migrate(&conn)?;
-        Ok(Self { conn, _lock_conn: lock_conn })
+        Ok(Self {
+            conn,
+            _lock_conn: lock_conn,
+        })
     }
 
     /// 只读打开:不建目录、不迁移、不抢锁。库不存在或版本超前一律报错。
@@ -65,7 +68,10 @@ impl Index {
         conn.pragma_update(None, "query_only", true)?;
         // 只读句柄不需要写锁;_lock_conn 用一个内存库占位,零成本。
         let placeholder = Connection::open_in_memory()?;
-        Ok(Self { conn, _lock_conn: placeholder })
+        Ok(Self {
+            conn,
+            _lock_conn: placeholder,
+        })
     }
 
     fn tune(conn: &Connection) -> Result<()> {
@@ -94,9 +100,11 @@ mod tests {
         // schema 已迁移
         let n: i64 = idx
             .conn()
-            .query_row("SELECT count(*) FROM sqlite_master WHERE name='resource'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='resource'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1);
         // 第二个实例被锁拒绝
@@ -113,7 +121,9 @@ mod tests {
         let db = dir.path().join("index.db");
         let writer = Index::open(&db).unwrap();
         let ro = Index::open_readonly(&db).unwrap();
-        let err = ro.conn().execute("INSERT INTO agent(agent_id) VALUES('x')", []);
+        let err = ro
+            .conn()
+            .execute("INSERT INTO agent(agent_id) VALUES('x')", []);
         assert!(err.is_err(), "只读句柄不得可写");
         drop(writer);
     }

@@ -51,10 +51,12 @@ pub const EXIT_OK: i32 = 0;
 /// 一般错误。
 pub const EXIT_ERROR: i32 = 1;
 /// 用法错误（clap 解析失败时的默认退出码，列在这里只为文档完整）。
+#[allow(dead_code)] // clap 自行返回 2,代码里不引用;保留为契约文档。
 pub const EXIT_USAGE: i32 = 2;
 /// 部分成功：整体流程走完，但个别子项失败（细节写进 warnings）。
 pub const EXIT_PARTIAL: i32 = 3;
 /// 需要确认被拒绝 / dry-run 仅预览未执行。
+#[allow(dead_code)] // 留给 M1 的 `duster clean`,先占住语义。
 pub const EXIT_CONFIRM_DENIED: i32 = 4;
 /// 锁冲突：目标 agent 运行中或索引被其他进程占用。
 pub const EXIT_LOCKED: i32 = 5;
@@ -74,7 +76,11 @@ pub enum OutputMode {
 
 /// 把 `--json` 旗标翻译成 [`OutputMode`]，无状态小胶水。
 pub fn is_json_mode(flag: bool) -> OutputMode {
-    if flag { OutputMode::Json } else { OutputMode::Human }
+    if flag {
+        OutputMode::Json
+    } else {
+        OutputMode::Human
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +136,10 @@ pub fn emit_json<T: Serialize>(command: &str, data: &T, warnings: &[String]) {
 /// 错误输出：信封写 stdout（机器读），同一条错误的人话同时写 stderr（人读）。
 pub fn emit_json_error(command: &str, code: &str, message: &str) {
     println!("{}", render_json_error(command, code, message));
-    let _ = writeln!(std::io::stderr(), "duster {command}: 错误[{code}] {message}");
+    let _ = writeln!(
+        std::io::stderr(),
+        "duster {command}: 错误[{code}] {message}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -309,17 +318,13 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(lines.len(), 4);
         // 每行第二列起始处的显示列必须一致（中文列不错位）。
-        let col_starts: Vec<usize> = [
-            (lines[0], "size"),
-            (lines[2], "12"),
-            (lines[3], "3456"),
-        ]
-        .iter()
-        .map(|(line, needle)| {
-            let idx = line.rfind(needle).unwrap();
-            display_width(&line[..idx])
-        })
-        .collect();
+        let col_starts: Vec<usize> = [(lines[0], "size"), (lines[2], "12"), (lines[3], "3456")]
+            .iter()
+            .map(|(line, needle)| {
+                let idx = line.rfind(needle).unwrap();
+                display_width(&line[..idx])
+            })
+            .collect();
         assert!(
             col_starts.windows(2).all(|w| w[0] == w[1]),
             "第二列起始显示列不一致: {col_starts:?}\n{rendered}"

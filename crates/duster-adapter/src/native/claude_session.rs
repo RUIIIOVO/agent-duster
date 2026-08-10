@@ -28,7 +28,8 @@ use serde_json::Value;
 /// `byte_off` / `byte_len` 是该轮次**整行 JSON** 在文件中的区间
 /// (不含行尾 `\n`/`\r\n`),用偏移回读该区间可重新解析出同一行。
 pub fn parse(path: &Path) -> anyhow::Result<(SessionMeta, Vec<TurnRecord>)> {
-    let file = File::open(path).with_context(|| format!("打开 Claude 会话文件失败: {}", path.display()))?;
+    let file = File::open(path)
+        .with_context(|| format!("打开 Claude 会话文件失败: {}", path.display()))?;
     let mut reader = BufReader::new(file);
 
     let mut turns: Vec<TurnRecord> = Vec::new();
@@ -89,11 +90,18 @@ pub fn parse(path: &Path) -> anyhow::Result<(SessionMeta, Vec<TurnRecord>)> {
                 if text.trim().is_empty() {
                     continue; // 纯工具/纯思考记录不是对话轮次
                 }
-                let role = if t == "user" { Role::User } else { Role::Assistant };
+                let role = if t == "user" {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
                 turns.push(TurnRecord {
                     seq: turns.len() as u32,
                     role,
-                    ts_ms: v.get("timestamp").and_then(Value::as_str).and_then(iso8601_to_ms),
+                    ts_ms: v
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .and_then(iso8601_to_ms),
                     byte_off: line_off,
                     byte_len: line.len() as u64,
                     text,
@@ -201,7 +209,10 @@ mod tests {
         assert_eq!(turns.len(), 4);
 
         let roles: Vec<Role> = turns.iter().map(|t| t.role).collect();
-        assert_eq!(roles, [Role::User, Role::Assistant, Role::User, Role::Assistant]);
+        assert_eq!(
+            roles,
+            [Role::User, Role::Assistant, Role::User, Role::Assistant]
+        );
 
         assert_eq!(turns[0].text, "帮我看看这个报错");
         assert_eq!(turns[1].text, "先看日志,再定位配置。");
@@ -245,8 +256,14 @@ mod tests {
     #[test]
     fn claude_session_ts_parse() {
         assert_eq!(iso8601_to_ms("1970-01-01T00:00:00.000Z"), Some(0));
-        assert_eq!(iso8601_to_ms("2026-08-01T10:00:00Z"), Some(1_785_578_400_000));
-        assert_eq!(iso8601_to_ms("2026-08-01T10:00:00.5Z"), Some(1_785_578_400_500));
+        assert_eq!(
+            iso8601_to_ms("2026-08-01T10:00:00Z"),
+            Some(1_785_578_400_000)
+        );
+        assert_eq!(
+            iso8601_to_ms("2026-08-01T10:00:00.5Z"),
+            Some(1_785_578_400_500)
+        );
         assert_eq!(iso8601_to_ms("垃圾"), None);
     }
 }
