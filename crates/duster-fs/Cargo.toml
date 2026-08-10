@@ -10,3 +10,7 @@ duster-model = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
 jwalk = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
