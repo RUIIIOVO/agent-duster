@@ -678,10 +678,10 @@ any_of = ["~/.ghost-nowhere"]
         fs::create_dir_all(&artifacts).unwrap();
         fs::write(artifacts.join("cache.bin"), vec![0u8; 128]).unwrap();
 
-        // unclassified 候选:存在且没被任何清单认领。
-        let qoder = home.join(".qoder");
-        fs::create_dir_all(&qoder).unwrap();
-        fs::write(qoder.join("junk.log"), b"0123456789").unwrap();
+        // unclassified 候选:存在且没被任何清单认领(gstack 无内置清单)。
+        let gstack = home.join(".gstack");
+        fs::create_dir_all(&gstack).unwrap();
+        fs::write(gstack.join("junk.log"), b"0123456789").unwrap();
     }
 
     #[test]
@@ -717,12 +717,12 @@ any_of = ["~/.ghost-nowhere"]
         assert!(!ghost.installed);
         assert_eq!(ghost.resources, 0);
 
-        // unclassified:~/.qoder 存在且未被认领。
+        // unclassified:~/.gstack 存在且未被认领。
         let q = report
             .unclassified
             .iter()
-            .find(|u| u.path == "~/.qoder")
-            .expect("~/.qoder 应进 unclassified");
+            .find(|u| u.path == "~/.gstack")
+            .expect("~/.gstack 应进 unclassified");
         assert!(q.bytes >= 10);
 
         // 索引行确实落库:4 行 resource + 4 个轮次的 turn。
