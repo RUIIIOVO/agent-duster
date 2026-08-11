@@ -29,7 +29,7 @@ use serde_json::Value;
 /// (不含行尾 `\n`/`\r\n`),用偏移回读该区间可重新解析出同一行。
 pub fn parse(path: &Path) -> anyhow::Result<(SessionMeta, Vec<TurnRecord>)> {
     let file = File::open(path)
-        .with_context(|| format!("打开 Claude 会话文件失败: {}", path.display()))?;
+        .with_context(|| format!("failed to open Claude session file: {}", path.display()))?;
     let mut reader = BufReader::new(file);
 
     let mut turns: Vec<TurnRecord> = Vec::new();
@@ -43,7 +43,7 @@ pub fn parse(path: &Path) -> anyhow::Result<(SessionMeta, Vec<TurnRecord>)> {
         buf.clear();
         let n = reader
             .read_until(b'\n', &mut buf)
-            .with_context(|| format!("读取 {} 失败", path.display()))?;
+            .with_context(|| format!("failed to read {}", path.display()))?;
         if n == 0 {
             break;
         }

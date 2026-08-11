@@ -18,7 +18,7 @@
 #   至少要声明 any_of / all_of / binary 之一,否则清单无从探测。
 #
 # ── [[resource]] 词汇表 ──────────────────────────────────────────────────
-#   kind         = mcp | skill | memory | session | artifact
+#   kind         = mcp | skill | memory | session | artifact | install
 #   scope        = global | project     (M0 内置清单只用 global;
 #                                        项目级资源如 ./CLAUDE.md 暂不入清单)
 #   path         = "~/..."              文件或目录。一律以 `~` 开头的字符串,
@@ -28,8 +28,50 @@
 #                                       与 json_pointer 互斥
 #   mapper       = 见下方封闭词汇表     格式树 <-> UARM 的映射器
 #   glob         = "*/SKILL.md"         可选:目录型资源的条目匹配模式
-#   clean_level  = l0 | l1 | l2 | l4    可选,仅 artifact 资源:
-#                                       l0 随删随生(缓存) … l4 不可再生(数据)
+#   clean_level  = l0 | l1 | l2         **artifact 必填,其余 kind 禁写**
+#
+# ── artifact vs install:清理安全的分界线 ─────────────────────────────────
+#   判据只有一条:**删了要不要重新安装**。跟占多大无关。
+#
+#   artifact = 可清理产物。缓存、日志、临时目录、运行时残留、可再生的
+#              备份与归档。清完 agent 照常启动、照常干活。
+#   install  = 软件本体与安装产物。扩展、插件、随附二进制、node_modules。
+#              删了等于卸载。**只统计体积,duster clean 永不触碰。**
+#
+#   1 GB 的扩展目录是 install;800 MB 的日志库是 artifact。把 install 写成
+#   artifact,等于给"卸载用户软件"发了许可证——校验层会直接拒绝加载。
+#
+# ── clean_level 封闭词汇表(只有三档,artifact 专用)────────────────────
+#   ⚠️ `duster clean` 尚未实现(M1)。下面每档的「clean 默认…」写的是
+#      **约定的目标行为**,不是今天已生效的行为。今天生效的只有分类本身:
+#      级别决定 scan/status 摘要行里这一项算进哪一档可回收量。
+#
+#   l0  无损回收:SQLite 空闲页(VACUUM)、孤儿 WAL/SHM、`.tmp-*` 崩溃残留。
+#                数据一条不少。计入可回收量的**只有空洞**(实测 freelist ×
+#                page_size),不是整个文件——文件里的活数据不算收益。
+#                clean 默认执行。
+#   l1  可再生  :缓存、日志、临时目录、运行时残留。删完自动重建,不影响使用。
+#                整项计入可回收量。clean 默认执行。
+#   l2  有时效  :滚动备份、归档。功能不缺,但重建有人工代价(如重新登录、
+#                重新下载)。整项计入可回收量。
+#                按 --older-than 天数阈值清,且必须二次确认。clean 默认**不**执行。
+#
+#   没有更高档:"删了等于卸载"的东西不是 artifact,是 install。
+#
+# ── 重叠路径:禁止 ───────────────────────────────────────────────────────
+#   两条 resource 的 path 不得互为前缀。体积按声明路径独立聚合,父子同时
+#   声明会双算,让「总共多少 GB」失真。宁可整块归到较保守的一侧——
+#   例如 ~/.claude/plugins 内含 cache/,整块仍归 install,不拆出子缓存。
+#   注意这条只在**单份清单内**校验;跨清单声明重叠目录不会报错,别踩。
+#
+# ── 未知字段 = 硬失败 ────────────────────────────────────────────────────
+#   四个 section 全都 `deny_unknown_fields`。写错一个字段名不是被忽略,
+#   而是整份清单加载失败;内置清单加载失败会直接 panic。改本文件时
+#   拼错字段 = 二进制起不来,这是最容易踩的一颗雷。
+#
+#   另注:本注释块整体进「解析规则指纹」(scan 的 parser_epoch 哈希清单
+#   源文本)。**改注释也会让指纹变**,用户下次 scan 会自动转全量重解析。
+#   这是刻意的取舍(数据变化必须被看见 > 省一次重扫),但别当水改。
 #
 # ── mapper 封闭词汇表(清单里只能写这七个)──────────────────────────────
 #   mcp/standard-json      标准 JSON mcpServers 映射(Claude Code / 多数 agent)
@@ -38,7 +80,8 @@
 #   memory/markdown        Markdown 记忆文件(CLAUDE.md / AGENTS.md 等)
 #   native/claude-session  Claude Code JSONL 会话(原生适配器逃生舱)
 #   native/codex-session   Codex JSONL 会话(原生适配器逃生舱)
-#   stats-only             不解析内容,只做体积/数量统计(artifact、配置文件)
+#   stats-only             不解析内容,只做体积/数量统计
+#                          (artifact / install 只能用这个)
 # =============================================================================
 
 [agent]
@@ -91,14 +134,16 @@ path = "~/.claude/projects"
 glob = "*/*.jsonl"
 mapper = "native/claude-session"
 
-# ── Artifact:可清理产物,clean_level 标注再生成本 ───────────────────────
+# ── Install:已安装插件本体(marketplaces + 插件缓存)────────────────────
+# 删了要重新 /plugin install,属卸载级操作,不进清理体系。
+# 内含 cache/ 子目录(本机约 40 MB),刻意不拆:父子同时声明会双算体积。
 [[resource]]
-kind = "artifact"
+kind = "install"
 scope = "global"
 path = "~/.claude/plugins"
 mapper = "stats-only"
-clean_level = "l2"   # 删了要重新安装插件,有代价
 
+# ── Artifact:可清理产物 ─────────────────────────────────────────────────
 [[resource]]
 kind = "artifact"
 scope = "global"

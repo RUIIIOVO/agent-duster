@@ -2,6 +2,11 @@
 # Cursor 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
 # 无 mcp 节:本机未见 ~/.cursor/mcp.json,MCP 配置形态未证实,宁缺毋滥。
 # 无 skill/memory 节:Cursor 的规则/记忆模型与本清单词汇表不对应。
+# 刻意不声明 ~/.cursor/ai-tracking:AI 代码采纳追踪数据,既非产物也非本体,
+#           内部格式未证实,按「不理解的东西不动」放弃认领。
+#           注意:probe 已认领 ~/.cursor,所以未声明的子目录既不入索引、
+#           也不会出现在 unclassified 表里——它现在谁都不统计。这个洞是
+#           collect_unclassified 只看顶层候选目录导致的,修在扫描器里。
 # =============================================================================
 
 [agent]
@@ -15,26 +20,16 @@ binary = "cursor"
 # M0 只存不执行。
 version_cmd = ["cursor", "--version"]
 
-# ── Artifact:AI 代码追踪数据库(使用数据,删了不可再生)───────────────────
+# ── Session:按项目分目录的 agent 会话/上下文,格式未证实,只统计 ─────────
 [[resource]]
-kind = "artifact"
-scope = "global"
-path = "~/.cursor/ai-tracking"
-mapper = "stats-only"
-clean_level = "l4"   # 使用追踪数据,不可再生
-
-# ── Artifact:已安装扩展 ─────────────────────────────────────────────────
-[[resource]]
-kind = "artifact"
-scope = "global"
-path = "~/.cursor/extensions"
-mapper = "stats-only"
-clean_level = "l2"   # 删了要重新安装扩展,有代价
-
-# ── Artifact:按项目分目录的 agent 数据(格式未证实,只统计)──────────────
-[[resource]]
-kind = "artifact"
+kind = "session"
 scope = "global"
 path = "~/.cursor/projects"
 mapper = "stats-only"
-clean_level = "l4"   # 项目会话/上下文数据,不可再生
+
+# ── Install:已安装扩展本体 ──────────────────────────────────────────────
+[[resource]]
+kind = "install"
+scope = "global"
+path = "~/.cursor/extensions"
+mapper = "stats-only"

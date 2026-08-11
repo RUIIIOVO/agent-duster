@@ -47,7 +47,7 @@ Agent Duster gives you one CLI to see, search, and manage all of it.
 duster scan          # discover agents & index resources
 duster status        # overview: agents / sizes / issues
 duster search "auth middleware"
-duster clean --level L0,L1 --dry-run
+duster clean --older-than 30d   # dry-run by default
 ```
 
 ## Commands
@@ -57,7 +57,7 @@ duster clean --level L0,L1 --dry-run
 | `duster scan` | Detect installed agents, index MCP / skills / memories / sessions. Incremental by default; unknown paths are reported, never touched. |
 | `duster status` | Per-agent disk usage, resource counts, and detected issues. |
 | `duster search <query>` | Full-text search across all agents. Filter by `--agent` / `--kind` / `--project` / time. `duster open <hit-id>` jumps to the source file. |
-| `duster clean [--level L0..L4]` | Tiered cleanup (see below). Dry-run by default; `--yes` executes; deletions go to trash. |
+| `duster clean [--level L0..L2] [--older-than 30d]` | Tiered cleanup (see below). Dry-run by default; `--yes` executes; deletions go to trash. Never removes installed software. |
 | `duster restore [<id>]` | Restore from trash — byte-identical to before. |
 | `duster doctor [--secrets]` | Health check: plaintext credentials (masked), unreachable MCP, missing skill metadata, config syntax errors, SQLite integrity. |
 | `duster skill list \| dedupe \| drift \| link \| unlink \| remove` | Cross-agent skill management. `link` converges duplicates into a content-addressed store — edit once, effective everywhere. |
@@ -69,13 +69,24 @@ duster clean --level L0,L1 --dry-run
 
 ### Cleanup tiers
 
-| Tier | Target | Risk |
-|---|---|---|
-| **L0** | SQLite free pages (VACUUM), crash leftovers, orphan WAL | Lossless |
-| **L1** | Regenerable caches | Auto-rebuilt |
-| **L2** | Expired logs | Debugging only |
-| **L3** | Stale sessions (optional export first) | Confirm required |
-| **L4** | Heavy assets: skill `node_modules`, plugin caches | Reinstall needed |
+| Tier | Target | Cost | Default |
+|---|---|---|---|
+| **L0** | SQLite free pages (VACUUM), orphan WAL/SHM, `.tmp-*` crash leftovers | Lossless — not a single row is lost | On |
+| **L1** | Caches, logs, temp dirs, runtime leftovers | Auto-rebuilt, agent keeps working | On |
+| **L2** | Skills & MCP servers untouched for N days, expired backups & archives; sessions older than N days get compressed, not deleted | Nothing breaks, but rebuilding costs manual work (e.g. logging back in) | Off — needs `--older-than` + confirmation |
+
+`--older-than` accepts `30d` / `60d` / `90d` or any `<N>d`. L2 always shows the full item
+list and asks again before touching anything.
+
+`duster status` reports **reclaimable** bytes, not occupied bytes. They differ for L0: a
+784 MB SQLite log store whose pages are 98% free reports 774 MB reclaimable, because the
+live rows stay. The per-agent `CLEANABLE` column shows occupancy; the summary line shows
+what you actually get back.
+
+**Installed software is never cleaned.** Extensions, plugins, bundled binaries, and
+`node_modules` are classified as `install`: counted in `duster status`, invisible to
+`duster clean`. If removing it would mean reinstalling, duster won't remove it — no tier,
+no flag, no exceptions.
 
 Global flags: `--dry-run` (default for destructive ops) · `--yes` · `--json` · `--agent <id>` · `--quiet` · `--no-color`
 

@@ -2,6 +2,10 @@
 # OpenCode 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
 # ~/.opencode 只是 npm 安装壳(bin/ + node_modules/),配置与数据在别处
 # (XDG 目录),M0 只认领安装产物。package.json/package-lock.json 不是资源。
+#
+# 全目录都是 install:这个 agent 在 home 下**没有任何可清理产物**。
+# node_modules 曾被标 artifact/l1「npm install 即可重建」——重建要联网、
+# 要装对版本,失败就等于 OpenCode 没了,这是卸载不是清理。
 # =============================================================================
 
 [agent]
@@ -15,18 +19,16 @@ binary = "opencode"
 # M0 只存不执行。
 version_cmd = ["opencode", "--version"]
 
-# ── Artifact:npm 依赖,可随时重装(prune 首选)───────────────────────────
+# ── Install:npm 依赖树 ──────────────────────────────────────────────────
 [[resource]]
-kind = "artifact"
+kind = "install"
 scope = "global"
 path = "~/.opencode/node_modules"
 mapper = "stats-only"
-clean_level = "l1"   # npm install 即可重建
 
-# ── Artifact:入口二进制 ─────────────────────────────────────────────────
+# ── Install:入口二进制 ──────────────────────────────────────────────────
 [[resource]]
-kind = "artifact"
+kind = "install"
 scope = "global"
 path = "~/.opencode/bin"
 mapper = "stats-only"
-clean_level = "l2"   # 删了要重装 OpenCode,有代价

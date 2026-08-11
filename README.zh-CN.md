@@ -47,7 +47,7 @@ Agent Duster 用一个 CLI 让你看清、搜到、管住这一切。
 duster scan          # 发现 agent 并建立索引
 duster status        # 总览：agent / 体积 / 问题数
 duster search "鉴权中间件"
-duster clean --level L0,L1 --dry-run
+duster clean --older-than 30d   # 默认 dry-run
 ```
 
 ## 命令一览
@@ -57,7 +57,7 @@ duster clean --level L0,L1 --dry-run
 | `duster scan` | 探测已安装 agent，索引 MCP / skills / 记忆 / 会话。默认增量；不认识的路径只上报、不触碰。 |
 | `duster status` | 每个 agent 的磁盘占用、资源数量、检测到的问题。 |
 | `duster search <query>` | 跨 agent 全文检索，支持 `--agent` / `--kind` / `--project` / 时间过滤；`duster open <hit-id>` 直接打开原文件。 |
-| `duster clean [--level L0..L4]` | 分级清理（见下表）。默认 dry-run，`--yes` 才执行，删除全部进回收站。 |
+| `duster clean [--level L0..L2] [--older-than 30d]` | 分级清理（见下表）。默认 dry-run，`--yes` 才执行，删除全部进回收站。**永不卸载已安装的软件**。 |
 | `duster restore [<id>]` | 从回收站原路还原，逐字节一致。 |
 | `duster doctor [--secrets]` | 体检：明文凭据（掩码显示）、MCP 可达性、skill 元数据缺失、配置语法错误、SQLite 完整性。 |
 | `duster skill list \| dedupe \| drift \| link \| unlink \| remove` | 跨 agent skill 管理。`link` 把重复项收敛到内容寻址库——一处修改，全局生效。 |
@@ -69,13 +69,22 @@ duster clean --level L0,L1 --dry-run
 
 ### 清理级别
 
-| 级别 | 清什么 | 风险 |
-|---|---|---|
-| **L0** | SQLite 空闲页（VACUUM）、崩溃残留、孤儿 WAL | 无损 |
-| **L1** | 可再生缓存 | 自动重建 |
-| **L2** | 过期日志 | 仅影响排障 |
-| **L3** | 超期会话（可先导出归档） | 需确认 |
-| **L4** | 重资产：skill 内 `node_modules`、插件缓存 | 需重装 |
+| 级别 | 清什么 | 代价 | 默认 |
+|---|---|---|---|
+| **L0** | SQLite 空闲页（VACUUM）、孤儿 WAL/SHM、`.tmp-*` 崩溃残留 | 无损，数据一条不少 | 开 |
+| **L1** | 缓存、日志、临时目录、运行时残留 | 自动重建，agent 照常用 | 开 |
+| **L2** | 超过 N 天没碰过的 skill / MCP、过期的备份与归档；超过 N 天的会话改为压缩存档（不删） | 功能不缺，但重建有人工代价（例如要重新登录） | 关 —— 需 `--older-than` + 二次确认 |
+
+`--older-than` 支持 `30d` / `60d` / `90d` 三个档位，也可以直接写 `<N>d`。
+L2 一定先列出全部条目、再问一次才动手。
+
+`duster status` 报的是**能拿回多少**，不是**占了多少**——这两个数在 L0 上不相等：
+一个 784 MB 的 SQLite 日志库若 98% 是空闲页，报的是 774 MB，因为里面的活数据还在。
+表格的 `CLEANABLE` 列给占用量，摘要行给真实回收量。
+
+**软件本体永不清理。** 扩展、插件、随附二进制、`node_modules` 归为 `install` 类：
+`duster status` 里算体积，`duster clean` 里看不见。判据只有一条——
+删了要重新安装的，duster 就不删，没有级别、没有开关、没有例外。
 
 全局开关：`--dry-run`（破坏性命令默认开）· `--yes` · `--json` · `--agent <id>` · `--quiet` · `--no-color`
 

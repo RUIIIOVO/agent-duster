@@ -11,7 +11,7 @@ pub mod skill;
 
 pub use agent::AgentInfo;
 pub use mcp::{McpServerSpec, McpTransport};
-pub use resource::{AgentId, Resource, ResourceId, ResourceKind, Scope};
+pub use resource::{AgentId, CleanLevel, Resource, ResourceId, ResourceKind, Scope};
 pub use session::{Role, SessionMeta, TurnRecord};
 pub use skill::SkillMeta;
 

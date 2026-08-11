@@ -1,6 +1,10 @@
 # =============================================================================
 # Qoder 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
 # 无 mcp 节:本机 ~/.qoder/settings.json 无 mcpServers 键,MCP 配置位置未证实。
+# 刻意不声明 ~/.qoder/canvas:看板/画布是用户手写内容,既非产物也非本体,
+#           格式未证实,按「不理解的东西不动」放弃认领。
+#           注意:probe 已认领 ~/.qoder,未声明的子目录既不入索引、也不进
+#           unclassified 表——现在谁都不统计。修在 collect_unclassified。
 # =============================================================================
 
 [agent]
@@ -25,21 +29,22 @@ scope = "global"
 path = "~/.qoder/settings.json"
 mapper = "stats-only"
 
-# ── Artifact:可清理产物 ─────────────────────────────────────────────────
+# ── Install:VS Code 系扩展与插件本体 ────────────────────────────────────
+# 本机实测 extensions 约 1.1 GB(chatgpt / cpptools / claude-code / java),
+# 是全机最大一块。删了 Qoder 掉功能,必须重新下载安装 ⇒ install,不参与清理。
 [[resource]]
-kind = "artifact"
+kind = "install"
 scope = "global"
 path = "~/.qoder/extensions"
 mapper = "stats-only"
-clean_level = "l2"   # 删了要重新安装扩展,有代价
 
 [[resource]]
-kind = "artifact"
+kind = "install"
 scope = "global"
 path = "~/.qoder/plugins"
 mapper = "stats-only"
-clean_level = "l2"   # 删了要重新安装插件,有代价
 
+# ── Artifact:可清理产物 ─────────────────────────────────────────────────
 [[resource]]
 kind = "artifact"
 scope = "global"
@@ -53,10 +58,3 @@ scope = "global"
 path = "~/.qoder/logs"
 mapper = "stats-only"
 clean_level = "l1"   # 日志,自动重建
-
-[[resource]]
-kind = "artifact"
-scope = "global"
-path = "~/.qoder/canvas"
-mapper = "stats-only"
-clean_level = "l4"   # 看板/画布用户内容,不可再生

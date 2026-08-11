@@ -36,6 +36,8 @@ jwalk = "0.8"
 serde_yaml = "0.9"
 dirs = "6"
 tempfile = "3"
+dialoguer = "0.11"
+console = "0.15"
 
 # 体积与性能预算（PRD §3.2）：二进制 ≤10MB、冷启动 ≤50ms
 [profile.release]

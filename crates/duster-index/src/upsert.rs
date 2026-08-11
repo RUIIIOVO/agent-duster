@@ -26,6 +26,16 @@ pub struct ResourceRow {
     pub mtime_ns: i64,
     pub hash_content: Option<[u8; 32]>,
     pub cheap_print: Option<[u8; 24]>,
+    /// 清单声明的清理级别（`l0`/`l1`/`l2`）；非 artifact 恒为 None。
+    ///
+    /// 注意它**不参与** `cheap_print` 短路判断，也不需要：带级别的行全是
+    /// stats-only 采集的（artifact 只有这一条路），而 stats-only 从不产出
+    /// `cheap_print`，短路条件要求入参指纹存在，所以这类行每轮都走写路径，
+    /// 清单改级别下一次 scan 必然落库。
+    pub clean_level: Option<String>,
+    /// 清掉这一项真正能拿回的字节数；非 artifact 恒为 None。
+    /// l1/l2 等于 `size`，l0 只算空洞（见 schema v3 注释）。
+    pub reclaimable: Option<u64>,
 }
 
 /// [`upsert_resource`] 的结果:行 id + 本次是否真的写了。
@@ -52,7 +62,7 @@ pub fn upsert_agent(
             last_scan_ms,
         ],
     )
-    .with_context(|| format!("upsert agent 失败: {}", info.id))?;
+    .with_context(|| format!("failed to upsert agent: {}", info.id))?;
     Ok(())
 }
 
@@ -70,7 +80,7 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
-        .context("查询 resource 现有行失败")?;
+        .context("failed to query existing resource row")?;
 
     if let Some((rid, Some(stored))) = &existing
         && let Some(incoming) = &row.cheap_print
@@ -84,14 +94,16 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
 
     let rid: i64 = conn
         .query_row(
-            "INSERT INTO resource(agent_id, kind, scope, key, path, size, mtime_ns, hash_content, cheap_print)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO resource(agent_id, kind, scope, key, path, size, mtime_ns, hash_content, cheap_print, clean_level, reclaimable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(agent_id, kind, scope, key) DO UPDATE SET
                path = excluded.path,
                size = excluded.size,
                mtime_ns = excluded.mtime_ns,
                hash_content = excluded.hash_content,
-               cheap_print = excluded.cheap_print
+               cheap_print = excluded.cheap_print,
+               clean_level = excluded.clean_level,
+               reclaimable = excluded.reclaimable
              RETURNING rid",
             params![
                 row.agent_id,
@@ -103,10 +115,12 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
                 row.mtime_ns,
                 row.hash_content.as_ref().map(|h| h.as_slice()),
                 row.cheap_print.as_ref().map(|p| p.as_slice()),
+                row.clean_level.as_deref(),
+                row.reclaimable,
             ],
             |r| r.get(0),
         )
-        .with_context(|| format!("upsert resource 失败: {}/{}/{}", row.agent_id, row.kind, row.key))?;
+        .with_context(|| format!("failed to upsert resource: {}/{}/{}", row.agent_id, row.kind, row.key))?;
 
     Ok(UpsertOutcome { rid, changed: true })
 }
@@ -125,16 +139,16 @@ pub fn replace_turns(
 ) -> Result<()> {
     let tx = conn
         .unchecked_transaction()
-        .context("开启 replace_turns 事务失败")?;
+        .context("failed to begin replace_turns transaction")?;
 
     // 先删 FTS(依赖 turn.tid 反查),再删 turn——顺序不能反。
     tx.execute(
         "DELETE FROM fts_turn WHERE rowid IN (SELECT tid FROM turn WHERE rid = ?1)",
         [rid],
     )
-    .context("清理旧 fts_turn 行失败")?;
+    .context("failed to delete stale fts_turn rows")?;
     tx.execute("DELETE FROM turn WHERE rid = ?1", [rid])
-        .context("清理旧 turn 行失败")?;
+        .context("failed to delete stale turn rows")?;
 
     {
         let mut ins_turn = tx.prepare(
@@ -166,7 +180,8 @@ pub fn replace_turns(
         }
     }
 
-    tx.commit().context("提交 replace_turns 事务失败")
+    tx.commit()
+        .context("failed to commit replace_turns transaction")
 }
 
 /// 删除该 (agent_id, kind) 下本轮扫描没见到的旧资源行,返回删除数。
@@ -183,7 +198,7 @@ pub fn delete_stale_resources(
 
     let tx = conn
         .unchecked_transaction()
-        .context("开启 delete_stale 事务失败")?;
+        .context("failed to begin delete_stale transaction")?;
 
     // 全量拉该 (agent, kind) 的 key 在 Rust 侧过滤:seen_keys 可能上千,
     // 拼 IN 子句既有长度上限又难以参数化。
@@ -199,7 +214,7 @@ pub fn delete_stale_resources(
             Err(e) => Some(Err(e)),
         })
         .collect::<std::result::Result<_, _>>()
-        .context("枚举陈旧 resource 失败")?
+        .context("failed to enumerate stale resources")?
     };
 
     for rid in &stale {
@@ -211,7 +226,8 @@ pub fn delete_stale_resources(
         tx.execute("DELETE FROM resource WHERE rid = ?1", [rid])?;
     }
 
-    tx.commit().context("提交 delete_stale 事务失败")?;
+    tx.commit()
+        .context("failed to commit delete_stale transaction")?;
     Ok(stale.len() as u64)
 }
 
@@ -251,6 +267,8 @@ mod tests {
             mtime_ns: 1_000,
             hash_content: Some([7u8; 32]),
             cheap_print: Some(print),
+            clean_level: None,
+            reclaimable: None,
         }
     }
 

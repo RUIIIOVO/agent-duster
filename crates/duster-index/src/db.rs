@@ -26,7 +26,7 @@ pub struct Index {
 
 /// 锁冲突的可识别错误(CLI 据此映射退出码 5)。
 #[derive(Debug, thiserror::Error)]
-#[error("索引库正被另一个 duster 实例占用: {0}")]
+#[error("index database is locked by another duster instance: {0}")]
 pub struct LockBusy(pub String);
 
 impl Index {
@@ -34,10 +34,10 @@ impl Index {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
-                .with_context(|| format!("创建索引目录失败: {}", dir.display()))?;
+                .with_context(|| format!("failed to create index directory: {}", dir.display()))?;
         }
         let conn = Connection::open(path)
-            .with_context(|| format!("打开索引库失败: {}", path.display()))?;
+            .with_context(|| format!("failed to open index database: {}", path.display()))?;
         Self::tune(&conn)?;
 
         // 单实例写锁:旁路 <db>.lock 库,busy_timeout=0,冲突立即失败而非等待。
@@ -48,7 +48,7 @@ impl Index {
         lock_conn
             .execute_batch("BEGIN EXCLUSIVE")
             .map_err(|e| LockBusy(e.to_string()))
-            .with_context(|| format!("索引库: {}", path.display()))?;
+            .with_context(|| format!("index database: {}", path.display()))?;
 
         schema::migrate(&conn)?;
         Ok(Self {
@@ -63,7 +63,12 @@ impl Index {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .with_context(|| format!("只读打开索引库失败: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to open index database read-only: {}",
+                path.display()
+            )
+        })?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update(None, "query_only", true)?;
         // 只读句柄不需要写锁;_lock_conn 用一个内存库占位,零成本。

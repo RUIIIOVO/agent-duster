@@ -7,7 +7,7 @@
 //! `adapters/claude-code.toml` 文件头注释。
 
 use anyhow::{Context, Result, bail};
-use duster_model::ResourceKind;
+use duster_model::{CleanLevel, ResourceKind};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -101,7 +101,7 @@ pub struct ResourceSection {
     /// 目录型资源的条目匹配模式，如 `*/SKILL.md`。
     #[serde(default)]
     pub glob: Option<String>,
-    /// 仅 artifact 资源：清理级别（再生成本）。
+    /// 仅 artifact 资源：清理级别。artifact 必填，其余 kind 禁写。
     #[serde(default)]
     pub clean_level: Option<CleanLevel>,
 }
@@ -156,6 +156,7 @@ impl MapperName {
     }
 
     /// mapper 是否适用于该资源类别。`stats-only` 通用，其余按前缀对号入座。
+    /// `artifact` / `install` 因此天然只能走 `stats-only`——它们没有可解析的内容模型。
     fn fits(self, kind: ResourceKind) -> bool {
         match self {
             Self::StatsOnly => true,
@@ -167,17 +168,6 @@ impl MapperName {
     }
 }
 
-/// artifact 清理级别：删除后的再生成本，l0 最低（随删随生）、l4 不可再生。
-/// 注意没有 l3——级别是离散档位不是连续刻度，留空位给未来细分。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CleanLevel {
-    L0,
-    L1,
-    L2,
-    L4,
-}
-
 impl Manifest {
     /// 结构之外的语义校验，给出人话错误。serde 已挡掉未知字段/非法枚举值。
     pub fn validate(&self) -> Result<()> {
@@ -187,45 +177,79 @@ impl Manifest {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         {
-            bail!("agent.id `{id}` 不合法：只能用小写字母、数字和连字符，且不能为空");
+            bail!(
+                "agent.id `{id}` is invalid: only lowercase letters, digits, and hyphens are allowed, and it must not be empty"
+            );
         }
         if self.agent.display_name.is_empty() {
-            bail!("[{id}] agent.display_name 不能为空");
+            bail!("[{id}] agent.display_name must not be empty");
         }
 
         let p = &self.probe;
         if p.any_of.is_empty() && p.all_of.is_empty() && p.binary.is_none() {
-            bail!("[{id}] probe 至少要声明 any_of / all_of / binary 之一，否则无从探测");
+            bail!(
+                "[{id}] probe must declare at least one of any_of / all_of / binary, otherwise nothing can be probed"
+            );
         }
         for path in p.any_of.iter().chain(&p.all_of) {
-            ensure_tilde(id, "probe 路径", path)?;
+            ensure_tilde(id, "probe path", path)?;
         }
         if let Some(cmd) = &p.version_cmd
             && cmd.is_empty()
         {
-            bail!("[{id}] probe.version_cmd 不能是空数组");
+            bail!("[{id}] probe.version_cmd must not be an empty array");
         }
 
         for (i, r) in self.resources.iter().enumerate() {
-            let at = format!("[{id}] 第 {} 个 resource（path = {}）", i + 1, r.path);
+            let at = format!("[{id}] resource #{} (path = {})", i + 1, r.path);
             ensure_tilde(id, "resource.path", &r.path)?;
             if let Some(ptr) = &r.json_pointer
                 && !ptr.starts_with('/')
             {
-                bail!("{at}：json_pointer `{ptr}` 必须以 `/` 开头（RFC 6901）");
+                bail!("{at}: json_pointer `{ptr}` must start with `/` (RFC 6901)");
             }
             if r.json_pointer.is_some() && r.toml_key.is_some() {
-                bail!("{at}：json_pointer 与 toml_key 互斥，只能声明其一");
+                bail!("{at}: json_pointer and toml_key are mutually exclusive; declare only one");
             }
             if !r.mapper.fits(r.kind) {
                 bail!(
-                    "{at}：mapper `{}` 不适用于 kind `{:?}`",
+                    "{at}: mapper `{}` is not applicable to kind `{:?}`",
                     r.mapper.as_str(),
                     r.kind
                 );
             }
-            if r.clean_level.is_some() && r.kind != ResourceKind::Artifact {
-                bail!("{at}：clean_level 只有 artifact 资源可以声明");
+            // artifact ⇔ clean_level 是双向绑定：clean_level 是 artifact 的
+            // 定义（"可清理，代价是这个"），不是可选修饰。漏写会让 clean 面对
+            // 一个不知道该不该动的目录，写在别的 kind 上则是在给不可清理的
+            // 东西发清理许可——两个方向都直接拒绝加载。
+            match r.kind {
+                ResourceKind::Artifact if r.clean_level.is_none() => bail!(
+                    "{at}: artifact resources must declare clean_level (l0 / l1 / l2). \
+                     If it cannot be cleaned without reinstalling, it is not an artifact — \
+                     declare it as kind = \"install\" instead"
+                ),
+                ResourceKind::Artifact => {}
+                _ if r.clean_level.is_some() => bail!(
+                    "{at}: clean_level may only be declared on artifact resources; \
+                     kind `{:?}` is never cleaned",
+                    r.kind
+                ),
+                _ => {}
+            }
+
+            // 重叠路径禁止：体积按声明路径独立聚合，父子同时声明会双算，
+            // 「总共多少 GB / 能清多少」当场失真。真要拆细粒度，得先让
+            // scan 支持子树扣减；在那之前，清单层直接把它拦在门外。
+            for (j, other) in self.resources.iter().enumerate().take(i) {
+                if path_contains(&other.path, &r.path) || path_contains(&r.path, &other.path) {
+                    bail!(
+                        "{at}: path overlaps resource #{} ({}); sizes are aggregated per \
+                         declared path, so nesting one inside the other double-counts bytes. \
+                         Declare the outer path only",
+                        j + 1,
+                        other.path
+                    );
+                }
             }
         }
         Ok(())
@@ -237,7 +261,20 @@ fn ensure_tilde(id: &str, what: &str, path: &str) -> Result<()> {
     if path == "~" || path.starts_with("~/") {
         Ok(())
     } else {
-        bail!("[{id}] {what} `{path}` 必须以 `~/` 开头（清单层不展开、不接受其他形式）");
+        bail!(
+            "[{id}] {what} `{path}` must start with `~/` (the manifest layer does not expand paths or accept other forms)"
+        );
+    }
+}
+
+/// `outer` 是否等于 `inner` 或为其祖先目录。按路径分段比较，
+/// `~/.claude/cache` 因此不会被误判为 `~/.claude/cache-v2` 的祖先。
+fn path_contains(outer: &str, inner: &str) -> bool {
+    let outer = outer.trim_end_matches('/');
+    match inner.trim_end_matches('/').strip_prefix(outer) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -252,8 +289,19 @@ fn parse(src: &str) -> Result<Manifest> {
 pub fn load_builtin() -> Vec<Manifest> {
     BUILTIN
         .iter()
-        .map(|(name, src)| parse(src).unwrap_or_else(|e| panic!("内置清单 {name} 损坏：{e:#}")))
+        .map(|(name, src)| {
+            parse(src).unwrap_or_else(|e| panic!("built-in manifest {name} is corrupt: {e:#}"))
+        })
         .collect()
+}
+
+/// 内置清单的原始源文本（文件名, 内容），顺序与 [`BUILTIN`] 声明一致。
+///
+/// 给上层算「解析规则指纹」用：清单文本决定了同一份源文件被怎么解析，
+/// 所以它必须进指纹。给源文本而不是解析后的结构，是为了免掉给整棵
+/// `Manifest` 加 `Serialize`；代价是改注释也会让指纹变，可以接受。
+pub fn builtin_sources() -> &'static [(&'static str, &'static str)] {
+    BUILTIN
 }
 
 /// 加载用户清单目录（`~/.agent-duster/adapters/*.toml`）。
@@ -263,7 +311,7 @@ pub fn load_user_dir(dir: &Path) -> Result<Vec<Manifest>> {
         return Ok(Vec::new());
     }
     let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .with_context(|| format!("读取用户清单目录 {} 失败", dir.display()))?
+        .with_context(|| format!("failed to read user manifest directory {}", dir.display()))?
         .collect::<std::io::Result<_>>()?;
     // 按文件名排序,保证加载顺序稳定。
     entries.sort_by_key(|e| e.file_name());
@@ -275,8 +323,9 @@ pub fn load_user_dir(dir: &Path) -> Result<Vec<Manifest>> {
             continue;
         }
         let src = std::fs::read_to_string(&path)
-            .with_context(|| format!("读取用户清单 {} 失败", path.display()))?;
-        let m = parse(&src).with_context(|| format!("用户清单 {} 不合法", path.display()))?;
+            .with_context(|| format!("failed to read user manifest {}", path.display()))?;
+        let m =
+            parse(&src).with_context(|| format!("invalid user manifest: {}", path.display()))?;
         out.push(m);
     }
     Ok(out)
@@ -349,22 +398,24 @@ any_of = ["~/.demo"]
             |r| r.kind == ResourceKind::Session && r.mapper == MapperName::NativeClaudeSession
         ));
 
-        // Artifact ×4：clean_level 依次 l2/l1/l1/l1。
+        // Install：插件本体不参与清理，clean_level 必须为空。
+        let install: Vec<_> = m
+            .resources
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Install)
+            .collect();
+        assert_eq!(install.len(), 1);
+        assert_eq!(install[0].path, "~/.claude/plugins");
+        assert_eq!(install[0].clean_level, None);
+
+        // Artifact ×3：全是自动重建的缓存类，一律 l1。
         let levels: Vec<_> = m
             .resources
             .iter()
             .filter(|r| r.kind == ResourceKind::Artifact)
-            .map(|r| r.clean_level.unwrap())
+            .map(|r| r.clean_level.expect("artifact 必须有 clean_level"))
             .collect();
-        assert_eq!(
-            levels,
-            [
-                CleanLevel::L2,
-                CleanLevel::L1,
-                CleanLevel::L1,
-                CleanLevel::L1
-            ]
-        );
+        assert_eq!(levels, [CleanLevel::L1, CleanLevel::L1, CleanLevel::L1]);
     }
 
     #[test]
@@ -454,11 +505,94 @@ path = "~/.demo/skills"
 mapper = "mcp/standard-json"
 "#,
         );
-        assert!(parse(&src).unwrap_err().to_string().contains("不适用"));
+        assert!(
+            parse(&src)
+                .unwrap_err()
+                .to_string()
+                .contains("not applicable")
+        );
 
         // probe 三无。
         let src = minimal("").replace("any_of = [\"~/.demo\"]", "");
         assert!(parse(&src).unwrap_err().to_string().contains("probe"));
+    }
+
+    /// artifact 必须自带 clean_level：漏写等于让 clean 面对一个不知道
+    /// 该不该动的目录，错误信息必须把人引向 `install`。
+    #[test]
+    fn artifact_without_clean_level_is_rejected() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/cache"
+mapper = "stats-only"
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("must declare clean_level"), "{err}");
+        assert!(err.contains("install"), "错误信息要指出正确归类: {err}");
+    }
+
+    /// install 是"删了等于卸载"的软件本体：给它发清理许可必须被拒。
+    #[test]
+    fn install_with_clean_level_is_rejected() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "install"
+scope = "global"
+path = "~/.demo/extensions"
+mapper = "stats-only"
+clean_level = "l1"
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("never cleaned"), "{err}");
+    }
+
+    /// 父子路径同时声明会把同一批字节算两遍，直接拒绝加载。
+    #[test]
+    fn nested_resource_paths_are_rejected() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "install"
+scope = "global"
+path = "~/.demo/plugins"
+mapper = "stats-only"
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/plugins/cache"
+mapper = "stats-only"
+clean_level = "l1"
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("double-counts"), "{err}");
+
+        // 只是同前缀、不是同一层级的兄弟目录，必须放行。
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/cache"
+mapper = "stats-only"
+clean_level = "l1"
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/cache-v2"
+mapper = "stats-only"
+clean_level = "l1"
+"#,
+        );
+        assert!(parse(&src).is_ok());
     }
 
     #[test]

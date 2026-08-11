@@ -29,10 +29,11 @@ scope = "global"
 path = "~/.pi/agent/settings.json"
 mapper = "stats-only"
 
-# ── Artifact:随附工具二进制(fd/rg 等,可重新下载)───────────────────────
+# ── Install:随附工具二进制(fd/rg 等)───────────────────────────────────
+# 曾被标 artifact/l1「自动重新下载」——重新下载要联网,失败则 Pi 的搜索
+# 能力直接缺失。属安装产物,不参与清理。
 [[resource]]
-kind = "artifact"
+kind = "install"
 scope = "global"
 path = "~/.pi/agent/bin"
 mapper = "stats-only"
-clean_level = "l1"   # 辅助工具,自动重新下载

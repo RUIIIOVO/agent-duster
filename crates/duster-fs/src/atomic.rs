@@ -26,26 +26,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = tempfile::Builder::new()
         .prefix(".tmp-duster-")
         .tempfile_in(&dir)
-        .with_context(|| format!("在 {} 创建临时文件失败", dir.display()))?;
+        .with_context(|| format!("failed to create temp file in {}", dir.display()))?;
 
     tmp.write_all(bytes)
-        .with_context(|| format!("写入临时文件 {} 失败", tmp.path().display()))?;
-    tmp.flush().context("flush 临时文件失败")?;
-    tmp.as_file().sync_all().context("fsync 临时文件失败")?;
+        .with_context(|| format!("failed to write temp file {}", tmp.path().display()))?;
+    tmp.flush().context("failed to flush temp file")?;
+    tmp.as_file()
+        .sync_all()
+        .context("failed to fsync temp file")?;
 
     tmp.persist(path)
-        .with_context(|| format!("rename 到 {} 失败", path.display()))?;
+        .with_context(|| format!("failed to rename to {}", path.display()))?;
 
     if let Some(perms) = prev_perms {
         fs::set_permissions(path, perms)
-            .with_context(|| format!("恢复 {} 权限失败", path.display()))?;
+            .with_context(|| format!("failed to restore permissions on {}", path.display()))?;
     }
 
     // fsync 父目录,让 rename 产生的目录项变更真正落盘。
-    let dir_fd = File::open(&dir).with_context(|| format!("打开父目录 {} 失败", dir.display()))?;
+    let dir_fd = File::open(&dir)
+        .with_context(|| format!("failed to open parent directory {}", dir.display()))?;
     dir_fd
         .sync_all()
-        .with_context(|| format!("fsync 父目录 {} 失败", dir.display()))?;
+        .with_context(|| format!("failed to fsync parent directory {}", dir.display()))?;
 
     Ok(())
 }

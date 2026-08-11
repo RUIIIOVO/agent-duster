@@ -22,6 +22,14 @@ pub struct AgentStatus {
     pub bytes: u64,
     /// 各 kind 的资源行数,如 `{"mcp": 2, "session": 40}`。
     pub kind_counts: BTreeMap<String, u64>,
+    /// 各 kind 的体积合计(字节)。
+    pub kind_bytes: BTreeMap<String, u64>,
+    /// **可回收**字节按清理级别拆分(`l0`/`l1`/`l2` -> 字节)。
+    ///
+    /// 记的是"清掉能拿回多少"而非"占了多少":l0 只算 SQLite 空洞。
+    /// `install` 永远不出现在这里——软件本体从不参与清理,
+    /// 把它算进"能清出多少"是在骗自己。
+    pub clean_bytes: BTreeMap<String, u64>,
 }
 
 /// `duster status` 的汇总报告。
@@ -39,12 +47,12 @@ pub fn status(index_path: Option<&Path>) -> Result<StatusReport> {
     };
     if !path.is_file() {
         bail!(
-            "索引库不存在: {}。请先运行 `duster scan` 建立索引。",
+            "index database not found: {}. Run `duster scan` first to build it.",
             path.display()
         );
     }
     let idx = Index::open_readonly(&path)
-        .with_context(|| format!("只读打开索引失败: {}", path.display()))?;
+        .with_context(|| format!("failed to open index read-only: {}", path.display()))?;
     let conn = idx.conn();
 
     let mut agents: Vec<AgentStatus> = Vec::new();
@@ -66,6 +74,8 @@ pub fn status(index_path: Option<&Path>) -> Result<StatusReport> {
                 last_scan_ms,
                 bytes: 0,
                 kind_counts: BTreeMap::new(),
+                kind_bytes: BTreeMap::new(),
+                clean_bytes: BTreeMap::new(),
             });
         }
     }
@@ -85,10 +95,27 @@ pub fn status(index_path: Option<&Path>) -> Result<StatusReport> {
         })?;
         for r in rows {
             let (kind, count, size) = r?;
-            a.kind_counts.insert(kind, count.max(0) as u64);
+            a.kind_counts.insert(kind.clone(), count.max(0) as u64);
+            a.kind_bytes.insert(kind, size.max(0) as u64);
             a.bytes += size.max(0) as u64;
         }
         total_bytes += a.bytes;
+
+        // 汇总 reclaimable 而不是 size:l0 的文件里活数据还在,
+        // 拿文件大小当回收量会虚报。老库(v3 之前扫的行)该列为 NULL,
+        // COALESCE 记 0——宁可少报,不能多报。
+        let mut stmt = conn.prepare(
+            "SELECT clean_level, COALESCE(SUM(reclaimable), 0) FROM resource \
+             WHERE agent_id = ?1 AND clean_level IS NOT NULL \
+             GROUP BY clean_level ORDER BY clean_level",
+        )?;
+        let rows = stmt.query_map((a.agent_id.as_str(),), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for r in rows {
+            let (level, reclaimable) = r?;
+            a.clean_bytes.insert(level, reclaimable.max(0) as u64);
+        }
     }
 
     Ok(StatusReport {

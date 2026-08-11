@@ -24,8 +24,10 @@ use duster_adapter::native::{claude_session, codex_session};
 use duster_adapter::probe::{self, ProbeSpec};
 use duster_fs::walk::{WalkOptions, walk_files, walk_stats};
 use duster_index::db::Index;
+use duster_index::meta;
+use duster_index::sqlite_probe;
 use duster_index::upsert::{self, ResourceRow};
-use duster_model::{AgentInfo, ResourceKind};
+use duster_model::{AgentInfo, CleanLevel, ResourceKind};
 
 /// scan 的输入选项。
 #[derive(Debug, Clone, Default)]
@@ -47,6 +49,14 @@ pub struct AgentReport {
     pub resources: usize,
     /// 各资源类的行数(kind -> 数量),零计数的 kind 不出现。
     pub kind_counts: BTreeMap<String, usize>,
+    /// 各资源类的体积合计(kind -> 字节)。
+    pub kind_bytes: BTreeMap<String, u64>,
+    /// **可回收**字节按清理级别拆分(`l0`/`l1`/`l2` -> 字节)。
+    ///
+    /// 只有 artifact 行进这里,且记的是"清掉能拿回多少"而不是"占了多少":
+    /// l1/l2 两者相同,l0 只算 SQLite 空洞。单看 `kind_bytes["artifact"]`
+    /// 既会把无损回收和需确认的删除混为一谈,又会把 l0 的活数据算成收益。
+    pub clean_bytes: BTreeMap<String, u64>,
     /// 本轮资源体积合计(mcp 配置行计 0,见 [`ResourceRow`] 约定)。
     pub bytes: u64,
     /// 本轮真正重解析入索引的会话文件数(增量短路的不算)。
@@ -57,9 +67,17 @@ pub struct AgentReport {
 
 impl AgentReport {
     /// 记一行资源:总数、分类计数、体积一次记齐。
-    fn tally(&mut self, kind: &str, bytes: u64) {
+    /// `clean` 非空(仅 artifact)时同时落进分级可回收账本。
+    fn tally(&mut self, kind: &str, bytes: u64, clean: Option<(CleanLevel, u64)>) {
         self.resources += 1;
         *self.kind_counts.entry(kind.to_string()).or_insert(0) += 1;
+        *self.kind_bytes.entry(kind.to_string()).or_insert(0) += bytes;
+        if let Some((level, reclaimable)) = clean {
+            *self
+                .clean_bytes
+                .entry(level.as_str().to_string())
+                .or_insert(0) += reclaimable;
+        }
         self.bytes += bytes;
     }
 }
@@ -80,6 +98,10 @@ pub struct ScanReport {
     /// agents 与 unclassified 的字节数总和。
     pub total_bytes: u64,
     pub duration_ms: u64,
+    /// 解析规则指纹与库内不一致,本轮已自动转全量重解析。
+    ///
+    /// 首次扫描(库内还没有指纹)不算变更——资源行本来就是空的,全解析是常态。
+    pub rules_changed: bool,
 }
 
 /// 疑似 agent 数据目录的候选表(来源 = todo 附录「unclassified 候选目录」)。
@@ -96,8 +118,44 @@ const UNCLASSIFIED_CANDIDATES: &[&str] = &[
     "~/.baoyu-skills",
 ];
 
-/// 五大资源类的库内 kind 字符串,顺序与 [`ResourceKind`] 一致。
-const ALL_KINDS: [&str; 5] = ["mcp", "skill", "memory", "session", "artifact"];
+/// 六大资源类的库内 kind 字符串,顺序与 [`ResourceKind`] 一致。
+const ALL_KINDS: [&str; 6] = ["mcp", "skill", "memory", "session", "artifact", "install"];
+
+/// 原生会话解析器的纪元号。
+///
+/// **改了 `duster_adapter::native::*` 的解析行为就必须 +1**——清单是数据、
+/// 改动会自动进指纹,但解析器是代码、哈希看不见,只能靠这个手动闸门。
+/// 递增后用户下次 `duster scan` 会自动全量重解析,无需知道 `--full`。
+const NATIVE_PARSER_EPOCH: u32 = 1;
+
+/// 计算解析规则指纹。
+///
+/// 覆盖「同一份源文件的解析结果可能变化」的全部输入:原生解析器纪元、
+/// 内置清单源文本、用户清单目录下每个 `.toml` 的文件名与内容。
+/// 任何一项变化都会换指纹,scan 据此自动转全量。
+fn parser_epoch(user_dir: &Path) -> Result<String> {
+    let mut h = blake3::Hasher::new();
+    h.update(&NATIVE_PARSER_EPOCH.to_le_bytes());
+    for (name, src) in manifest::builtin_sources() {
+        h.update(name.as_bytes());
+        h.update(src.as_bytes());
+    }
+    if user_dir.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(user_dir)
+            .with_context(|| format!("failed to read {}", user_dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        files.sort(); // 指纹必须与目录遍历顺序无关。
+        for f in &files {
+            h.update(f.file_name().unwrap_or_default().as_encoded_bytes());
+            let src =
+                std::fs::read(f).with_context(|| format!("failed to read {}", f.display()))?;
+            h.update(&src);
+        }
+    }
+    Ok(h.finalize().to_hex().to_string())
+}
 
 /// 执行一次扫描:probe → 采集 → upsert → 清理 stale → unclassified 统计。
 pub fn scan(opts: &ScanOptions) -> Result<ScanReport> {
@@ -108,13 +166,23 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanReport> {
         .clone()
         .unwrap_or_else(|| default_index_path(&home));
 
-    let manifests = manifest::load_all(Some(&home.join(".agent-duster").join("adapters")))?;
+    let adapters_dir = home.join(".agent-duster").join("adapters");
+    let manifests = manifest::load_all(Some(&adapters_dir))?;
     let idx = Index::open(&index_path)?;
+
+    // 解析规则变了 → 旧 turn 是用旧规则解出来的,指纹却没变,增量会静默留下
+    // 过期数据。这里自动转全量,用户不必知道 `--full` 的存在。
+    let epoch = parser_epoch(&adapters_dir)?;
+    let stored = meta::get(idx.conn(), meta::PARSER_EPOCH)?;
+    let rules_changed = matches!(&stored, Some(s) if s != &epoch);
+    let full = opts.full || rules_changed;
 
     let mut agents = Vec::with_capacity(manifests.len());
     for m in &manifests {
-        agents.push(scan_agent(&idx, m, &home, opts.full)?);
+        agents.push(scan_agent(&idx, m, &home, full)?);
     }
+    // 只有整轮走完才落指纹:中途失败保持旧值,下次仍会重解析。
+    meta::set(idx.conn(), meta::PARSER_EPOCH, &epoch)?;
     drop(idx); // 尽早释放单实例写锁,unclassified 统计不需要索引。
 
     let unclassified = collect_unclassified(&manifests, &home);
@@ -126,6 +194,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanReport> {
         unclassified,
         total_bytes,
         duration_ms: started.elapsed().as_millis() as u64,
+        rules_changed,
     })
 }
 
@@ -141,7 +210,7 @@ fn resolve_home(injected: Option<&Path>) -> Result<PathBuf> {
     }
     let h = duster_fs::path::expand_tilde("~");
     if h == Path::new("~") {
-        bail!("无法确定用户主目录(HOME 未设置)");
+        bail!("cannot determine home directory (HOME is not set)");
     }
     Ok(h)
 }
@@ -173,6 +242,8 @@ fn scan_agent(idx: &Index, m: &Manifest, home: &Path, full: bool) -> Result<Agen
         installed: outcome.installed,
         resources: 0,
         kind_counts: BTreeMap::new(),
+        kind_bytes: BTreeMap::new(),
+        clean_bytes: BTreeMap::new(),
         bytes: 0,
         sessions_indexed: 0,
         warnings: Vec::new(),
@@ -188,7 +259,7 @@ fn scan_agent(idx: &Index, m: &Manifest, home: &Path, full: bool) -> Result<Agen
         version: outcome.version.clone(),
     };
     upsert::upsert_agent(idx.conn(), &info, now_ms())
-        .with_context(|| format!("写入 agent `{agent_id}` 失败"))?;
+        .with_context(|| format!("failed to write agent `{agent_id}`"))?;
 
     // 本轮各 kind 见到的 key,收尾时据此清 stale(没声明的 kind 也要清:
     // 清单撤掉某类资源后,旧行必须跟着消失)。
@@ -197,17 +268,20 @@ fn scan_agent(idx: &Index, m: &Manifest, home: &Path, full: bool) -> Result<Agen
 
     for r in &m.resources {
         let kind = kind_str(r.kind);
-        let seen_kind = seen.get_mut(kind).expect("ALL_KINDS 覆盖全部资源类");
+        let seen_kind = seen
+            .get_mut(kind)
+            .expect("ALL_KINDS covers every resource kind");
         if let Err(e) = scan_resource(idx, &agent_id, r, home, full, seen_kind, &mut report) {
-            report
-                .warnings
-                .push(format!("资源 {}({kind})采集失败: {e:#}", r.path));
+            report.warnings.push(format!(
+                "failed to collect resource {} ({kind}): {e:#}",
+                r.path
+            ));
         }
     }
 
     for kind in ALL_KINDS {
         upsert::delete_stale_resources(idx.conn(), &agent_id, kind, &seen[kind])
-            .with_context(|| format!("清理 `{agent_id}` 的 stale {kind} 失败"))?;
+            .with_context(|| format!("failed to clean stale {kind} rows for `{agent_id}`"))?;
     }
     Ok(report)
 }
@@ -249,8 +323,8 @@ fn scan_mcp(
     if !cfg.is_file() {
         return Ok(()); // 装了 agent 但没配过 MCP,不算异常。
     }
-    let meta =
-        std::fs::metadata(cfg).with_context(|| format!("读取元数据失败: {}", cfg.display()))?;
+    let meta = std::fs::metadata(cfg)
+        .with_context(|| format!("failed to read metadata: {}", cfg.display()))?;
     let mtime_ns = mtime_ns_of(&meta);
     let doc = codec::read_file(cfg)?;
 
@@ -275,7 +349,7 @@ fn scan_mcp(
                 .unwrap_or_default()
         }
         _ => bail!(
-            "mapper `{}` 与文件实际格式不匹配: {}",
+            "mapper `{}` does not match the file's actual format: {}",
             r.mapper.as_str(),
             cfg.display()
         ),
@@ -293,11 +367,13 @@ fn scan_mcp(
             mtime_ns,
             hash_content: Some(*s.content_hash().as_bytes()),
             cheap_print: None,
+            clean_level: None,
+            reclaimable: None,
         };
         upsert::upsert_resource(idx.conn(), &row)
-            .with_context(|| format!("upsert mcp `{}` 失败", s.name))?;
+            .with_context(|| format!("failed to upsert mcp `{}`", s.name))?;
         seen.push(s.name.clone());
-        report.tally("mcp", 0);
+        report.tally("mcp", 0, None);
     }
     Ok(())
 }
@@ -327,16 +403,19 @@ fn scan_skills(
                 mtime_ns: mtime_ns_of(&meta),
                 hash_content: None,
                 cheap_print: None,
+                clean_level: None,
+                reclaimable: None,
             };
             upsert::upsert_resource(idx.conn(), &row)?;
             seen.push(s.name.clone());
-            report.tally("skill", stats.total_bytes);
+            report.tally("skill", stats.total_bytes, None);
             Ok(())
         })();
         if let Err(e) = result {
-            report
-                .warnings
-                .push(format!("skill `{}` 统计失败: {e:#}", s.name));
+            report.warnings.push(format!(
+                "failed to collect stats for skill `{}`: {e:#}",
+                s.name
+            ));
         }
     }
     Ok(())
@@ -354,8 +433,8 @@ fn scan_memory(
     if !file.is_file() {
         return Ok(());
     }
-    let meta =
-        std::fs::metadata(file).with_context(|| format!("读取元数据失败: {}", file.display()))?;
+    let meta = std::fs::metadata(file)
+        .with_context(|| format!("failed to read metadata: {}", file.display()))?;
     let key = file_name_of(file);
     let row = ResourceRow {
         agent_id: agent_id.to_string(),
@@ -367,10 +446,12 @@ fn scan_memory(
         mtime_ns: mtime_ns_of(&meta),
         hash_content: None,
         cheap_print: None,
+        clean_level: None,
+        reclaimable: None,
     };
     upsert::upsert_resource(idx.conn(), &row)?;
     seen.push(key);
-    report.tally("memory", meta.len());
+    report.tally("memory", meta.len(), None);
     Ok(())
 }
 
@@ -410,9 +491,10 @@ fn scan_sessions(
 
     for f in &files {
         if let Err(e) = index_session_file(idx, agent_id, r, f, full, is_codex, seen, report) {
-            report
-                .warnings
-                .push(format!("会话文件 {} 索引失败: {e:#}", f.display()));
+            report.warnings.push(format!(
+                "failed to index session file {}: {e:#}",
+                f.display()
+            ));
         }
     }
     Ok(())
@@ -442,10 +524,12 @@ fn index_session_file(
         mtime_ns: cp.mtime_ns,
         hash_content: None,
         cheap_print: Some(cp.to_bytes()),
+        clean_level: None,
+        reclaimable: None,
     };
     let outcome = upsert::upsert_resource(idx.conn(), &row)?;
     seen.push(key);
-    report.tally("session", cp.size);
+    report.tally("session", cp.size, None);
 
     if outcome.changed || full {
         let (_meta, turns) = if is_codex {
@@ -459,7 +543,8 @@ fn index_session_file(
     Ok(())
 }
 
-/// stats-only(含 artifact):目录聚合体积一行,或单文件一行;不解析内容。
+/// stats-only(artifact / install / 格式未证实的 memory·session):
+/// 目录聚合体积一行,或单文件一行;不解析内容。
 fn scan_stats_only(
     idx: &Index,
     agent_id: &str,
@@ -479,7 +564,22 @@ fn scan_stats_only(
         return Ok(());
     };
 
-    let key = file_name_of(path);
+    // key 取清单里声明的 `~` 形式路径,不取 basename:同一 agent 下
+    // `~/.x/a/cache` 与 `~/.x/b/cache` 的 basename 相同,会撞上
+    // UNIQUE(agent_id, kind, scope, key) 把两个目录塌成一行、体积互相覆盖。
+    // 声明路径在单份清单内唯一由 Manifest::validate 的重叠检查保证(路径
+    // 相等即互为前缀,直接拒绝加载)。
+    let key = r.path.clone();
+    let level = r.clean_level;
+    // 可回收量 ≠ 占用量。l1/l2 是整个删掉,两者相等;l0 只回收空洞——
+    // 一个 784 MB 的日志库里可能只有 774 MB 是空闲页,VACUUM 后剩下的
+    // 真实数据还在。估不出来(不是 SQLite / 库被独占)就记 0,绝不拿 size 兜底:
+    // 把"占了多少"当"能清多少"报给用户,是这次改造要根除的那类谎。
+    let reclaimable = match level {
+        None => None,
+        Some(CleanLevel::L0) => Some(sqlite_probe::vacuum_reclaimable(path)?.unwrap_or(0)),
+        Some(_) => Some(size),
+    };
     let row = ResourceRow {
         agent_id: agent_id.to_string(),
         kind: kind_str(r.kind).to_string(),
@@ -490,10 +590,12 @@ fn scan_stats_only(
         mtime_ns,
         hash_content: None,
         cheap_print: None,
+        clean_level: level.map(|l| l.as_str().to_string()),
+        reclaimable,
     };
     upsert::upsert_resource(idx.conn(), &row)?;
     seen.push(key);
-    report.tally(kind_str(r.kind), size);
+    report.tally(kind_str(r.kind), size, level.zip(reclaimable));
     Ok(())
 }
 
@@ -540,6 +642,7 @@ fn kind_str(k: ResourceKind) -> &'static str {
         ResourceKind::Memory => "memory",
         ResourceKind::Session => "session",
         ResourceKind::Artifact => "artifact",
+        ResourceKind::Install => "install",
     }
 }
 
@@ -796,6 +899,195 @@ any_of = ["~/.ghost-nowhere"]
         assert_eq!(a.kind_counts.get("session").copied(), Some(1));
         assert_eq!(a.kind_counts.get("artifact").copied(), Some(1));
         assert!(st.total_bytes > 0);
+    }
+
+    /// 分类学的三条硬契约,一次全测:
+    /// 1. `install` 永不进可回收账本——软件本体不是收益;
+    /// 2. l0 记的是空洞而不是文件大小——一个 SQLite 库里的活数据不算收益;
+    /// 3. scan(进程内累加)与 status(SQL 聚合)对同一份索引必须给出同一个数。
+    ///
+    /// 这三条是「clean 永不卸载用户软件 / 永不虚报回收量」在 clean 落地前
+    /// 唯一的机器守卫。
+    #[test]
+    fn install_不计回收_l0_只算空洞_scan与status一致() {
+        const MANIFEST: &str = r#"
+[agent]
+id = "taxo-agent"
+display_name = "Taxonomy"
+
+[probe]
+any_of = ["~/.taxo"]
+
+[[resource]]
+kind = "install"
+scope = "global"
+path = "~/.taxo/extensions"
+mapper = "stats-only"
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.taxo/cache"
+mapper = "stats-only"
+clean_level = "l1"
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.taxo/logs.sqlite"
+mapper = "stats-only"
+clean_level = "l0"
+"#;
+        let home = TempHome::new("taxonomy");
+        let adapters = home.path().join(".agent-duster/adapters");
+        fs::create_dir_all(&adapters).unwrap();
+        fs::write(adapters.join("taxo-agent.toml"), MANIFEST).unwrap();
+
+        let root = home.path().join(".taxo");
+        // install:一块很大的"软件本体"。
+        fs::create_dir_all(root.join("extensions")).unwrap();
+        fs::write(root.join("extensions/bin"), vec![0u8; 64 * 1024]).unwrap();
+        // l1:整块都能回收的缓存。
+        fs::create_dir_all(root.join("cache")).unwrap();
+        fs::write(root.join("cache/blob"), vec![0u8; 4096]).unwrap();
+        // l0:真的 SQLite 库,借索引层建(省一个 rusqlite 直依赖)。
+        let sqlite_path = root.join("logs.sqlite");
+        drop(Index::open(&sqlite_path).unwrap());
+
+        let index_path = home.path().join(".agent-duster/index.db");
+        let opts = ScanOptions {
+            home: Some(home.path().to_path_buf()),
+            index_path: Some(index_path.clone()),
+            full: false,
+        };
+        let report = scan(&opts).unwrap();
+        let a = report
+            .agents
+            .iter()
+            .find(|x| x.agent_id == "taxo-agent")
+            .expect("报告里应有 taxo-agent");
+        assert!(a.warnings.is_empty(), "warnings: {:?}", a.warnings);
+
+        // 1. install 占了体积,但一个字节都不算可回收。
+        let install_bytes = a.kind_bytes.get("install").copied().unwrap_or(0);
+        assert!(install_bytes >= 64 * 1024, "install 应统计体积");
+        assert!(
+            !a.clean_bytes.contains_key("install"),
+            "install 不得出现在分级账本里"
+        );
+        let clean_total: u64 = a.clean_bytes.values().sum();
+        assert!(
+            clean_total < install_bytes,
+            "可回收量 {clean_total} 不该把 {install_bytes} 的软件本体算进去"
+        );
+
+        // 2. l1 整块回收;l0 只回收空洞,必须小于文件本身。
+        assert_eq!(a.clean_bytes.get("l1").copied(), Some(4096));
+        let sqlite_size = fs::metadata(&sqlite_path).unwrap().len();
+        let l0 = a.clean_bytes.get("l0").copied().expect("l0 应有账");
+        assert!(sqlite_size > 0);
+        assert!(
+            l0 < sqlite_size,
+            "l0 记了 {l0},文件才 {sqlite_size}——空洞不可能等于整个库"
+        );
+
+        // 3. 两条独立的计算路径必须收敛到同一个数。
+        let st = crate::status::status(Some(&index_path)).unwrap();
+        let s = st
+            .agents
+            .iter()
+            .find(|x| x.agent_id == "taxo-agent")
+            .unwrap();
+        assert_eq!(
+            s.clean_bytes, a.clean_bytes,
+            "status 的 SQL 聚合与 scan 的进程内累加对不上"
+        );
+        assert_eq!(s.kind_bytes.get("install").copied(), Some(install_bytes));
+    }
+
+    /// 解析规则变了 → 下次扫描自动全量重解析,用户无需知道 `--full`。
+    ///
+    /// 这是增量的唯一正确性缺口:清单/解析器改了,文件指纹却没变,
+    /// 增量会静默留下按旧规则解析的 turn。
+    #[test]
+    fn 清单变更后_下次扫描自动全量重解析() {
+        let home = TempHome::new("epoch");
+        build_fake_home(home.path());
+        let index_path = home.path().join(".agent-duster/index.db");
+        let opts = ScanOptions {
+            home: Some(home.path().to_path_buf()),
+            index_path: Some(index_path.clone()),
+            full: false,
+        };
+
+        // 首次:全解析,但不算「规则变更」——库里本来就没指纹。
+        let first = scan(&opts).unwrap();
+        assert!(!first.rules_changed, "首次扫描不该报规则变更");
+        assert_eq!(fake_of(&first).sessions_indexed, 1);
+
+        // 二次无改动:增量短路。
+        let second = scan(&opts).unwrap();
+        assert!(!second.rules_changed);
+        assert_eq!(fake_of(&second).sessions_indexed, 0);
+
+        // 改用户清单(这里加一行注释就够——源文本进指纹)。
+        let adapters = home.path().join(".agent-duster/adapters");
+        fs::write(
+            adapters.join("fake-agent.toml"),
+            format!("{FAKE_MANIFEST}\n# rules tweaked\n"),
+        )
+        .unwrap();
+
+        // 三次:文件指纹没变,但规则指纹变了 → 自动全量。
+        let third = scan(&opts).unwrap();
+        assert!(third.rules_changed, "清单改了却没触发全量");
+        assert_eq!(fake_of(&third).sessions_indexed, 1);
+
+        // 四次:新指纹已落库,回到增量。
+        let fourth = scan(&opts).unwrap();
+        assert!(!fourth.rules_changed);
+        assert_eq!(fake_of(&fourth).sessions_indexed, 0);
+    }
+
+    /// artifact 的体积要能从 scan 与 status 两侧都读到(CLI 用它出「能清多少」)。
+    #[test]
+    fn artifact_体积在_scan_与_status_两侧一致() {
+        let home = TempHome::new("kindbytes");
+        build_fake_home(home.path());
+        let index_path = home.path().join(".agent-duster/index.db");
+        let report = scan(&ScanOptions {
+            home: Some(home.path().to_path_buf()),
+            index_path: Some(index_path.clone()),
+            full: false,
+        })
+        .unwrap();
+
+        // artifacts/cache.bin 是 128 字节。
+        let scanned = fake_of(&report)
+            .kind_bytes
+            .get("artifact")
+            .copied()
+            .unwrap();
+        assert_eq!(scanned, 128);
+
+        let st = crate::status::status(Some(&index_path)).unwrap();
+        let a = st
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "fake-agent")
+            .unwrap();
+        assert_eq!(a.kind_bytes.get("artifact").copied(), Some(128));
+        // mcp 行按约定体积计 0,不该混进 artifact。
+        assert_eq!(a.kind_bytes.get("mcp").copied(), Some(0));
+    }
+
+    /// 取报告里的 fake-agent,测试内多处复用。
+    fn fake_of(report: &ScanReport) -> &AgentReport {
+        report
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "fake-agent")
+            .expect("报告里应有 fake-agent")
     }
 
     #[test]

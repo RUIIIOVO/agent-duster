@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// 当前 schema 版本。新增迁移时递增，并在 [`migrate`] 中追加对应分支。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// v1 全量 DDL。
 ///
@@ -62,17 +62,63 @@ CREATE VIRTUAL TABLE fts_turn USING fts5(
 );
 ";
 
+/// v2：`meta` 键值表。
+///
+/// 存跨扫描保留的小状态，目前只有 `parser_epoch`（解析规则指纹，见
+/// duster-core 的 scan）。刻意做成 key/value 而不是加列：这类状态是全库级的、
+/// 数量少、schema 会随功能长，键值表免掉后续每加一项就来一次迁移。
+const V2_DDL: &str = "
+CREATE TABLE meta(
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+";
+
+/// v3：`resource.clean_level` + `resource.reclaimable`。
+///
+/// - `clean_level`：清理级别是清单声明的属性，但 clean 的计划生成是纯读
+///   索引的（不重跑 probe、不重解析清单），所以级别必须随资源行一起落库。
+///   可空：只有 `kind = 'artifact'` 的行有值，其余 kind 恒为 NULL——
+///   "有没有值"本身就是"能不能清"的判据，不需要再回查清单。
+/// - `reclaimable`：**清掉这一项真正能拿回多少字节**，与 `size`（这一项
+///   占了多少）是两个数。l1/l2 两者相等（整个删掉）；l0 只回收空洞，
+///   例如一个 784 MB 的 SQLite 日志库里可能只有 774 MB 是空闲页，
+///   VACUUM 之后剩下的 10 MB 真实数据还在。把 `size` 当回收量报给用户
+///   就是虚报。同样只有 artifact 行有值。
+///
+/// 刻意不建索引：唯一的读方（status 的分级汇总）带 `agent_id` 过滤，
+/// 规划器实测选的是 `UNIQUE(agent_id, kind, scope, key)` 自动索引。
+/// 等 M1 的全局 clean 查询真的出现，再连同它的实测一起加。
+const V3_DDL: &str = "
+ALTER TABLE resource ADD COLUMN clean_level TEXT;
+ALTER TABLE resource ADD COLUMN reclaimable INTEGER;
+";
+
 /// 把 `conn` 上的 schema 迁移到 [`SCHEMA_VERSION`]。幂等，可放心重复调用。
 pub fn migrate(conn: &Connection) -> Result<()> {
     let current: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .context("读取 user_version 失败")?;
+        .context("failed to read user_version")?;
 
     if current < 1 {
         conn.execute_batch(&format!(
             "BEGIN;\n{V1_DDL}\nPRAGMA user_version = 1;\nCOMMIT;"
         ))
-        .context("应用 schema v1 失败")?;
+        .context("failed to apply schema v1")?;
+    }
+
+    if current < 2 {
+        conn.execute_batch(&format!(
+            "BEGIN;\n{V2_DDL}\nPRAGMA user_version = 2;\nCOMMIT;"
+        ))
+        .context("failed to apply schema v2")?;
+    }
+
+    if current < 3 {
+        conn.execute_batch(&format!(
+            "BEGIN;\n{V3_DDL}\nPRAGMA user_version = 3;\nCOMMIT;"
+        ))
+        .context("failed to apply schema v3")?;
     }
 
     Ok(())
@@ -141,5 +187,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 4);
+    }
+
+    /// 老库(v2)必须能就地升到 v3 并保住既有数据。
+    /// 新装用户走的是全量 DDL 路径，只有这条能守住升级路径。
+    #[test]
+    fn v2_database_upgrades_in_place_to_v3() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "BEGIN;\n{V1_DDL}\n{V2_DDL}\nPRAGMA user_version = 2;\nCOMMIT;"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resource(agent_id, kind, scope, key, path, size, mtime_ns)
+             VALUES ('codex', 'artifact', 'global', '~/.codex/cache', '/x', 42, 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+
+        // 既有行还在，新列存在且为 NULL（下次 scan 才会填上级别）。
+        let (size, level): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT size, clean_level FROM resource WHERE key = '~/.codex/cache'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(size, 42);
+        assert_eq!(level, None);
     }
 }

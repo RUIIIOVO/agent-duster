@@ -29,17 +29,24 @@ scope = "global"
 path = "~/.omp/agent/sessions"
 mapper = "stats-only"
 
-# ── Artifact:可清理产物 ─────────────────────────────────────────────────
+# ── Artifact:运行时目录 ─────────────────────────────────────────────────
+# socket / token / pid 确实随删随生,但本机实测该目录 105 MB 里有 100 MB 是
+# daemons/<hash>/omp.browser.headless.profile —— headless 浏览器 profile,
+# 删了要重新人工登录。功能不缺、进程会重建,但有人工代价 ⇒ l2 而非 l1。
+# hash 子目录名随项目变化,清单层无法精确到 profile,整块按 l2 处理。
 [[resource]]
 kind = "artifact"
 scope = "global"
 path = "~/.omp/run"
 mapper = "stats-only"
-clean_level = "l1"   # 运行时产物,自动重建
+clean_level = "l2"
 
+# ── Install:puppeteer 的浏览器下载根目录 ────────────────────────────────
+# 本机实测只有一个 2 字节 package.json——Chromium 还没下过。它一旦落地就是
+# 上百 MB 的浏览器本体,删了要重新联网下载 ⇒ install,不是 artifact。
+# (登录态在 run/ 下的 profile 里,不在这儿;别把两者的理由弄混。)
 [[resource]]
-kind = "artifact"
+kind = "install"
 scope = "global"
 path = "~/.omp/puppeteer"
 mapper = "stats-only"
-clean_level = "l2"   # 浏览器 profile,删了丢登录态,有代价

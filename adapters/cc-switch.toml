@@ -19,23 +19,24 @@ path = "~/.cc-switch/skills"
 glob = "*/SKILL.md"
 mapper = "skill/frontmatter-md"
 
-# ── Artifact:主数据库(供应商配置等,删了丢配置)─────────────────────────
+# ── Memory:主数据库(供应商配置等)。**不是 artifact**——它是应用配置本身,
+#           删了丢配置且无处再生。只统计,不参与清理。────────────────────
 [[resource]]
-kind = "artifact"
+kind = "memory"
 scope = "global"
 path = "~/.cc-switch/cc-switch.db"
 mapper = "stats-only"
-clean_level = "l4"   # 应用主数据,不可再生
 
-# ── Artifact:数据库自动备份(可从主库再备份)────────────────────────────
+# ── Artifact:数据库滚动备份 ─────────────────────────────────────────────
+# 本机实测 10 份日备份 × 约 7.6 MB,而主库本身才 7.3 MB。旧备份过期即无用,
+# 但「留几天」是用户决定 ⇒ l2,按 --older-than 天数清并二次确认。
 [[resource]]
 kind = "artifact"
 scope = "global"
 path = "~/.cc-switch/backups"
 mapper = "stats-only"
-clean_level = "l1"   # 自动备份,主库在即可重建
+clean_level = "l2"
 
-# ── Artifact:日志目录 ───────────────────────────────────────────────────
 [[resource]]
 kind = "artifact"
 scope = "global"

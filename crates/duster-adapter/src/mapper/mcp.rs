@@ -19,7 +19,7 @@ use duster_model::{McpServerSpec, McpTransport};
 /// 传输判定：显式 `type` 优先（http/streamable-http -> Http，sse -> Sse）；
 /// 无 `type` 时有 `command` -> Stdio，只有 `url` -> Http。
 pub fn from_standard_json(v: &serde_json::Value) -> anyhow::Result<Vec<McpServerSpec>> {
-    let map = v.as_object().context("mcpServers 不是 JSON 对象")?;
+    let map = v.as_object().context("mcpServers is not a JSON object")?;
     let mut out = Vec::with_capacity(map.len());
     for (name, entry) in map {
         match parse_std_entry(name, entry) {
@@ -36,7 +36,7 @@ pub fn from_standard_json(v: &serde_json::Value) -> anyhow::Result<Vec<McpServer
 ///
 /// Codex 无显式 type 字段：有 `command` -> Stdio，只有 `url` -> Http。
 pub fn from_codex_toml(v: &toml::Value) -> anyhow::Result<Vec<McpServerSpec>> {
-    let table = v.as_table().context("mcp_servers 不是 TOML 表")?;
+    let table = v.as_table().context("mcp_servers is not a TOML table")?;
     let mut out = Vec::with_capacity(table.len());
     for (name, entry) in table {
         match parse_codex_entry(name, entry) {
@@ -52,7 +52,7 @@ pub fn from_codex_toml(v: &toml::Value) -> anyhow::Result<Vec<McpServerSpec>> {
 fn parse_std_entry(name: &str, v: &serde_json::Value) -> anyhow::Result<McpServerSpec> {
     let obj = v
         .as_object()
-        .with_context(|| format!("server `{name}` 不是对象"))?;
+        .with_context(|| format!("server `{name}` is not an object"))?;
     // clone 后取走已建模字段，剩余的整体进 extra（serde_json 开了
     // preserve_order，键序与原文一致）。
     let mut rest = obj.clone();
@@ -70,14 +70,14 @@ fn parse_std_entry(name: &str, v: &serde_json::Value) -> anyhow::Result<McpServe
         (Some("sse"), _, _) => McpTransport::Sse,
         (Some("stdio") | None, Some(_), _) => McpTransport::Stdio,
         (None, None, Some(_)) => McpTransport::Http,
-        (Some(other), _, _) => bail!("server `{name}` 的 type `{other}` 无法识别"),
-        _ => bail!("server `{name}` 既无 command 也无 url，无法判定传输方式"),
+        (Some(other), _, _) => bail!("server `{name}` has unrecognized type `{other}`"),
+        _ => bail!("server `{name}` has neither command nor url; cannot determine transport"),
     };
 
     let extra = if rest.is_empty() {
         None
     } else {
-        Some(serde_json::to_string(&rest).context("序列化 extra 失败")?)
+        Some(serde_json::to_string(&rest).context("failed to serialize extra")?)
     };
 
     Ok(McpServerSpec {
@@ -101,7 +101,7 @@ fn take_json_str(
     match m.shift_remove(key) {
         None => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s)),
-        Some(other) => bail!("字段 `{key}` 应为字符串，实际为 {other}"),
+        Some(other) => bail!("field `{key}` should be a string, got {other}"),
     }
 }
 
@@ -115,12 +115,12 @@ fn take_json_str_array(
     };
     let arr = match v {
         serde_json::Value::Array(a) => a,
-        other => bail!("字段 `{key}` 应为数组，实际为 {other}"),
+        other => bail!("field `{key}` should be an array, got {other}"),
     };
     arr.into_iter()
         .map(|item| match item {
             serde_json::Value::String(s) => Ok(s),
-            other => bail!("字段 `{key}` 的元素应为字符串，实际为 {other}"),
+            other => bail!("element of field `{key}` should be a string, got {other}"),
         })
         .collect()
 }
@@ -136,7 +136,7 @@ fn take_json_str_map(
     };
     let obj = match v {
         serde_json::Value::Object(o) => o,
-        other => bail!("字段 `{key}` 应为对象，实际为 {other}"),
+        other => bail!("field `{key}` should be an object, got {other}"),
     };
     let mut out = BTreeMap::new();
     for (k, val) in obj {
@@ -144,7 +144,7 @@ fn take_json_str_map(
             serde_json::Value::String(s) => s,
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
-            other => bail!("字段 `{key}.{k}` 应为标量，实际为 {other}"),
+            other => bail!("field `{key}.{k}` should be a scalar, got {other}"),
         };
         out.insert(k, s);
     }
@@ -156,7 +156,7 @@ fn take_json_str_map(
 fn parse_codex_entry(name: &str, v: &toml::Value) -> anyhow::Result<McpServerSpec> {
     let table = v
         .as_table()
-        .with_context(|| format!("server `{name}` 不是 TOML 表"))?;
+        .with_context(|| format!("server `{name}` is not a TOML table"))?;
     let mut rest = table.clone();
 
     let command = take_toml_str(&mut rest, "command")?;
@@ -169,15 +169,17 @@ fn parse_codex_entry(name: &str, v: &toml::Value) -> anyhow::Result<McpServerSpe
     let transport = match (&command, &url) {
         (Some(_), _) => McpTransport::Stdio,
         (None, Some(_)) => McpTransport::Http,
-        (None, None) => bail!("server `{name}` 既无 command 也无 url，无法判定传输方式"),
+        (None, None) => {
+            bail!("server `{name}` has neither command nor url; cannot determine transport")
+        }
     };
 
     let extra = if rest.is_empty() {
         None
     } else {
         // TOML 表本身保序，转 JSON（preserve_order）后键序不变。
-        let json = serde_json::to_value(&rest).context("extra 转 JSON 失败")?;
-        Some(serde_json::to_string(&json).context("序列化 extra 失败")?)
+        let json = serde_json::to_value(&rest).context("failed to convert extra to JSON")?;
+        Some(serde_json::to_string(&json).context("failed to serialize extra")?)
     };
 
     Ok(McpServerSpec {
@@ -199,7 +201,7 @@ fn take_toml_str(
     match m.remove(key) {
         None => Ok(None),
         Some(toml::Value::String(s)) => Ok(Some(s)),
-        Some(other) => bail!("字段 `{key}` 应为字符串，实际为 {other}"),
+        Some(other) => bail!("field `{key}` should be a string, got {other}"),
     }
 }
 
@@ -212,12 +214,12 @@ fn take_toml_str_array(
     };
     let arr = match v {
         toml::Value::Array(a) => a,
-        other => bail!("字段 `{key}` 应为数组，实际为 {other}"),
+        other => bail!("field `{key}` should be an array, got {other}"),
     };
     arr.into_iter()
         .map(|item| match item {
             toml::Value::String(s) => Ok(s),
-            other => bail!("字段 `{key}` 的元素应为字符串，实际为 {other}"),
+            other => bail!("element of field `{key}` should be a string, got {other}"),
         })
         .collect()
 }
@@ -232,7 +234,7 @@ fn take_toml_str_map(
     };
     let table = match v {
         toml::Value::Table(t) => t,
-        other => bail!("字段 `{key}` 应为表，实际为 {other}"),
+        other => bail!("field `{key}` should be a table, got {other}"),
     };
     let mut out = BTreeMap::new();
     for (k, val) in table {
@@ -241,7 +243,7 @@ fn take_toml_str_map(
             toml::Value::Integer(n) => n.to_string(),
             toml::Value::Float(f) => f.to_string(),
             toml::Value::Boolean(b) => b.to_string(),
-            other => bail!("字段 `{key}.{k}` 应为标量，实际为 {other}"),
+            other => bail!("field `{key}.{k}` should be a scalar, got {other}"),
         };
         out.insert(k, s);
     }

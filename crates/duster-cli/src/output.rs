@@ -39,6 +39,7 @@
 //! - `error`：`null` 或 `{"code": "机器可读短码", "message": "人话"}`。
 //!   `code` 建议与退出码语义对应，如 `"partial"` / `"locked"` / `"io"`。
 
+use console::{Style, StyledObject};
 use serde::Serialize;
 use std::io::Write;
 
@@ -136,60 +137,124 @@ pub fn emit_json<T: Serialize>(command: &str, data: &T, warnings: &[String]) {
 /// 错误输出：信封写 stdout（机器读），同一条错误的人话同时写 stderr（人读）。
 pub fn emit_json_error(command: &str, code: &str, message: &str) {
     println!("{}", render_json_error(command, code, message));
-    let _ = writeln!(
-        std::io::stderr(),
-        "duster {command}: 错误[{code}] {message}"
-    );
+    let _ = writeln!(std::io::stderr(), "duster {command}: [{code}] {message}");
+}
+
+// ---------------------------------------------------------------------------
+// 配色
+// ---------------------------------------------------------------------------
+//
+// 全部走 console 的 `Style`：它自带 tty 判定与 `NO_COLOR` / `CLICOLOR_FORCE`
+// 语义，管道/重定向时自动退化成纯文本，调用方不必到处判断。
+// 只用前景色与 bold/dim 两个属性——背景色在浅色主题下会瞎眼。
+
+/// 主色：命令名、agent 名、区块标题。
+pub fn accent() -> Style {
+    Style::new().cyan()
+}
+
+/// 次要信息：分隔线、单位、提示语。
+pub fn muted() -> Style {
+    Style::new().dim()
+}
+
+/// 成功前缀 `✔`（已着色）。
+pub fn ok_mark() -> StyledObject<&'static str> {
+    Style::new().green().bold().apply_to("✔")
+}
+
+/// 警告前缀 `!`（已着色）。
+pub fn warn_mark() -> StyledObject<&'static str> {
+    Style::new().yellow().bold().apply_to("!")
+}
+
+/// 错误前缀 `✖`（已着色）。
+pub fn err_mark() -> StyledObject<&'static str> {
+    Style::new().red().bold().apply_to("✖")
 }
 
 // ---------------------------------------------------------------------------
 // 表格
 // ---------------------------------------------------------------------------
 
-/// 判断字符是否按「东亚宽字符」占两列。
+/// 字符串的终端显示宽度：东亚宽字符按 2，ANSI 转义序列按 0。
 ///
-/// 近似实现：只收录常用东亚宽/全角区间（CJK 统一表意及扩展、假名、谚文、
-/// 全角标点/字母、CJK 兼容），外加常用 emoji 区。不追求 UAX #11 全表精确，
-/// 但覆盖中文/日文/韩文列对齐的实际需求。
-fn is_wide_char(c: char) -> bool {
-    matches!(u32::from(c),
-        0x1100..=0x115F          // 谚文字母（初声）
-        | 0x2E80..=0x303E        // CJK 部首、康熙部首、CJK 符号与标点
-        | 0x3041..=0x33FF        // 平/片假名、注音、谚文兼容、CJK 括号/兼容
-        | 0x3400..=0x4DBF        // CJK 扩展 A
-        | 0x4E00..=0x9FFF        // CJK 统一表意
-        | 0xA000..=0xA4CF        // 彝文
-        | 0xAC00..=0xD7A3        // 谚文音节
-        | 0xF900..=0xFAFF        // CJK 兼容表意
-        | 0xFE30..=0xFE4F        // CJK 兼容形式
-        | 0xFF00..=0xFF60        // 全角 ASCII、全角标点
-        | 0xFFE0..=0xFFE6        // 全角符号（￥ 等）
-        | 0x1F300..=0x1FAFF      // 常用 emoji（近似按宽 2）
-        | 0x20000..=0x2FFFD      // CJK 扩展 B–F
-        | 0x30000..=0x3FFFD      // CJK 扩展 G
-    )
-}
-
-/// 字符串的终端显示宽度（东亚宽字符按 2，其余按 1，近似值）。
+/// 直接复用 console 的实现（unicode-width + ANSI 解析），不再手搓码点区间表。
 pub fn display_width(s: &str) -> usize {
-    s.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum()
+    console::measure_text_width(s)
 }
 
-/// 手写等宽列表格：列宽按内容自适应，CJK 按显示宽度 2 对齐。
+/// 按显示宽度截断，超长时尾部替换成 `…`（本身占 1 列）。
 ///
-/// 渲染格式：表头一行、`-` 分隔线一行、数据行若干；列间两个空格，
-/// 每行末尾不留补齐空格。整体供人类模式写 stdout。
+/// 结果宽度不超过 `max.max(1)`——`max == 0` 是调用方笔误，退化为只剩省略号。
+/// 只在纯文本上调用——先截断、后着色，别反过来，否则会剪断 ANSI 序列。
+pub fn truncate_width(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    let budget = max.saturating_sub(1); // 给省略号留一列
+    let mut out = String::with_capacity(budget + 3);
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = display_width(c.encode_utf8(&mut [0u8; 4]));
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// 人类模式的列表格：列宽自适应，CJK 按显示宽度 2 对齐。
+///
+/// 渲染成「表头一行 + 一条 `─` 横线 + 数据行若干」，整体缩进两格，
+/// 列间两个空格，行尾不留补齐空格。
+///
+/// 单元格一律存**无样式**的纯文本，颜色在 render 时按列附加——宽度计算
+/// 因此永远看不见 ANSI 字节，对齐不会被着色带偏。
 pub struct Table {
     header: Vec<String>,
     rows: Vec<Vec<String>>,
+    /// 该列是否右对齐（数字列用）。
+    right: Vec<bool>,
+    /// 该列数据行的前景色；表头恒为 bold。
+    color: Vec<Option<Style>>,
 }
+
+/// 表格缩进：给终端留出呼吸感，也把表格和摘要行区分开。
+const INDENT: &str = "  ";
+
+/// 空计数占位符，渲染时自动置灰。
+const DASH: &str = "-";
 
 impl Table {
     /// 以表头建表。列数由表头决定，行短于表头的列按空串补齐。
     pub fn new<S: Into<String>>(header: Vec<S>) -> Self {
+        let header: Vec<String> = header.into_iter().map(Into::into).collect();
+        let cols = header.len();
         Self {
-            header: header.into_iter().map(Into::into).collect(),
+            header,
             rows: Vec::new(),
+            right: vec![false; cols],
+            color: vec![None; cols],
+        }
+    }
+
+    /// 把这些列改成右对齐。越界下标忽略。
+    pub fn right_align(&mut self, cols: &[usize]) {
+        for &c in cols {
+            if let Some(flag) = self.right.get_mut(c) {
+                *flag = true;
+            }
+        }
+    }
+
+    /// 给某列的数据行上色。越界下标忽略。
+    pub fn color_col(&mut self, col: usize, style: Style) {
+        if let Some(slot) = self.color.get_mut(col) {
+            *slot = Some(style);
         }
     }
 
@@ -200,54 +265,86 @@ impl Table {
         self.rows.push(cells);
     }
 
-    /// 渲染为多行字符串（含末尾换行的行序列，最后一行无多余换行）。
+    /// 是否一行数据都没有。
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// 渲染为多行字符串（最后一行无多余换行）。
     pub fn render(&self) -> String {
-        let cols = self.header.len();
-        // 各列取内容最大显示宽度。
-        let mut widths = vec![0usize; cols];
-        for (i, h) in self.header.iter().enumerate() {
-            widths[i] = widths[i].max(display_width(h));
+        let widths = self.widths();
+        let bold = Style::new().bold();
+        let dim = muted();
+
+        let mut out = String::new();
+        let head_styles: Vec<Option<&Style>> = vec![Some(&bold); widths.len()];
+        let row_styles: Vec<Option<&Style>> = self.color.iter().map(Option::as_ref).collect();
+
+        self.render_line(&mut out, &self.header, &widths, &head_styles);
+        // 一条贯穿的横线：总宽 = 各列宽之和 + 列间两空格。
+        let rule: usize = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+        out.push('\n');
+        out.push_str(INDENT);
+        out.push_str(&dim.apply_to("─".repeat(rule)).to_string());
+        for row in &self.rows {
+            out.push('\n');
+            self.render_line(&mut out, row, &widths, &row_styles);
         }
+        out
+    }
+
+    /// 各列取内容（含表头）的最大显示宽度。
+    fn widths(&self) -> Vec<usize> {
+        let mut widths: Vec<usize> = self.header.iter().map(|h| display_width(h)).collect();
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
                 widths[i] = widths[i].max(display_width(cell));
             }
         }
-
-        let mut out = String::new();
-        Self::render_line(&mut out, &self.header, &widths);
-        // 分隔线：每列等宽的 '-'，列间两空格。
-        let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-        out.push('\n');
-        Self::render_line(&mut out, &sep, &widths);
-        for row in &self.rows {
-            out.push('\n');
-            Self::render_line(&mut out, row, &widths);
-        }
-        out
+        widths
     }
 
-    /// 渲染单行：按显示宽度补空格，行尾不留补齐。
-    fn render_line(out: &mut String, cells: &[String], widths: &[usize]) {
+    /// 渲染单行：先按纯文本算补白，再给单元格套色，行尾不补空格。
+    fn render_line(
+        &self,
+        out: &mut String,
+        cells: &[String],
+        widths: &[usize],
+        styles: &[Option<&Style>],
+    ) {
+        let dim = muted();
         let last = widths.len().saturating_sub(1);
+        out.push_str(INDENT);
         for (i, width) in widths.iter().enumerate() {
             if i > 0 {
                 out.push_str("  ");
             }
             let cell = cells.get(i).map(String::as_str).unwrap_or("");
-            out.push_str(cell);
-            if i < last {
-                let pad = width.saturating_sub(display_width(cell));
-                for _ in 0..pad {
-                    out.push(' ');
-                }
+            let pad = width.saturating_sub(display_width(cell));
+            // 占位横杠一律置灰，让真实数字自己跳出来。
+            let style = if cell == DASH {
+                Some(&dim)
+            } else {
+                styles.get(i).copied().flatten()
+            };
+            let right = self.right.get(i).copied().unwrap_or(false);
+            if right {
+                out.extend(std::iter::repeat_n(' ', pad));
+            }
+            match style {
+                Some(s) => out.push_str(&s.apply_to(cell).to_string()),
+                None => out.push_str(cell),
+            }
+            // 行尾不留补齐空格。
+            if !right && i < last {
+                out.extend(std::iter::repeat_n(' ', pad));
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// 字节格式化
+// 数值格式化
 // ---------------------------------------------------------------------------
 
 /// 1024 进制的人类可读字节数，如 `0 B` / `1023 B` / `1.5 GB`。
@@ -267,6 +364,16 @@ pub fn human_bytes(n: u64) -> String {
     let s = format!("{value:.1}");
     let s = s.strip_suffix(".0").unwrap_or(&s);
     format!("{s} {}", UNITS[unit])
+}
+
+/// 毫秒 → 人话时长：不足 1 秒说 `820 ms`，否则说 `1.3 s`。
+pub fn human_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        let s = format!("{:.1}", ms as f64 / 1000.0);
+        format!("{} s", s.strip_suffix(".0").unwrap_or(&s))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +440,28 @@ mod tests {
         assert!(rendered.lines().all(|l| !l.ends_with(' ')));
     }
 
+    /// 右对齐列：数字末位对齐到列右缘，且行尾不留补齐空格。
+    #[test]
+    fn table_right_align_numbers() {
+        let mut t = Table::new(vec!["agent", "size"]);
+        t.right_align(&[1]);
+        t.push_row(vec!["a", "7"]);
+        t.push_row(vec!["bbbb", "1024"]);
+        let rendered = t.render();
+        let lines: Vec<&str> = rendered.lines().collect();
+        // 末列右对齐 ⇒ 每行显示宽度相同（都顶到列右缘）。
+        let widths: Vec<usize> = [lines[0], lines[2], lines[3]]
+            .iter()
+            .map(|l| display_width(l))
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "右对齐后各行宽度应一致: {widths:?}\n{rendered}"
+        );
+        assert!(lines[3].ends_with("1024"));
+        assert!(rendered.lines().all(|l| !l.ends_with(' ')));
+    }
+
     #[test]
     fn human_bytes_boundaries() {
         assert_eq!(human_bytes(0), "0 B");
@@ -340,6 +469,28 @@ mod tests {
         assert_eq!(human_bytes(1024), "1 KB");
         assert_eq!(human_bytes(1536), "1.5 KB");
         assert_eq!(human_bytes(1_610_612_736), "1.5 GB"); // 1.5 GiB
+    }
+
+    #[test]
+    fn human_ms_boundaries() {
+        assert_eq!(human_ms(0), "0 ms");
+        assert_eq!(human_ms(999), "999 ms");
+        assert_eq!(human_ms(1000), "1 s");
+        assert_eq!(human_ms(1349), "1.3 s");
+    }
+
+    /// 截断按显示宽度算：宽字符不劈开，结果永不超过上限。
+    #[test]
+    fn truncate_width_不超上限且不劈开宽字符() {
+        assert_eq!(truncate_width("short", 10), "short");
+        assert_eq!(truncate_width("abcdefghij", 5), "abcd…");
+        // 中文各占 2 列：上限 5 只放得下 2 个字 + 省略号。
+        let cut = truncate_width("一二三四五", 5);
+        assert_eq!(cut, "一二…");
+        assert!(display_width(&cut) <= 5);
+        // 边界：上限 1 只剩省略号，上限 0 直接空。
+        assert_eq!(truncate_width("一二", 1), "…");
+        assert_eq!(truncate_width("一二", 0), "…");
     }
 
     #[test]

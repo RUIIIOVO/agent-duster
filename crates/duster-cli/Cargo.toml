@@ -1,6 +1,6 @@
 [package]
 name = "duster-cli"
-description = "duster 命令行外壳（clap）。"
+description = "duster command-line shell (clap)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 duster-core = { workspace = true }
+# 只为共享的封闭词汇表（CleanLevel 的档位与展示标签）。
+# model 是最底层、零 I/O，CLI 直依赖它不构成越层。
+duster-model = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+dialoguer = { workspace = true }
+console = { workspace = true }

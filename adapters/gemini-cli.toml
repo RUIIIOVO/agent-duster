@@ -30,6 +30,13 @@ scope = "global"
 path = "~/.gemini/GEMINI.md"
 mapper = "memory/markdown"
 
+# ── Install:已安装扩展本体(Gemini 的 extension 模型,非 SKILL.md)──────
+[[resource]]
+kind = "install"
+scope = "global"
+path = "~/.gemini/extensions"
+mapper = "stats-only"
+
 # ── Artifact:可清理产物 ─────────────────────────────────────────────────
 [[resource]]
 kind = "artifact"
@@ -38,9 +45,11 @@ path = "~/.gemini/tmp"
 mapper = "stats-only"
 clean_level = "l1"   # 临时目录,自动重建
 
+# 按项目分区的 CLI 历史目录(每项目一个 .project_root 标记),
+# 下次在该项目里跑 gemini 会自动重建。
 [[resource]]
 kind = "artifact"
 scope = "global"
 path = "~/.gemini/history"
 mapper = "stats-only"
-clean_level = "l1"   # 命令历史,可再生
+clean_level = "l1"

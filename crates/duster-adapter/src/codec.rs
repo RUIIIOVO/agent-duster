@@ -35,12 +35,12 @@ pub fn read_file(path: &Path) -> anyhow::Result<Doc> {
     match ext.as_deref() {
         Some("json") => {
             let v = serde_json::from_str(&text)
-                .with_context(|| format!("解析 JSON 失败: {}", path.display()))?;
+                .with_context(|| format!("failed to parse JSON: {}", path.display()))?;
             Ok(Doc::Json(v))
         }
         Some("toml") => {
             let v = toml::from_str(&text)
-                .with_context(|| format!("解析 TOML 失败: {}", path.display()))?;
+                .with_context(|| format!("failed to parse TOML: {}", path.display()))?;
             Ok(Doc::Toml(v))
         }
         _ => {
@@ -54,7 +54,7 @@ pub fn read_file(path: &Path) -> anyhow::Result<Doc> {
                 Err(e) => e,
             };
             bail!(
-                "无法识别 {} 的格式:按 JSON 解析失败({json_err});按 TOML 解析失败({toml_err})",
+                "unrecognized format for {}: JSON parse failed ({json_err}); TOML parse failed ({toml_err})",
                 path.display()
             );
         }
@@ -91,16 +91,17 @@ pub fn toml_path<'a>(v: &'a toml::Value, dotted: &str) -> Option<&'a toml::Value
 /// 带大小上限的文本读取。超限直接报错并说明实际大小,防止把
 /// 误认成配置的巨型文件整个吸进内存。
 pub fn read_to_string_capped(path: &Path, cap: u64) -> anyhow::Result<String> {
-    let meta = fs::metadata(path).with_context(|| format!("读取元数据失败: {}", path.display()))?;
+    let meta = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata: {}", path.display()))?;
     if meta.len() > cap {
         bail!(
-            "文件过大,拒绝读取: {} 实际 {} 字节,上限 {} 字节",
+            "file too large, refusing to read: {} is {} bytes, cap is {} bytes",
             path.display(),
             meta.len(),
             cap
         );
     }
-    fs::read_to_string(path).with_context(|| format!("读取文件失败: {}", path.display()))
+    fs::read_to_string(path).with_context(|| format!("failed to read file: {}", path.display()))
 }
 
 #[cfg(test)]

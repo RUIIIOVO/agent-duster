@@ -16,11 +16,12 @@ use anyhow::Context;
 ///
 /// 内部由 blake3 以固定大小缓冲区分块读取,不会将整个文件读入内存。
 pub fn hash_file(path: &Path) -> anyhow::Result<blake3::Hash> {
-    let file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("failed to open file: {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
     hasher
         .update_reader(file)
-        .with_context(|| format!("读取文件失败: {}", path.display()))?;
+        .with_context(|| format!("failed to read file: {}", path.display()))?;
     Ok(hasher.finalize())
 }
 
@@ -59,7 +60,8 @@ impl CheapPrint {
 
 /// 读取文件的廉价指纹(Unix 专用,依赖 `MetadataExt`)。
 pub fn cheap_print(path: &Path) -> anyhow::Result<CheapPrint> {
-    let meta = fs::metadata(path).with_context(|| format!("读取元数据失败: {}", path.display()))?;
+    let meta = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata: {}", path.display()))?;
     Ok(CheapPrint {
         size: meta.size(),
         mtime_ns: meta
@@ -100,9 +102,11 @@ fn collect_files(
     prune: &[String],
     out: &mut Vec<(String, std::path::PathBuf)>,
 ) -> anyhow::Result<()> {
-    let entries = fs::read_dir(dir).with_context(|| format!("读取目录失败: {}", dir.display()))?;
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory: {}", dir.display()))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("读取目录项失败: {}", dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to read directory entry: {}", dir.display()))?;
         let path = entry.path();
         // 用 symlink_metadata 拿到的类型判断,符号链接不跟随。
         let file_type = entry.file_type()?;
@@ -115,7 +119,7 @@ fn collect_files(
         } else if file_type.is_file() {
             let rel = path
                 .strip_prefix(root)
-                .expect("子路径必然以 root 为前缀")
+                .expect("child path must be prefixed by root")
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()

@@ -48,20 +48,20 @@ type FilesWalk = WalkDirGeneric<((), Option<Metadata>)>;
 /// 其余(文件、断链)报错。
 fn resolve_dir_root(root: &Path) -> anyhow::Result<PathBuf> {
     let meta = std::fs::symlink_metadata(root)
-        .with_context(|| format!("无法读取根路径: {}", root.display()))?;
+        .with_context(|| format!("failed to read root path: {}", root.display()))?;
     if meta.is_dir() {
         return Ok(root.to_path_buf());
     }
     if meta.is_symlink() {
         let target = std::fs::metadata(root)
-            .with_context(|| format!("根路径是断开的符号链接: {}", root.display()))?;
+            .with_context(|| format!("root path is a broken symlink: {}", root.display()))?;
         if target.is_dir() {
             return root
                 .canonicalize()
-                .with_context(|| format!("无法解析符号链接根: {}", root.display()));
+                .with_context(|| format!("failed to resolve symlink root: {}", root.display()));
         }
     }
-    bail!("根路径不是目录: {}", root.display());
+    bail!("root path is not a directory: {}", root.display());
 }
 
 /// 并行统计 `root` 子树：总字节数、文件数、一级子目录聚合体积（降序）。

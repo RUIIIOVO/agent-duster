@@ -21,7 +21,7 @@ use duster_model::SkillMeta;
 pub fn parse_skill_md(skill_root: &Path) -> anyhow::Result<SkillMeta> {
     let md_path = skill_root.join("SKILL.md");
     let content = std::fs::read_to_string(&md_path)
-        .with_context(|| format!("读取 {} 失败", md_path.display()))?;
+        .with_context(|| format!("failed to read {}", md_path.display()))?;
 
     // 目录名兜底：根路径没有 file_name 时退化为完整路径展示。
     let dir_name = skill_root
@@ -56,7 +56,7 @@ pub fn parse_skill_md(skill_root: &Path) -> anyhow::Result<SkillMeta> {
             }
         }
         // frontmatter 不是映射（纯标量/序列）：无字段可取，记错降级。
-        Ok(_) => meta.extra = Some(parse_error_json("frontmatter 不是键值映射")),
+        Ok(_) => meta.extra = Some(parse_error_json("frontmatter is not a key-value mapping")),
         Err(e) => meta.extra = Some(parse_error_json(&e.to_string())),
     }
 
@@ -70,12 +70,12 @@ pub fn discover_skills(dir: &Path) -> anyhow::Result<Vec<SkillMeta>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("遍历 {} 失败", dir.display())),
+        Err(e) => return Err(e).with_context(|| format!("failed to traverse {}", dir.display())),
     };
 
     let mut skills = Vec::new();
     for entry in entries {
-        let entry = entry.with_context(|| format!("遍历 {} 失败", dir.display()))?;
+        let entry = entry.with_context(|| format!("failed to traverse {}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() && path.join("SKILL.md").is_file() {
             skills.push(parse_skill_md(&path)?);

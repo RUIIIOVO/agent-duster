@@ -43,20 +43,28 @@ scope = "global"
 path = "~/.codex/sessions"
 mapper = "native/codex-session"
 
-# ── Artifact:可清理产物,clean_level 标注再生成本 ───────────────────────
+# ── Session:归档会话。**不是 artifact**。──────────────────────────────
+# 本机实测(2026-08-10):153 个 rollout jsonl,与 sessions/ 零重名——
+# 归档是「从 sessions 移走」而非「从 sessions 复制」,这里是唯一副本。
+# 曾被误标 artifact/l1「可从 sessions 再归档」,那会把用户唯一的历史
+# 当缓存删掉。要瘦身走 session prune(按天数压缩/导出),不走 clean。
+# 格式与 sessions/ 相同,但目录不按 YYYY/MM/DD 分层,M0 先只统计。
+[[resource]]
+kind = "session"
+scope = "global"
+path = "~/.codex/archived_sessions"
+mapper = "stats-only"
+
+# ── Artifact:可清理产物 ─────────────────────────────────────────────────
+# 日志库。本机实测 200783 页里 198286 页是空闲页(98.8%),实际只有
+# 11353 行日志——VACUUM 一把回收约 775 MB 且一条日志都不丢,
+# 所以是 l0(无损)而不是 l1(删除重建)。
 [[resource]]
 kind = "artifact"
 scope = "global"
 path = "~/.codex/logs_2.sqlite"
 mapper = "stats-only"
-clean_level = "l1"   # 日志库,自动重建
-
-[[resource]]
-kind = "artifact"
-scope = "global"
-path = "~/.codex/plugins"
-mapper = "stats-only"
-clean_level = "l2"   # 删了要重新安装插件,有代价
+clean_level = "l0"
 
 [[resource]]
 kind = "artifact"
@@ -65,9 +73,9 @@ path = "~/.codex/cache"
 mapper = "stats-only"
 clean_level = "l1"   # 纯缓存,自动重建
 
+# ── Install:插件本体(内含 cache/,不拆,见头注释「重叠路径」)───────────
 [[resource]]
-kind = "artifact"
+kind = "install"
 scope = "global"
-path = "~/.codex/archived_sessions"
+path = "~/.codex/plugins"
 mapper = "stats-only"
-clean_level = "l1"   # 归档会话,可从 sessions 再归档

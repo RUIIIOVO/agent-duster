@@ -20,7 +20,7 @@ use rusqlite::Connection;
 use std::io::{Read, Seek, SeekFrom};
 
 /// 回读失败（文件已删/截短/非 UTF-8）时的降级摘要。
-const SNIPPET_SOURCE_CHANGED: &str = "[源文件已变动]";
+const SNIPPET_SOURCE_CHANGED: &str = "[source file changed]";
 
 /// 命中窗口:子串两侧各保留的 char 数。
 const WINDOW_CHARS: usize = 80;
@@ -83,7 +83,7 @@ pub fn search_turns(
              ORDER BY bm25(fts_turn)
              LIMIT ?3",
         )
-        .context("准备检索语句失败")?;
+        .context("failed to prepare search statement")?;
 
     let rows = stmt
         .query_map(
@@ -101,12 +101,12 @@ pub fn search_turns(
                 ))
             },
         )
-        .context("执行检索失败")?;
+        .context("failed to execute search")?;
 
     let mut hits = Vec::new();
     for row in rows {
         let (tid, rid, agent_id, path, seq, role, byte_off, byte_len) =
-            row.context("读取命中行失败")?;
+            row.context("failed to read hit row")?;
         let byte_off = byte_off.max(0) as u64;
         let byte_len = byte_len.max(0) as u64;
 

@@ -23,11 +23,12 @@ fn open_index(index_path: Option<&Path>) -> Result<Index> {
     };
     if !path.is_file() {
         bail!(
-            "索引库不存在: {}。请先运行 `duster scan` 建立索引。",
+            "index database not found: {}. Run `duster scan` first to build it.",
             path.display()
         );
     }
-    Index::open_readonly(&path).with_context(|| format!("只读打开索引失败: {}", path.display()))
+    Index::open_readonly(&path)
+        .with_context(|| format!("failed to open index read-only: {}", path.display()))
 }
 
 /// 全文检索会话正文。`index_path` 缺省 `~/.agent-duster/index.db`。
@@ -69,7 +70,7 @@ pub fn open_turn(index_path: Option<&Path>, tid: i64) -> Result<TurnDetail> {
              JOIN resource r USING (rid)
              WHERE t.tid = ?1",
         )
-        .context("准备查询轮次语句失败")?;
+        .context("failed to prepare turn query statement")?;
     let mut rows = stmt
         .query_map([tid], |row| {
             Ok((
@@ -81,12 +82,13 @@ pub fn open_turn(index_path: Option<&Path>, tid: i64) -> Result<TurnDetail> {
                 row.get::<_, i64>(5)?,
             ))
         })
-        .context("查询轮次失败")?;
+        .context("failed to query turn")?;
 
     let Some(row) = rows.next() else {
-        bail!("tid {tid} 不存在。请先用 `duster search` 找到有效的 tid。");
+        bail!("tid {tid} does not exist. Use `duster search` to find a valid tid.");
     };
-    let (resource_path, agent_id, seq, role, byte_off, byte_len) = row.context("读取轮次行失败")?;
+    let (resource_path, agent_id, seq, role, byte_off, byte_len) =
+        row.context("failed to read turn row")?;
 
     let text = read_span(
         &resource_path,
@@ -95,8 +97,9 @@ pub fn open_turn(index_path: Option<&Path>, tid: i64) -> Result<TurnDetail> {
     )
     .with_context(|| {
         format!(
-            "回读源文件失败: {resource_path}(文件可能已删除、截短或改写;\
-             索引是派生物,可重跑 `duster scan` 修正)"
+            "failed to read back source file: {resource_path} (the file may have been \
+             deleted, truncated, or rewritten; the index is derived data — rerun \
+             `duster scan` to repair)"
         )
     })?;
 
@@ -112,12 +115,13 @@ pub fn open_turn(index_path: Option<&Path>, tid: i64) -> Result<TurnDetail> {
 /// 从源文件精确回读 `[off, off+len)` 字节并解码为 UTF-8。
 /// 与检索侧的降级回读不同,open 语义是「给我全文」,任何一步失败都报错。
 fn read_span(path: &str, off: u64, len: u64) -> Result<String> {
-    let mut f = std::fs::File::open(path).context("打开源文件失败")?;
-    f.seek(SeekFrom::Start(off)).context("定位字节偏移失败")?;
+    let mut f = std::fs::File::open(path).context("failed to open source file")?;
+    f.seek(SeekFrom::Start(off))
+        .context("failed to seek to byte offset")?;
     let mut buf = vec![0u8; len as usize];
     f.read_exact(&mut buf)
-        .context("源文件长度不足(可能已被截短)")?;
-    String::from_utf8(buf).context("该区间不再是合法 UTF-8(内容已改写)")
+        .context("source file is too short (it may have been truncated)")?;
+    String::from_utf8(buf).context("byte span is no longer valid UTF-8 (content was rewritten)")
 }
 
 #[cfg(test)]
@@ -152,6 +156,8 @@ mod tests {
                 mtime_ns: 0,
                 hash_content: None,
                 cheap_print: None,
+                clean_level: None,
+                reclaimable: None,
             },
         )
         .unwrap();
@@ -190,7 +196,7 @@ mod tests {
     fn open_turn_tid_不存在报错() {
         let (dir, db, _) = build_fixture("missing-tid");
         let err = open_turn(Some(&db), 9999).unwrap_err();
-        assert!(err.to_string().contains("不存在"), "{err:#}");
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -199,7 +205,10 @@ mod tests {
         let (dir, db, _) = build_fixture("truncated");
         std::fs::write(dir.join("session.jsonl"), "x").unwrap();
         let err = open_turn(Some(&db), 1).unwrap_err();
-        assert!(format!("{err:#}").contains("回读源文件失败"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("failed to read back source file"),
+            "{err:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
