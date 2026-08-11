@@ -227,8 +227,8 @@ fn cmd_scan(mode: OutputMode, index: Option<&Path>, full: bool) -> i32 {
 }
 
 fn render_scan_human(report: &ScanReport, warnings: &[String]) {
-    let mut headers: Vec<String> = vec!["AGENT".into(), "SIZE".into()];
-    headers.extend(kind_headers());
+    let mut headers: Vec<String> = vec!["AGENT".into()];
+    headers.extend(metric_headers());
     headers.push("WARN".into());
     let ncols = headers.len();
 
@@ -247,7 +247,7 @@ fn render_scan_human(report: &ScanReport, warnings: &[String]) {
             *clean.entry(level.clone()).or_insert(0) += bytes;
         }
         install_bytes += a.kind_bytes.get("install").copied().unwrap_or(0);
-        let mut row = vec![a.agent_id.clone(), human_bytes(a.bytes)];
+        let mut row = vec![a.agent_id.clone()];
         row.extend(
             COUNT_KINDS
                 .iter()
@@ -258,6 +258,7 @@ fn render_scan_human(report: &ScanReport, warnings: &[String]) {
                 .iter()
                 .map(|(k, _)| bytes_cell(a.kind_bytes.get(*k))),
         );
+        row.push(human_bytes(a.bytes));
         row.push(count_cell(Some(&a.warnings.len())));
         table.push_row(row);
     }
@@ -341,10 +342,15 @@ const COUNT_KINDS: [&str; 4] = ["mcp", "skill", "memory", "session"];
 /// 列里给的是**占用量**;能拿回多少看摘要行,两者对 l0 并不相等。
 const BYTE_KINDS: [(&str, &str); 2] = [("artifact", "CLEANABLE"), ("install", "INSTALLED")];
 
-/// 资源类表头,顺序即列顺序。
-fn kind_headers() -> Vec<String> {
+/// 每个 agent 的度量列表头,顺序即列顺序:先四类计数,再三个体积。
+///
+/// 三个体积列必须挨着,顺序 CLEANABLE → INSTALLED → SIZE 也是刻意的:
+/// 前两个是这次决策要看的数(能清多少 / 碰不得多少),SIZE 是它们的上界,
+/// 放在末尾当总计。夹在 AGENT 和计数列之间时,读者得跨半张表才能对上。
+fn metric_headers() -> Vec<String> {
     let mut h: Vec<String> = COUNT_KINDS.iter().map(|k| k.to_uppercase()).collect();
     h.extend(BYTE_KINDS.iter().map(|(_, label)| (*label).to_string()));
+    h.push("SIZE".into());
     h
 }
 
@@ -423,8 +429,8 @@ fn cmd_status(mode: OutputMode, index: Option<&Path>) -> i32 {
 }
 
 fn render_status_human(report: &StatusReport) {
-    let mut headers: Vec<String> = vec!["AGENT".into(), "SIZE".into()];
-    headers.extend(kind_headers());
+    let mut headers: Vec<String> = vec!["AGENT".into()];
+    headers.extend(metric_headers());
     headers.push("LAST SCAN".into());
     let last_col = headers.len() - 1;
 
@@ -439,7 +445,7 @@ fn render_status_human(report: &StatusReport) {
             *clean.entry(level.clone()).or_insert(0) += bytes;
         }
         install_bytes += a.kind_bytes.get("install").copied().unwrap_or(0);
-        let mut row = vec![a.agent_id.clone(), human_bytes(a.bytes)];
+        let mut row = vec![a.agent_id.clone()];
         row.extend(
             COUNT_KINDS
                 .iter()
@@ -450,6 +456,7 @@ fn render_status_human(report: &StatusReport) {
                 .iter()
                 .map(|(k, _)| bytes_cell(a.kind_bytes.get(*k))),
         );
+        row.push(human_bytes(a.bytes));
         row.push(relative_time(a.last_scan_ms));
         table.push_row(row);
     }
