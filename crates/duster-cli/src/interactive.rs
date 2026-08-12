@@ -38,7 +38,7 @@ use crate::prompt::{
     Checklist, Picker, prompt_checklist, prompt_confirm, prompt_line, prompt_pick,
 };
 
-use duster_core::mcp::{self, SyncOptions, SyncOutcome};
+use duster_core::mcp::{self, MergedServer, SyncOptions, SyncOutcome};
 use duster_core::memory::{self, MemoryEntry};
 use duster_core::plan::{Action, OLDER_THAN_PRESETS, Plan, PlanItem, parse_older_than};
 use duster_core::search::{self, SearchFilter, SearchHit};
@@ -441,15 +441,64 @@ fn run_doctor(mode: OutputMode, index: Option<&Path>) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// 列表 → 详情 → 上下文动作 → 回列表
+// ---------------------------------------------------------------------------
+
+/// 三层形状的循环骨架:浏览一张表 → 下钻看一条 → 回到原来那一行接着看。
+///
+/// 早先每张列表都是一次性的:下钻一条,详情打完,直接弹回顶层菜单。想看
+/// 第二条就得从头再来一遍——重新选范围、重新出表、重新翻到那一页。而
+/// 「挨个看看」恰恰是列表类命令唯一的用法(`mcp list` 十几个服务器,
+/// 用户是来逐个核对声明的,不是来选一个就走的)。
+///
+/// 三件事由这里统一,不许各写各的:
+/// - **光标带回来**。`browse` 收上一次的下标,回列表时还停在那一行。
+/// - **退出码累积**。`base` 是列表自己那一档(warning 就是 `EXIT_PARTIAL`),
+///   每趟下钻的结果用 [`worse`] 并进去:看了五条,有一条报错,整趟就不是 0。
+///   累积用 `worse` 而不是 `max`——退出码数值本身无序(3「部分成功」比
+///   4「什么都没做」更坏),取大会把错误吞成「没做」。
+/// - **Esc 只退一层**。列表上 Esc 才回菜单,详情里的 Esc 由 `detail` 自己
+///   处理成「回列表」。
+///
+/// 非 TTY 时 `browse` 直接给 None,原样返回 `base`——与下钻前的行为
+/// 逐字节相同,浏览始终是 TTY 上的增益而不是新契约。
+fn drill(
+    prompt: &str,
+    header: &str,
+    labels: &[String],
+    base: i32,
+    mut detail: impl FnMut(usize) -> i32,
+) -> i32 {
+    let mut code = base;
+    let mut cursor = 0;
+    loop {
+        match browse(prompt, header, labels, cursor) {
+            Some(i) => {
+                cursor = i;
+                code = worse(code, detail(i));
+            }
+            None => return code,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // session / memory / mcp:M2 的三组(diff 已从菜单撤下,见顶层菜单的注释)
 // ---------------------------------------------------------------------------
 
-// `session list` / `session show` / `search` / `mcp ping` 的默认值与命令行
-// 同一个常量,不再照抄。抄错的代价是菜单里印的行数与命令行不一样,不会更
-// 危险,但一样是谎。
+// `session show` / `search` / `mcp ping` 的默认值与命令行同一个常量,不再
+// 照抄。抄错的代价是菜单里印的行数与命令行不一样,不会更危险,但一样是谎。
+// `session list` 不在此列:菜单要全表(理由见下面 docstring),命令行那份
+// 20 是它自己的领地。
 
-/// `session list` → 逐条浏览,选中即 `session show`(折叠视图,与命令行默认
-/// 同档)。Esc 回菜单,什么都没发生——浏览是 TTY 上的增益,不是新契约。
+/// `session list` → 逐条浏览,选中即 [`session_detail`] 下钻:折叠视图扫完,
+/// 同一行上给出全文 / 导出两个动作,再回列表接着看下一条。
+///
+/// 表本身不限行数:命令行那份默认 20 是给管道和「一眼扫完」用的,而菜单里
+/// `browse` 自己翻页,截到 20 反而让用户以为自己只有 20 场会话——同一张表
+/// 在两个入口给出两种「共有多少」是撒谎。行数在 [`duster_core::session::list`]
+/// 里由 `limit > 0` 才生效,这里直接给 0 = 全部;命令行的默认 20 是它的领地,
+/// 菜单不借,也不改。
 fn session_list(mode: OutputMode, index: Option<&Path>) -> i32 {
     let agents = match prompt_agent(index) {
         Ok(Some(v)) => v,
@@ -463,7 +512,7 @@ fn session_list(mode: OutputMode, index: Option<&Path>) -> i32 {
             project: None,
             older_than_days: None,
             min_bytes: None,
-            limit: cmd::session::DEFAULT_LIST_LIMIT,
+            limit: 0,
             now_ms: None,
         },
     ) {
@@ -482,18 +531,13 @@ fn session_list(mode: OutputMode, index: Option<&Path>) -> i32 {
         return EXIT_OK;
     }
     let (header, labels) = session_list_rows(&rows);
-    match browse("Which conversation", &header, &labels) {
-        Some(i) => cmd::session::run(
-            mode,
-            index,
-            cmd::session::SessionCmd::Show {
-                rid: rows[i].rid,
-                limit: cmd::session::DEFAULT_SHOW_LIMIT,
-                full: false,
-            },
-        ),
-        None => EXIT_OK,
-    }
+    drill(
+        "Which conversation",
+        &header,
+        &labels,
+        EXIT_OK,
+        |i| session_detail(mode, index, &rows[i]),
+    )
 }
 
 /// `session list` 的浏览行:列与 `cmd::session::render_list` 一致(ID / AGENT /
@@ -574,9 +618,96 @@ fn session_size_cell(bytes: u64, compressed: bool) -> String {
     }
 }
 
+/// 一场会话的下钻:先折叠视图(与命令行默认同档)扫一遍,再在同一行上
+/// 给四个上下文动作。
+///
+/// `--full` 是菜单以前唯一够不着又最痛的能力——折叠视图是**扫**一场会话的
+/// 形态,而用户扫完往往正是要读全文,让他退出菜单去敲一条带 rid 的命令是
+/// 最没道理的收场。这里把全文、两种导出都摆在同一个菜单里,动作跑完回
+/// 列表接着看下一条(`drill` 的下一轮),退出码与折叠视图那趟用 [`worse`]
+/// 并起来——看了五条有一条报错,整趟就不是 0。
+///
+/// 导出 `out` 恒为 None(写到 stdout):在提示符后面拼文件路径是 shell 的活,
+/// 菜单不抢。全文那档 `limit: 0` + `full: true`:`limit` 0 = 全部轮次、
+/// `--full` = 工具轮不折叠、正文不截 40 行,两条都是 `SessionCmd::Show`
+/// 里「要全部」的表达(见 `cmd::session::run_show`)。
+fn session_detail(mode: OutputMode, index: Option<&Path>, row: &SessionRow) -> i32 {
+    let rid = row.rid;
+    let mut code = cmd::session::run(
+        mode,
+        index,
+        cmd::session::SessionCmd::Show {
+            rid,
+            limit: cmd::session::DEFAULT_SHOW_LIMIT,
+            full: false,
+        },
+    );
+    // 动作。默认落在 back——回车不该触发写操作(export 会往 stdout 灌整场)。
+    let actions = session_detail_actions();
+    match menu_pick(&format!("Conversation {rid}: what next"), &actions, actions.len() - 1) {
+        Ok(Some(0)) => {
+            code = worse(
+                code,
+                cmd::session::run(
+                    mode,
+                    index,
+                    cmd::session::SessionCmd::Show {
+                        rid,
+                        limit: 0,
+                        full: true,
+                    },
+                ),
+            );
+        }
+        Ok(Some(1)) => {
+            code = worse(
+                code,
+                cmd::session::run(
+                    mode,
+                    index,
+                    cmd::session::SessionCmd::Export {
+                        rid,
+                        format: cmd::session::Format::Markdown,
+                        out: None,
+                    },
+                ),
+            );
+        }
+        Ok(Some(2)) => {
+            code = worse(
+                code,
+                cmd::session::run(
+                    mode,
+                    index,
+                    cmd::session::SessionCmd::Export {
+                        rid,
+                        format: cmd::session::Format::Json,
+                        out: None,
+                    },
+                ),
+            );
+        }
+        // Esc 与 back 同路:回列表,折叠视图那趟的退出码原样带走。
+        _ => {}
+    }
+    code
+}
+
+/// 下钻动作的行文。单独成函数而不是 inline:这是对用户可见的稳定契约
+/// (数量、措辞、back 恒在最后),测试要逐字核对,inline 就没有抓手。
+fn session_detail_actions() -> Vec<String> {
+    [
+        "read it in full (every turn, nothing truncated)".to_string(),
+        "export as markdown".to_string(),
+        "export as json".to_string(),
+        "back".to_string(),
+    ]
+    .to_vec()
+}
+
 /// `session show`:rid 来自上一屏那张表的 ID 列。
-/// 菜单里没有 `--full` 这档(折叠 + 截断正是交互阅读要的形态),
-/// 恒以折叠视图跑。
+/// 这是「我已经知道 rid」的快捷方式,恒以折叠视图跑;要读全文走列表下钻
+/// ([`session_detail`]),那里才有 `--full` 这档。
 fn session_show(mode: OutputMode, index: Option<&Path>) -> i32 {
     let rid = match prompt_rid() {
         Ok(Some(v)) => v,
@@ -654,6 +785,12 @@ fn session_prune(mode: OutputMode, index: Option<&Path>) -> i32 {
 
 /// `memory list` → 逐条浏览,选中即 `memory show`(key 是行尾那一串,原样递,
 /// 不经过用户的手抄)。Esc 回菜单,什么都没发生。
+///
+/// 这一屏不挂上下文动作菜单:memory 是一份只读文本,读完没有第二个动作可做;
+/// 为了形状统一硬塞一个只有 `back` 一条的动作菜单,等于每读一条记忆多按一次
+/// 回车。三层形状是因为有上下文动作才成立(`skill copies` 的详情有 link / 对比,
+/// search 的详情有全文),没有动作时它就是两层——少一层不是偷工,是省掉一次
+/// 无意义的按键。
 fn memory_list(mode: OutputMode, index: Option<&Path>) -> i32 {
     let agents = match prompt_agent(index) {
         Ok(Some(v)) => v,
@@ -670,7 +807,7 @@ fn memory_list(mode: OutputMode, index: Option<&Path>) -> i32 {
         .filter(|e| agents.is_empty() || agents.contains(&e.agent_id))
         .collect();
     // 有 warning 说明这张表不全:与命令行同一档退出码(3),提示照常上 stderr。
-    let code = if all.warnings.is_empty() {
+    let base = if all.warnings.is_empty() {
         EXIT_OK
     } else {
         EXIT_PARTIAL
@@ -682,23 +819,26 @@ fn memory_list(mode: OutputMode, index: Option<&Path>) -> i32 {
             "  {}",
             muted().apply_to(cmd::memory::empty_list_message(&agents, &all.entries))
         );
-        return code;
+        return base;
     }
     let (header, labels, keys) = cmd::memory::browse_rows(&entries);
-    match browse("Which memory", &header, &labels) {
-        // 下钻后不能把「这张表不全」的 warning 退出码吞掉。
-        Some(i) => worse(
-            code,
+    // 读完回列表接着看下一条:`drill` 把光标带回原行,退出码一路 `worse`
+    // 并进 `base`——「这张表不全」的 warning 档(3)不会被后面的读操作吞掉。
+    drill(
+        "Which memory",
+        &header,
+        &labels,
+        base,
+        |i| {
             cmd::memory::run(
                 mode,
                 index,
                 &cmd::memory::MemoryCmd::Show {
                     key: keys[i].clone(),
                 },
-            ),
-        ),
-        None => code,
-    }
+            )
+        },
+    )
 }
 
 /// `memory show`:key 是上一屏 PATH 列里的那一串,原样贴进来。
@@ -712,7 +852,7 @@ fn memory_show(mode: OutputMode, index: Option<&Path>) -> i32 {
     cmd::memory::run(mode, index, &cmd::memory::MemoryCmd::Show { key })
 }
 
-/// `mcp list` → 逐条浏览,选中即 `mcp show`。Esc 回菜单,什么都没发生。
+/// `mcp list` → 逐条浏览,选中进详情([`mcp_detail`])。Esc 回菜单,什么都没发生。
 fn mcp_list(mode: OutputMode, index: Option<&Path>) -> i32 {
     let list = match mcp::list(index) {
         Ok(l) => l,
@@ -736,20 +876,158 @@ fn mcp_list(mode: OutputMode, index: Option<&Path>) -> i32 {
         return code;
     }
     let (header, labels) = cmd::mcp::browse_rows(&list);
-    match browse("Which server", &header, &labels) {
-        // 下钻后不能把「这张表不全」的 warning 退出码吞掉。
-        Some(i) => worse(
-            code,
-            cmd::mcp::run(
-                mode,
-                index,
-                cmd::mcp::McpCmd::Show {
-                    name: list.servers[i].name.clone(),
-                },
-            ),
-        ),
-        None => code,
+    // warning 那一档退出码由 drill 的 base 承载,下钻再深也不吞它。
+    drill(
+        "Which server",
+        &header,
+        &labels,
+        code,
+        |i| mcp_detail(mode, index, &list.servers[i]),
+    )
+}
+
+/// 详情屏的动作。菜单行文本与动作一一对应;compare 在声明者不足两个时
+/// 整条不出现在菜单里,所以行号不能写死,必须由这个表反查。
+#[derive(Clone, Copy)]
+enum McpDetailAction {
+    Compare,
+    Copy,
+    Ping,
+    Back,
+}
+
+impl McpDetailAction {
+    /// 菜单行文本,顺序即菜单顺序。
+    fn label(self) -> &'static str {
+        match self {
+            McpDetailAction::Compare => "compare how two agents declare it",
+            McpDetailAction::Copy => "copy it into other agents",
+            McpDetailAction::Ping => "ping it",
+            McpDetailAction::Back => "back",
+        }
     }
+}
+
+/// 一个 server 的详情:先 `mcp show`,再出上下文动作。动作跑完回列表
+/// (drill 的下一轮),不是回顶层菜单。
+///
+/// `mcp list` 印出冲突块之后,用户下一步必然是 diff 或 sync——旧版他得
+/// 退回菜单再选一次、再手敲一遍服务器名;这一屏把「下一步」放在详情
+/// 底下,名字与两边的 agent 都从上下文里来,一个字不用敲。
+fn mcp_detail(mode: OutputMode, index: Option<&Path>, server: &MergedServer) -> i32 {
+    let mut code = cmd::mcp::run(
+        mode,
+        index,
+        cmd::mcp::McpCmd::Show {
+            name: server.name.clone(),
+        },
+    );
+
+    // compare 要从「声明了这个服务器的 agent」里选两个不同的:声明它的
+    // agent 不足两个时这条动作不出现在菜单里——菜单里不该有一条按下去
+    // 只会说「不够两个」的条目。
+    //
+    // 同一 agent 可能在两个文件里声明同一个 server(同名同哈希合并成一行),
+    // 去重后再数:两条声明来自同一个 agent 时,「对比两家声明」无从谈起。
+    //
+    // 先排序再去重——`dedup` 只塌掉**相邻**的重复项,而 `declared_in` 的
+    // 顺序来自扫描时的文件遍历,同一个 agent 的两处声明中间完全可能夹着
+    // 别人。不排序的话它会漏掉,于是菜单里出现一条「对比两家声明」,点进去
+    // 两边是同一个 agent。
+    let mut declarers: Vec<String> = server
+        .declared_in
+        .iter()
+        .map(|d| d.agent_id.clone())
+        .collect();
+    declarers.sort_unstable();
+    declarers.dedup();
+
+    let mut actions: Vec<McpDetailAction> = Vec::with_capacity(4);
+    if declarers.len() >= 2 {
+        actions.push(McpDetailAction::Compare);
+    }
+    actions.push(McpDetailAction::Copy);
+    actions.push(McpDetailAction::Ping);
+    actions.push(McpDetailAction::Back);
+    let labels: Vec<String> = actions.iter().map(|a| a.label().to_string()).collect();
+    // 默认落在 back——回车不该触发写操作(copy 会往别的 agent 的配置
+    // 文件里写字)。
+    let Ok(Some(i)) = menu_pick(&format!("{}: what next", server.name), &labels, labels.len() - 1)
+    else {
+        // Esc 与 back 同路:回列表,什么都没发生。
+        return code;
+    };
+    match actions[i] {
+        McpDetailAction::Compare => {
+            code = worse(code, mcp_diff_pair(mode, index, server, &declarers));
+        }
+        McpDetailAction::Copy => {
+            // 名字不再问第二遍:这一屏的上下文就是它。
+            code = worse(code, mcp_sync_named(mode, index, server.name.clone()));
+        }
+        McpDetailAction::Ping => {
+            code = worse(
+                code,
+                cmd::mcp::run(
+                    mode,
+                    index,
+                    cmd::mcp::McpCmd::Ping {
+                        name: Some(server.name.clone()),
+                        timeout_ms: cmd::mcp::DEFAULT_PING_TIMEOUT_MS,
+                    },
+                ),
+            );
+        }
+        // back:回列表(drill 的下一轮),什么都不做。
+        McpDetailAction::Back => {}
+    }
+    code
+}
+
+/// 从一份名单里选两个不同的下标:先选左,再在剩下的里面选右。
+///
+/// 两份都选完才算数——任一步 Esc 都整体取消(回列表,什么都没发生)。
+/// skill 那组有同形的 [`pick_copy_pair`],但它的入参是组结构不是名单,
+/// 共用要两头适配,不如这一份独立的小函数直接。
+fn pick_two_distinct(
+    prompt_a: &str,
+    prompt_b: &str,
+    items: &[String],
+) -> Option<(usize, usize)> {
+    let a = match menu_pick(prompt_a, items, 0) {
+        Ok(Some(i)) => i,
+        Ok(None) | Err(()) => return None,
+    };
+    let rest: Vec<usize> = (0..items.len()).filter(|&i| i != a).collect();
+    let rest_rows: Vec<String> = rest.iter().map(|&i| items[i].clone()).collect();
+    let b = match menu_pick(prompt_b, &rest_rows, 0) {
+        Ok(Some(j)) => j,
+        Ok(None) | Err(()) => return None,
+    };
+    Some((a, rest[b]))
+}
+
+/// 详情屏的 diff 动作:两个 agent 都从 [`mcp_detail`] 的 `declared_in`
+/// 名单里选,用户不手敲——`mcp list` 的冲突块里印的就是这两个名字,
+/// 手敲一遍等于让用户把刚看过的字再打一遍。
+fn mcp_diff_pair(
+    mode: OutputMode,
+    index: Option<&Path>,
+    server: &MergedServer,
+    declarers: &[String],
+) -> i32 {
+    let Some((a, b)) = pick_two_distinct("Left side", "Right side", declarers) else {
+        return EXIT_OK;
+    };
+    cmd::mcp::run(
+        mode,
+        index,
+        cmd::mcp::McpCmd::Diff {
+            name: server.name.clone(),
+            from: declarers[a].clone(),
+            to: declarers[b].clone(),
+        },
+    )
 }
 
 /// `mcp show`:名字来自 `mcp list` 的 NAME 列。
@@ -782,9 +1060,22 @@ fn mcp_diff(mode: OutputMode, index: Option<&Path>) -> i32 {
     cmd::mcp::run(mode, index, cmd::mcp::McpCmd::Diff { name, from, to })
 }
 
-/// `mcp sync`:这一组里唯一会写别人配置文件的动作,所以走两段式——
-/// `plan_sync` 先出计划(一个字节都不写),目标勾选表确认后 `apply_sync`
-/// 只对勾过的目标动手。
+/// `mcp sync`:先问名字,剩下的全部交给 [`mcp_sync_named`]。
+///
+/// 详情屏(copy it into other agents)直接调 [`mcp_sync_named`]——名字
+/// 已经在那屏的上下文里,不重问第二遍。
+fn mcp_sync(mode: OutputMode, index: Option<&Path>) -> i32 {
+    let name = match prompt_required("Server name, as `mcp list` prints it") {
+        Ok(Some(v)) => v,
+        Ok(None) => return EXIT_OK,
+        Err(()) => return EXIT_ERROR,
+    };
+    mcp_sync_named(mode, index, name)
+}
+
+/// 拿到名字之后的 `mcp sync`:这一组里唯一会写别人配置文件的动作,所以
+/// 走两段式——`plan_sync` 先出计划(一个字节都不写),目标勾选表确认后
+/// `apply_sync` 只对勾过的目标动手。
 ///
 /// `--from` 留空即不带这个旗标:只有一个 agent 声明它时 core 自己认得出来,
 /// 多于一个才会要求点名,那句报错比菜单在这里瞎猜一个来源有用得多。
@@ -792,31 +1083,20 @@ fn mcp_diff(mode: OutputMode, index: Option<&Path>) -> i32 {
 /// 早先这一条不走勾选表,只有「全做 / 全不做」两个答案,而且那条通用
 /// 路径靠退出码 4 做控制流——两条罪状一起删了:同一张计划不该有两种
 /// 权力,`clean` / `prune` 能留下一两条,会话与 MCP 也该能。所以这里
-/// 目标也走勾选表:勾几个就写几个。
-fn mcp_sync(mode: OutputMode, index: Option<&Path>) -> i32 {
-    let name = match prompt_required("Server name, as `mcp list` prints it") {
-        Ok(Some(v)) => v,
-        Ok(None) => return EXIT_OK,
-        Err(()) => return EXIT_ERROR,
-    };
+/// 目标也走勾选表:勾几个就写几个。目标候选来自索引、排除 `from`,
+/// 默认一个都不勾——方向与 [`prompt_agent`] 相反,理由见 [`sync_target_agents`]。
+fn mcp_sync_named(mode: OutputMode, index: Option<&Path>, name: String) -> i32 {
     let from = match prompt_optional("Copy from which agent (leave empty to let duster pick)") {
         Ok(LineOutcome::Value(v)) => Some(v),
         Ok(LineOutcome::Empty) => None,
         Ok(LineOutcome::Esc) => return EXIT_OK,
         Err(()) => return EXIT_ERROR,
     };
-    let raw = match prompt_required("Copy into which agents, comma separated") {
+    let to = match sync_target_agents(index, from.as_deref()) {
         Ok(Some(v)) => v,
-        Ok(None) => return EXIT_OK,
+        Ok(None) => return EXIT_OK, // Esc:什么都没发生,与其余问句一致
         Err(()) => return EXIT_ERROR,
     };
-    // 与 clap 的 `value_delimiter = ','` 同一把切法。
-    let to: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
     if to.is_empty() {
         eprintln!();
         eprintln!("  {}", style("No target agent — nothing to do.").dim());
@@ -852,7 +1132,7 @@ fn mcp_sync(mode: OutputMode, index: Option<&Path>) -> i32 {
     let picked = match prompt_checklist(
         &menu_theme(),
         Checklist {
-            prompt: "Space toggles · a all/none · Enter syncs the checked · Esc cancels",
+            prompt: "Write these · Space toggles · a all/none · Enter syncs the checked · Esc cancels",
             header: None,
             items: &labels,
             checked: vec![true; plan.targets.len()],
@@ -940,7 +1220,97 @@ fn sync_target_rows_at(plan: &[SyncOutcome], cols: usize) -> Vec<String> {
         .collect()
 }
 
+/// 目标名单的勾选表:一行一个 agent,排除 `from` 点名的那个。默认一个
+/// 都不勾。
+///
+/// 行文本只印 agent id,不照抄 [`agent_choice_rows`] 那张带体积的表:
+/// 那两个数(总量 / 可回收量)是给 clean / prune 做「清谁」决策用的;
+/// 这里的问题是「往谁家写」,家当多大不改变答案,印出来只会把行顶宽、
+/// 把屏幕占掉,而这一屏的候选常常就是三五个名字。
+///
+/// **默认一个都不勾**——与 [`prompt_agent`] 那张表相反。理由:`--agent`
+/// 不带就是「全部」,所以那屏默认全勾;而 `--to` 在 clap 里是
+/// `required = true`,命令行**没有**「全部」这个默认,菜单替用户勾满
+/// 等于凭空发明一个 CLI 表达不出的默认值,而它的后果是往每一个 agent
+/// 的配置文件里写字。
+///
+/// 索引缺失或一个 agent 都没有时退回逗号输入:一屏没有任何可选项的
+/// 菜单是死胡同,而自由输入总能给出一条路。排除 `from` 后一个都不剩
+/// 同样退回——勾选表连一行都没有,不是「用户勾了零个」,是根本没得选。
+fn sync_target_agents(
+    index: Option<&Path>,
+    from: Option<&str>,
+) -> Result<Option<Vec<String>>, ()> {
+    let agents = match agent_choices(index) {
+        Some(a) => a,
+        None => return fallback_targets(),
+    };
+    let items: Vec<String> = agents
+        .iter()
+        .map(|a| a.agent_id.clone())
+        .filter(|id| Some(id.as_str()) != from)
+        .collect();
+    if items.is_empty() {
+        return fallback_targets();
+    }
+    let picked = match prompt_checklist(
+        &menu_theme(),
+        Checklist {
+            // 这一屏只是圈定候选,一个字节都还没写——计划在它之后才出。
+            // 措辞不能借用下一屏那句「Enter syncs the checked」:那是同意
+            // 门,这里按下回车只会让 duster 去算一份计划给你看。
+            prompt: "Copy into which agents · Space toggles · a all/none · Enter confirms · Esc cancels",
+            header: None,
+            items: &items,
+            checked: initial_checked(items.len(), false),
+            select_all: false,
+            page: crate::browse::viewport(CHECKLIST_RESERVED),
+        },
+    ) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Ok(None), // Esc:回上一屏,什么都没发生
+        Err(_) => return Err(()),
+    };
+    Ok(Some(
+        picked.iter().map(|&i| items[i].clone()).collect(),
+    ))
+}
+
+/// 逗号输入的降级:与 clap 的 `value_delimiter = ','` 同一把切法,
+/// 空串与空白段一律滤掉。
+fn fallback_targets() -> Result<Option<Vec<String>>, ()> {
+    let raw = match prompt_required("Copy into which agents, comma separated") {
+        Ok(Some(v)) => v,
+        Ok(None) => return Ok(None),
+        Err(()) => return Err(()),
+    };
+    Ok(Some(
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    ))
+}
+
+/// 勾选表的初始勾选向量。两个入口方向相反:
+/// - [`prompt_agent`] 默认全勾——命令行不带 `--agent` 就是「全部」,
+///   所以「全部」才是那屏的默认答案;
+/// - sync 的目标表默认全不勾——`--to` 没有「全部」这个默认(见
+///   [`sync_target_agents`]),替用户勾满等于发明一个 CLI 表达不出的
+///   默认值。
+///
+/// 抽成纯函数,让测试能把这两个方向各自钉死。
+fn initial_checked(n: usize, default: bool) -> Vec<bool> {
+    vec![default; n]
+}
+
 /// `mcp ping`:留空即全部试一遍。会起进程,所以名字这一问不能替用户跳过。
+///
+/// timeout 单独一问,留空用默认 [`cmd::mcp::DEFAULT_PING_TIMEOUT_MS`]:
+/// ping 会起进程,慢的服务器在默认 3 秒下必然全红,而用户唯一能做的
+/// 补救就是给它更长时间——这个旋钮不给,这一屏的结论就是错的
+/// (把「这台机器连不上」报成「这个服务器挂了」)。
 fn mcp_ping(mode: OutputMode, index: Option<&Path>) -> i32 {
     let name = match prompt_optional("Only this server (leave empty to try all)") {
         Ok(LineOutcome::Value(v)) => Some(v),
@@ -948,18 +1318,59 @@ fn mcp_ping(mode: OutputMode, index: Option<&Path>) -> i32 {
         Ok(LineOutcome::Esc) => return EXIT_OK,
         Err(()) => return EXIT_ERROR,
     };
+    let timeout_ms = match prompt_timeout_ms() {
+        Ok(Some(t)) => t,
+        Ok(None) => return EXIT_OK, // Esc:回菜单,什么都没发生
+        Err(()) => return EXIT_ERROR,
+    };
     cmd::mcp::run(
         mode,
         index,
         cmd::mcp::McpCmd::Ping {
             name,
-            timeout_ms: cmd::mcp::DEFAULT_PING_TIMEOUT_MS,
+            timeout_ms,
         },
     )
 }
 
+/// timeout 的校验器本体(纯函数,测试直接断言):空串 = 留空用默认,
+/// 其余必须是正整数毫秒。非法输入当场给一句人话,不让它掉到下游
+/// 变成一个更远的报错。
+fn validate_timeout_ms(s: &str) -> Result<(), String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(());
+    }
+    match s.parse::<u64>() {
+        Ok(0) => Err("please type a positive number of milliseconds".to_string()),
+        Ok(_) => Ok(()),
+        Err(_) => Err("please type a positive number of milliseconds".to_string()),
+    }
+}
+
+/// timeout 一问。`Ok(None)` = Esc,调用方原样回菜单,什么都没发生。
+fn prompt_timeout_ms() -> Result<Option<u64>, ()> {
+    let v = |s: &str| validate_timeout_ms(s);
+    let prompt = format!(
+        "Timeout in milliseconds (leave empty for {})",
+        cmd::mcp::DEFAULT_PING_TIMEOUT_MS
+    );
+    match prompt_line(&ColorfulTheme::default(), &prompt, Some(&v)) {
+        Ok(Some(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                Ok(Some(cmd::mcp::DEFAULT_PING_TIMEOUT_MS))
+            } else {
+                Ok(Some(s.parse::<u64>().expect("validator already checked")))
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// skill copies:组列表 → 组详情(副本表 + link / 对比)
+// skill copies:组列表 → 组详情(副本表 + link / 对比)→ 回组列表
 // ---------------------------------------------------------------------------
 
 /// `skill copies` → 组列表逐条浏览,选中进组详情。Esc 回菜单,什么都没发生。
@@ -978,10 +1389,14 @@ fn skill_copies(mode: OutputMode, index: Option<&Path>) -> i32 {
         return EXIT_OK;
     }
     let (header, labels) = skill_group_rows(&groups);
-    match browse("Which skill", &header, &labels) {
-        Some(i) => skill_group_detail(mode, index, &groups[i]),
-        None => EXIT_OK,
-    }
+    // 组详情里的动作打完回列表,接着看下一组:`drill` 会把光标带回原行。
+    drill(
+        "Which skill",
+        &header,
+        &labels,
+        EXIT_OK,
+        |i| skill_group_detail(mode, index, &groups[i]),
+    )
 }
 
 /// 组列表的浏览行:名字 + 状态 + 副本数。选中进详情,细节都在那一屏。
@@ -1036,6 +1451,10 @@ fn skill_group_rows(groups: &[SkillGroup]) -> (String, Vec<String>) {
 /// 顶层 `diff` 已从菜单撤下(见顶层菜单的注释),通用文件对比交给系统 `diff`;
 /// 这一屏是 diff 引擎在菜单里剩下的两个有上下文的落脚点之一
 /// (另一个是 `mcp diff`),所以「对比两份副本」必须在这里。
+///
+/// back(或 Esc)回 `skill_copies` 的组列表,不弹回顶层——这一屏是 drill 的
+/// 详情,动作打完用户多半还要看下一组,回列表且光标停在原行,比重新进一遍
+/// 省事。
 fn skill_group_detail(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) -> i32 {
     // INSTALLED 只在真有编译产物时出一列——与 `render_skill_groups` 同一条
     // 规矩:一整列 0 B 既占掉 PATH 要的宽度,又让人以为那里有意义可读。
@@ -1088,7 +1507,8 @@ fn skill_group_detail(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) ->
     match menu_pick(&format!("{}: what next", g.name), &actions, 2) {
         Ok(Some(0)) => skill_link_action(mode, index, g),
         Ok(Some(1)) => skill_compare_action(mode, index, g),
-        // Esc 与 back 同路:回菜单。
+        // Esc 与 back 同路:回组列表(详情是 drill 的下钻,回列表是回到
+        // 原行接着看,不是弹回顶层)。
         _ => EXIT_OK,
     }
 }
@@ -1296,7 +1716,8 @@ fn prompt_agent(index: Option<&Path>) -> Result<Option<Vec<String>>, ()> {
     let mut items: Vec<String> = Vec::with_capacity(agents.len() + 1);
     items.push("All agents".to_string());
     items.extend(agent_choice_rows(&agents));
-    let checked = vec![true; items.len()];
+    // 默认全勾:方向与 sync 的目标表相反,见 [`initial_checked`]。
+    let checked = initial_checked(items.len(), true);
     let picked = match prompt_checklist(
         &menu_theme(),
         Checklist {
@@ -1802,7 +2223,14 @@ fn ask(theme: &ColorfulTheme, prompt: &str) -> Approval {
 }
 
 /// 交互式收集 search 参数:query(≥3 字符)、可选 agent、limit(默认 20)。
-/// 命中逐条浏览,选中即 `open` 整轮(折叠视图)。Esc 回菜单,什么都没发生。
+/// 命中逐条浏览,选中即 `open` 整轮(折叠视图),详情屏还能换全文读;读哪样
+/// 完了都回命中表接着看。Esc 回菜单,什么都没发生。
+///
+/// 列表类命令唯独 search 设上限(20),这条不对称是故意的:别的表是从索引
+/// 现读的行数,多印一行不花成本;search 的命中是 bm25 相关度 top-N,而且
+/// 每条命中都要回读源文件切摘要,不限量等于让用户按一次回车扫全盘。上限
+/// 本身没错,错的是它以前藏着——用户看到 20 行,不知道自己看的是前 20 名
+/// 还是全部,所以顶到上限时必须明说(见 [`search_limit_notice`])。
 fn prompt_search(mode: OutputMode, index: Option<&Path>) -> i32 {
     let theme = ColorfulTheme::default();
     let v = |s: &str| {
@@ -1846,11 +2274,56 @@ fn prompt_search(mode: OutputMode, index: Option<&Path>) -> i32 {
         );
         return EXIT_OK;
     }
-    let (header, labels) = search_rows(&hits, &query);
-    match browse("Which turn to read", &header, &labels) {
-        Some(i) => cmd_open(mode, index, hits[i].tid, false),
-        None => EXIT_OK,
+    // 命中数顶到上限就是「可能还有」:检索层只保证最多回 limit 条,回满
+    // 上限就说不清后面还有没有。告示走 stderr,与「No matches」同一路输出。
+    if let Some(notice) = search_limit_notice(hits.len(), &query) {
+        eprintln!();
+        eprintln!("  {}", muted().apply_to(notice));
     }
+    let (header, labels) = search_rows(&hits, &query);
+    drill(
+        "Which turn to read",
+        &header,
+        &labels,
+        EXIT_OK,
+        |i| search_detail(mode, index, hits[i].tid),
+    )
+}
+
+/// search 详情:先折叠打开整轮,再给「读全文」与 back 两个动作。
+///
+/// 折叠是默认档:大多数命中,摘要加折叠正文就够判断了;要全文的人自己按
+/// 一次——方向与命令行 `open` 的 `--full` 一致,菜单只是把两个档摆成动作。
+/// 动作默认落在 back:回车不该把上千行的全文劈头盖脸铺出来,要全文的人
+/// 会自己按一次。back(或 Esc)回命中表:看完一条多半还有下一条,弹回
+/// 顶层等于逼用户从头搜一遍。
+fn search_detail(mode: OutputMode, index: Option<&Path>, tid: i64) -> i32 {
+    let code = cmd_open(mode, index, tid, false);
+    let actions = [
+        "read this turn in full".to_string(),
+        "back".to_string(),
+    ];
+    match menu_pick(&format!("#{tid}: what next"), &actions, actions.len() - 1) {
+        Ok(Some(0)) => worse(code, cmd_open(mode, index, tid, true)),
+        // Esc 与 back 同路:回命中表。
+        _ => code,
+    }
+}
+
+/// search 命中数顶到查询上限时的截断告示;没顶到就返回 None。
+///
+/// 判定用 `>=` 而不是 `==`:检索层只保证「最多返回 limit 条」,恰好回满
+/// 上限时后面可能还有,少一条才是真的没有了。给纯函数、不碰终端,测试
+/// 直接喂 19 / 20 / 21 条验判定;提示里带上查询词与 `--limit`,用户照着
+/// 抄就能跑出更多命中。
+fn search_limit_notice(n: usize, query: &str) -> Option<String> {
+    if n < crate::DEFAULT_SEARCH_LIMIT {
+        return None;
+    }
+    Some(format!(
+        "Only the top {} matches by relevance are shown — run `duster search \"{query}\" --limit <n>` for more",
+        crate::DEFAULT_SEARCH_LIMIT
+    ))
 }
 
 /// 命中的浏览行:`#tid  agent  file  turn N · role`,与 `render_search_human`
@@ -2090,6 +2563,41 @@ mod tests {
         }
     }
 
+    /// 两张勾选表的默认方向必须相反:范围表(`prompt_agent`,clean / prune
+    /// 的 `--agent`)默认全勾,因为命令行不带 `--agent` 就是「全部」;sync
+    /// 的目标表默认全不勾,因为 `--to` 是 `required = true`,命令行没有
+    /// 「全部」这个默认——替用户勾满等于发明一个 CLI 表达不出的默认值,
+    /// 而它的后果是往每个 agent 的配置文件里写字。
+    #[test]
+    fn 勾选表默认方向相反() {
+        assert!(
+            initial_checked(4, true).iter().all(|c| *c),
+            "范围表默认全勾"
+        );
+        assert!(
+            initial_checked(4, false).iter().all(|c| !*c),
+            "sync 目标表默认全不勾"
+        );
+        assert_eq!(initial_checked(4, false).len(), 4, "一行一个勾选框");
+    }
+
+    /// timeout 校验器:空串(留空 = 用默认)与正整数毫秒放行,`abc` / `-1`
+    /// / `0` 当场报错——非法输入必须死在问句上,不让它掉到下游变成一个
+    /// 更远的报错。
+    #[test]
+    fn timeout校验器() {
+        assert!(validate_timeout_ms("").is_ok(), "空串 = 留空用默认");
+        assert!(validate_timeout_ms("   ").is_ok(), "纯空白同空串");
+        assert!(validate_timeout_ms("3000").is_ok(), "正整数毫秒");
+        assert!(validate_timeout_ms(" 5000 ").is_ok(), "trim 后再校验");
+        for bad in ["abc", "-1", "0", "1.5"] {
+            assert!(
+                validate_timeout_ms(bad).is_err(),
+                "非法输入 {bad} 必须当场报错"
+            );
+        }
+    }
+
     /// 目标勾选表在 80 列终端下必须放得下那条出了名的长路径:路径列不截
     /// 的话,`claude-desktop · create · ~/Library/Application Support/…` 一行
     /// 就是 90 列,折行后控件按逻辑行计数、`clear_last_lines` 按物理行擦,
@@ -2113,5 +2621,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 截断告示的判定是纯函数,不碰终端:19 条没回满上限、必然就是全部;
+    /// 20 条顶到上限、后面可能还有;21 条同样按截断处理(判定是 `>=`,
+    /// 防的是上限被调小)。提示措辞里带着查询词与 `--limit`,用户照着抄
+    /// 就能跑出更多命中。
+    #[test]
+    fn search_limit_notice_顶到上限才提示() {
+        assert_eq!(search_limit_notice(19, "cache"), None);
+        assert!(search_limit_notice(20, "cache").is_some());
+        assert!(search_limit_notice(21, "cache").is_some());
+        let notice = search_limit_notice(20, "cache").unwrap();
+        assert!(notice.contains("cache") && notice.contains("--limit"), "{notice}");
+    }
+
+    /// 下钻菜单的条目是用户可见的稳定契约:数量、措辞、back 恒在最后。
+    /// 这条菜单是列表浏览的出口,加一条新动作或把 back 挪走,「回车默认
+    /// 做什么」的预期当场作废,而编译器不会拦——这里逐字钉死,顺带守住
+    /// `menu_pick` 的默认下标就是最后一条(back)这个约定。
+    #[test]
+    fn 会话下钻动作_数量措辞稳定且_back_恒在最后() {
+        assert_eq!(
+            session_detail_actions(),
+            [
+                "read it in full (every turn, nothing truncated)",
+                "export as markdown",
+                "export as json",
+                "back",
+            ]
+        );
+        let actions = session_detail_actions();
+        assert_eq!(actions.last().map(String::as_str), Some("back"));
     }
 }

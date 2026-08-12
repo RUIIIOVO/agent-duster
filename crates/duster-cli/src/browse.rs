@@ -5,6 +5,13 @@
 //! 显示几行,超出部分按页翻(←/→,末行报「第几到第几 / 共几行」),
 //! Enter 带走选中下标,Esc 原样退回。
 //!
+//! # 光标要带回来
+//!
+//! 下钻看完一条再回到列表时,光标必须还停在那一条上。[`browse`] 收一个
+//! 起点下标,调用方在循环里把上一次的选择原样递回来。少了这一条,「看完
+//! 第 37 条回列表」就等于「回到第 1 条,自己再翻三页」——三层形状
+//! (列表 → 详情 → 动作 → 回列表)会当场退化成一次性下钻。
+//!
 //! # 为什么不是 dialoguer 的 `Select`
 //!
 //! 它会翻页,但页高由它自己从终端行数重算(`paging.rs`:
@@ -71,12 +78,20 @@ fn viewport_of(rows: usize, reserved: usize) -> usize {
     rows.saturating_sub(reserved).max(1)
 }
 
-/// 分页浏览一批已经渲染好的行；Enter 返回选中下标，Esc 返回 None。
-/// 非 TTY 返回 None：调用方照旧打完整表格，浏览是 TTY 上的增益，不是新契约。
+/// 分页浏览一批已经渲染好的行;Enter 返回选中下标,Esc 返回 None。
+///
+/// 光标落在 `start` 那一行:下钻回来时调用方把上一次的选择原样递回来
+/// (见 `interactive.rs` 的 `drill`),列表就还停在原地。`start` 越界
+/// (行数在两趟之间变少了)由 [`prompt_pick`] 自己夹回 0,这里不重复判一遍。
+///
+/// 没有「从头开始」那个便利重载:全部调用点都在 `drill` 的循环里,一个
+/// 恒传 0 的包装函数只会让下一个人以为存在两种浏览语义。首次进列表传 0。
+///
+/// 非 TTY 返回 None:调用方照旧打完整表格,浏览是 TTY 上的增益,不是新契约。
 ///
 /// `header` 是列名那一行,交给 [`prompt_pick`] 画在问句下面——它必须与条目
 /// 一起被擦掉,否则退场后屏幕上留着一个没有表的表头。
-pub fn browse(prompt: &str, header: &str, rows: &[String]) -> Option<usize> {
+pub fn browse(prompt: &str, header: &str, rows: &[String], start: usize) -> Option<usize> {
     if !std::io::stderr().is_terminal() || rows.is_empty() {
         return None;
     }
@@ -97,7 +112,7 @@ pub fn browse(prompt: &str, header: &str, rows: &[String]) -> Option<usize> {
             header: Some(header),
             items: rows,
             page,
-            start: 0,
+            start,
         },
     )
     .ok()
@@ -126,9 +141,11 @@ mod tests {
             return;
         }
         assert!(!std::io::stdout().is_terminal(), "测试前提:stdout 应是管道");
-        assert_eq!(browse("Pick one", "HEADER", &["row".to_string()]), None);
+        assert_eq!(browse("Pick one", "HEADER", &["row".to_string()], 0), None);
         // 空列表同样不该进交互——没有可选项的菜单是死胡同。
-        assert_eq!(browse("Pick one", "HEADER", &[]), None);
+        assert_eq!(browse("Pick one", "HEADER", &[], 0), None);
+        // 越界的起点也不许把这条早退路径绕过去:非 TTY 先于一切判定。
+        assert_eq!(browse("Pick one", "HEADER", &["row".to_string()], 99), None);
     }
 
     #[test]
