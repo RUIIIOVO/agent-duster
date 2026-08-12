@@ -1,12 +1,21 @@
 # =============================================================================
 # Cursor 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
-# 无 mcp 节:本机未见 ~/.cursor/mcp.json,MCP 配置形态未证实,宁缺毋滥。
-# 无 skill/memory 节:Cursor 的规则/记忆模型与本清单词汇表不对应。
-# 刻意不声明 ~/.cursor/ai-tracking:AI 代码采纳追踪数据,既非产物也非本体,
-#           内部格式未证实,按「不理解的东西不动」放弃认领。
-#           注意:probe 已认领 ~/.cursor,所以未声明的子目录既不入索引、
-#           也不会出现在 unclassified 表里——它现在谁都不统计。这个洞是
-#           collect_unclassified 只看顶层候选目录导致的,修在扫描器里。
+#
+# ── MCP:项目级,今天声明不了(本机实测 2026-08-11)──────────────────────
+# 全局 ~/.cursor/mcp.json **不存在**,Cursor 的 MCP 注册表是每项目一份:
+#     ~/.cursor/projects/<路径编码>/mcps/
+# (`/`→`-` 编码,与 Claude 的 projects 同一套。目录已建、本机为空。)
+# 两个硬阻塞,缺一不可解,别再去重测:
+#   1. path 里要有一段**路径编码通配符**,清单 schema 今天表达不了——
+#      path 只是一个普通字符串,没有通配段语义,glob 只作用于资源目录内部。
+#   2. ManifestScope::Project 在 M0 只占了个位,扫描器不走项目级资源;
+#      它必须先真正落地,这条声明才有地方去。
+# 另外 mcps/ 目录在本机是空的,**磁盘格式未证实**——即便前两条解决了,
+# 也要先采到一份真实样本再决定 mapper,不许照着全局方言猜。
+# 无 skill/memory 节:项目级 rules/ 同样卡在上面两条上(本机也为空)。
+#
+# 无 binary / version_cmd:`cursor` 本机不在 PATH 上,写了永远不会命中,
+# 属于无害但误导的声明——探测只靠 ~/.cursor 目录存在性。
 # =============================================================================
 
 [agent]
@@ -16,11 +25,10 @@ display_name = "Cursor"
 [probe]
 # ~/.cursor 数据目录存在即视为已安装。
 any_of = ["~/.cursor"]
-binary = "cursor"
-# M0 只存不执行。
-version_cmd = ["cursor", "--version"]
 
 # ── Session:按项目分目录的 agent 会话/上下文,格式未证实,只统计 ─────────
+# 注意这条同时把 projects/<路径编码>/{mcps,rules}/ 一并盖住了:体积不会漏,
+# 只是内容还没被解析。将来拆项目级资源时,得同步处理重叠路径。
 [[resource]]
 kind = "session"
 scope = "global"
@@ -33,3 +41,28 @@ kind = "install"
 scope = "global"
 path = "~/.cursor/extensions"
 mapper = "stats-only"
+
+# ── Artifact:AI 代码采纳追踪 ────────────────────────────────────────────
+# 本机内含 ai-code-tracking.db(SQLite)。是「你接受了多少 AI 补全」的用量
+# 遥测,不是用户资产也不是软件本体,删了 Cursor 照常跑、下次用就重建。
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.cursor/ai-tracking"
+mapper = "stats-only"
+clean_level = "l1"   # 用量遥测,自动重建
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 一棵独占树,与 M1 `uninstall --data-only` 取的根一致。整棵删——包括清单
+# 今天声明不了的 projects/<路径编码>/{mcps,rules}/。
+#
+# 无 shared 节:Cursor 的 MCP 与 rules 都是项目级、都在自己树里,没有任何
+# 别的 agent 的文件存着它的配置键(本机 2026-08-11 确认)。
+#
+# 无 package 节 —— 本机**根本没有装 Cursor 这个应用**:mdfind -name Cursor.app
+# 零命中,/Applications 与 ~/Applications 都没有,`command -v cursor` 找不到,
+# brew cask 列表里也没有。~/.cursor 是应用被卸载后留下的数据目录。
+# 没有可归因的包管理器 ⇒ 整条不写。等哪天在装着 Cursor 的机器上采到证据
+# (大概率是 brew cask 或官方 dmg)再补。
+[uninstall]
+owns = ["~/.cursor"]

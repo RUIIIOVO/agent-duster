@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Agent 环境快照:利用 APFS clonefile(cp -c)做秒级、近零磁盘成本的备份/恢复。
-# 用途:duster 破坏性命令(clean/dedupe/migrate)测试前打快照,出问题一键还原。
+# 用途:duster 破坏性命令(clean/prune/uninstall)测试前打快照,出问题一键还原。
 #
 #   ./scripts/env-snapshot.sh backup            # 打一份新快照
 #   ./scripts/env-snapshot.sh list              # 列出所有快照

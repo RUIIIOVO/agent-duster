@@ -1,6 +1,21 @@
 # =============================================================================
 # GitHub Copilot CLI 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
-# 无 mcp 节:本机 ~/.copilot/config.json 无 mcpServers 键,MCP 配置位置未证实。
+#
+# 无 mcp 节 —— 本机实测 2026-08-11:~/.copilot 下**没有任何 MCP 注册表**,
+#           config.json 里也没有。不是位置未证实,是翻遍了没有。
+#
+# ~/.copilot/config.json 的两件事,记下来省得下一个人再踩:
+#   1. 它是 **JSONC**:文件以 `//` 注释开头,严格 JSON 解析直接失败
+#      (实测 serde_json 拒绝)。读方向必须走 codec 的 JSONC 分支。
+#   2. 它**自述**「User settings belong in settings.json」——也就是用户设置
+#      本该在同目录的 settings.json 里,而本机**没有这个文件**。
+#      没见过的文件不建资源:声明一个从未观察到的路径,等于把猜测写进清单,
+#      将来格式对不上还得回来拆。等哪天真出现了再补一条 memory 资源。
+#
+# ide/*.lock 是运行时锁文件,进程活着时才有,不是可清理产物,不声明。
+#
+# 无 binary / version_cmd:`copilot` 本机不在 PATH 上,写了永远不会命中,
+#           属于无害但误导的声明——探测只靠 ~/.copilot 目录存在性。
 # =============================================================================
 
 [agent]
@@ -10,14 +25,26 @@ display_name = "GitHub Copilot CLI"
 [probe]
 # ~/.copilot 数据目录存在即视为已安装。
 any_of = ["~/.copilot"]
-binary = "copilot"
-# M0 只存不执行。
-version_cmd = ["copilot", "--version"]
 
 # ── Artifact:日志目录 ───────────────────────────────────────────────────
+# 本机当前为空(已被 clean 回收过),但目录声明保留:下次跑起来又会长出来。
 [[resource]]
 kind = "artifact"
 scope = "global"
 path = "~/.copilot/logs"
 mapper = "stats-only"
 clean_level = "l1"   # 日志,自动重建
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 一棵独占树,与 M1 `uninstall --data-only` 取的根一致。整棵删,包括
+# ide/ 下的运行时锁文件与清单没声明的其余子目录。
+#
+# 无 shared 节:本机 2026-08-11 确认 ~/.copilot 下没有 MCP 注册表,别的
+# agent 的文件里也没有 Copilot CLI 的配置键。
+#
+# 无 package 节 —— `command -v copilot` 找不到,`npm ls -g --depth 0` 里没有
+# @github/copilot(那台机器的全局 npm 只有 corepack 与 npm),mise 管的工具里
+# 没有,`gh extension list` 为空,brew 列表里也没有。~/.copilot 是残留数据。
+# 没有可归因的包管理器 ⇒ 整条不写。
+[uninstall]
+owns = ["~/.copilot"]

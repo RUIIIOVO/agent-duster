@@ -28,6 +28,7 @@ scope = "global"
 path = "~/.codex/skills"
 glob = "*/SKILL.md"
 mapper = "skill/frontmatter-md"
+install_paths = ["node_modules", "dist", "bin", ".git"]
 
 # ── Memory:全局记忆 ~/.codex/AGENTS.md ──────────────────────────────────
 [[resource]]
@@ -79,3 +80,31 @@ kind = "install"
 scope = "global"
 path = "~/.codex/plugins"
 mapper = "stats-only"
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 一棵独占树。owns 与 M1 `uninstall --data-only` 取的根一致(probe.any_of 里
+# 实际存在的那条),显式写出来把删除范围钉住。
+# 注意 ~/.codex 里有清单没声明的子目录(computer-use/、ambient-suggestions/、
+# .tmp/ 等),卸载要整棵删——uninstall 的所有权模型与 clean/prune 相反。
+#
+# 无 shared 节:本机 2026-08-11 逐个文件确认,没有别的 agent 的文件里存着
+# Codex 的配置键。~/.claude.json 的 /mcpServers 与 ~/.gemini/settings.json 的
+# mcpServers 里只有一个 stitch(Google Stitch,不是本清单里的 agent),
+# ~/.config/opencode/opencode.jsonc 只有 $schema。
+# 一个 schema 表达不了的残留:~/.cc-switch/cc-switch.db 的 providers 表
+# (app_type = 'codex')存着 Codex 的供应商档案与密钥,SQLite 行级手术不在
+# 本 schema 能力内。反方向(cc-switch 写进 ~/.codex/config.toml 的
+# model_catalog_json)记在 adapters/cc-switch.toml 里,那是**它的**键。
+[uninstall]
+owns = ["~/.codex"]
+
+# 本机 2026-08-11 实测:`mise which codex` →
+#   ~/.local/share/mise/installs/npm-openai-codex/latest/node_modules/.bin/codex
+# 即 mise 的 npm 后端装的 npm:@openai/codex(0.147.0),声明在
+# ~/.config/mise/config.toml。manager 写 npm 是因为包来自 npm 注册表,
+# 但**卸载命令必须走 mise**:本机 `npm ls -g --depth 0` 里没有这个包,
+# `npm uninstall -g @openai/codex` 会直接失败。
+[[uninstall.package]]
+manager = "npm"
+detect = ["mise", "which", "codex"]
+command = ["mise", "unuse", "--global", "npm:@openai/codex"]

@@ -1,10 +1,11 @@
 # =============================================================================
 # Qoder 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
-# 无 mcp 节:本机 ~/.qoder/settings.json 无 mcpServers 键,MCP 配置位置未证实。
-# 刻意不声明 ~/.qoder/canvas:看板/画布是用户手写内容,既非产物也非本体,
-#           格式未证实,按「不理解的东西不动」放弃认领。
-#           注意:probe 已认领 ~/.qoder,未声明的子目录既不入索引、也不进
-#           unclassified 表——现在谁都不统计。修在 collect_unclassified。
+#
+# 无 mcp 节:本机实测 2026-08-11 未发现任何 MCP 注册表(settings.json 无
+#           mcpServers 键,别处也没有)。~/.qoder/argv.json 是 **JSONC**
+#           (以 // 注释开头),但它是 Electron 启动参数,不是 MCP 配置。
+# 无 binary / version_cmd:`qoder` 本机不在 PATH 上,写了永远不会命中,
+#           属于无害但误导的声明——探测只靠 ~/.qoder 目录存在性。
 # =============================================================================
 
 [agent]
@@ -15,7 +16,16 @@ display_name = "Qoder"
 # ~/.qoder 数据目录存在即视为已安装。
 any_of = ["~/.qoder"]
 
-# ── Memory:记忆库(按 workspace 哈希分目录,内部格式未证实,只统计)──────
+# ── Memory:记忆库,仍然只统计 ────────────────────────────────────────────
+# 本机实测 2026-08-11:叶子文件确实是 Markdown + YAML frontmatter
+# (title / usage_scenario / keywords),内容形态完全够 memory/markdown 解析。
+# **但今天升不了 mapper**,原因在扫描器不在这里:
+#   - scan_memory 是**单文件**资源处理器,开头 `if !file.is_file() { return }`,
+#     喂给它一个目录会**静默记零行**——比 stats-only 还糟,连体积都没了。
+#   - 它也不看 glob 字段,所以 glob = "*/*/*/*.md" 之类写了也不生效。
+# 真实层级是 memories/<user-hash>/{global,projects/<路径编码>}/<category>/*.md,
+# 四级目录 + 通配段,要么 scan_memory 支持目录 + glob 递归,要么等项目级
+# 资源落地。在那之前 stats-only 至少体积不失真。
 [[resource]]
 kind = "memory"
 scope = "global"
@@ -44,6 +54,25 @@ scope = "global"
 path = "~/.qoder/plugins"
 mapper = "stats-only"
 
+# ── Install:Canvas SDK 与配方模板 ───────────────────────────────────────
+# 这一棵原先谁都不统计(probe 认领了 ~/.qoder,未声明子目录连 unclassified
+# 都进不去),必须收编。
+#
+# 归类要点:附录 A 记的是「用户手写看板」,**实测不是**。本机 2026-08-11
+# 打开看:148 KB,内容是 sdk/*.d.ts(TypeScript 类型声明)、
+# recipes/*.recipe.md(给 agent 读的布局配方)、kanban/index.canvas.tsx
+# (`import ... from "qoder/canvas"` 的内置组件)。三者时间戳同一秒,是随
+# Qoder 一起铺下来的**软件自带资产**,不是用户产物。
+# 按本项目唯一判据「删了要不要重新安装」:删了 canvas 功能就缺 SDK 与配方,
+# 得重装/升级 Qoder 才回来 ⇒ install。归 artifact 等于给 clean 发许可证
+# 去删人家的运行时资产;归 memory 则是谎称它是用户内容。
+# 若将来发现用户创建的画布落在别处(或本目录下多出用户文件),再拆资源。
+[[resource]]
+kind = "install"
+scope = "global"
+path = "~/.qoder/canvas"
+mapper = "stats-only"
+
 # ── Artifact:可清理产物 ─────────────────────────────────────────────────
 [[resource]]
 kind = "artifact"
@@ -58,3 +87,17 @@ scope = "global"
 path = "~/.qoder/logs"
 mapper = "stats-only"
 clean_level = "l1"   # 日志,自动重建
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 一棵独占树,与 M1 `uninstall --data-only` 取的根一致。整棵删,包括
+# canvas/(软件自带资产)与 memories/ 下四级目录。
+#
+# 无 shared 节:本机 2026-08-11 确认没有别的 agent 的文件里存着 Qoder 的
+# 配置键;~/.qoder/settings.json 的 enabledPlugins 是它自己的。
+#
+# 无 package 节 —— 本机没有装 Qoder 应用:mdfind -name Qoder.app 零命中,
+# /Applications 与 ~/Applications 都没有,`command -v qoder` 找不到,
+# brew 列表里也没有。~/.qoder(含 1.1 GB extensions/)是卸载后留下的数据目录,
+# 也正因如此它是本机最值得卸干净的一棵。没有可归因的包管理器 ⇒ 整条不写。
+[uninstall]
+owns = ["~/.qoder"]

@@ -21,13 +21,26 @@ scope = "global"
 path = "~/.omp/agent/managed-skills"
 glob = "*/SKILL.md"
 mapper = "skill/frontmatter-md"
+install_paths = ["node_modules", "dist", "bin", ".git"]
 
-# ── Session:只做体积/数量统计(history.db 的解析留 M2)───────────────────
+# ── Session:会话正文(sessions/<路径编码>/<时间戳>_<uuid>.jsonl)────────────
+# 每条 jsonl 是一个完整对话(用户轮次 / 助手回复 / 工具结果,正文进全文检索)。
+# 本机 2026-08-11 实测:251 个文件 / 192 MB。历史型:session 不进 clean。
 [[resource]]
 kind = "session"
 scope = "global"
 path = "~/.omp/agent/sessions"
-mapper = "stats-only"
+mapper = "native/omp-jsonl-session"
+
+# ── Session:prompt 历史(history.db,SQLite,只存用户输入)───────────────────
+# 与上面的 jsonl 互补不重复:正文在 jsonl,库只记 prompt(567 行 / 97 个会话)。
+# 即使会话被 prune 压缩或删除,prompt 历史仍可检索;两处都是 session 资源,
+# 体积各记各的(路径不嵌套,不触发清单重叠校验),clean 永不触碰。
+[[resource]]
+kind = "session"
+scope = "global"
+path = "~/.omp/agent/history.db"
+mapper = "native/omp-session"
 
 # ── Artifact:运行时目录 ─────────────────────────────────────────────────
 # socket / token / pid 确实随删随生,但本机实测该目录 105 MB 里有 100 MB 是
@@ -50,3 +63,27 @@ kind = "install"
 scope = "global"
 path = "~/.omp/puppeteer"
 mapper = "stats-only"
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 一棵独占树,与 M1 `uninstall --data-only` 取的根一致。~/.omp 下有清单没声明的
+# 子目录(agent/ 里除 managed-skills 与 sessions 之外的部分),卸载整棵删。
+# 无 shared 节:本机 2026-08-11 确认没有别的 agent 的文件里存着 omp 的配置键。
+#
+# 一处 schema 表达不了的痕迹,记下来不猜:~/.zshrc 有
+#   export PATH="$HOME/.config/herdr/shims:$PATH"
+# 而 ~/.config/herdr/shims 里唯一的文件就是一个 omp 包装(把 argv[0] 还原成
+# omp 好让 herdr 认出来)。写这行的是 herdr,不是 omp,而 herdr 不在本清单
+# 覆盖的十一个 agent 里 —— 所以既不进 owns,也不进 shared。
+[uninstall]
+owns = ["~/.omp"]
+
+# 本机 2026-08-11 实测:`mise which omp` →
+#   ~/.local/share/mise/installs/npm-oh-my-pi-pi-coding-agent/latest/node_modules/.bin/omp
+# 即 mise 的 npm 后端装的 npm:@oh-my-pi/pi-coding-agent(17.2.12)。
+# 注意别与 adapters/pi.toml 的 npm:@earendil-works/pi-coding-agent 弄混:
+# 两个包的名字都叫 pi-coding-agent,只有 scope 不同,装出来的二进制一个是
+# omp、一个是 pi。写错 scope 会卸掉另一个 agent。
+[[uninstall.package]]
+manager = "npm"
+detect = ["mise", "which", "omp"]
+command = ["mise", "unuse", "--global", "npm:@oh-my-pi/pi-coding-agent"]

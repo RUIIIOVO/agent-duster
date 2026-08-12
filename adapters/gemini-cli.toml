@@ -15,13 +15,15 @@ binary = "gemini"
 # M0 只存不执行。
 version_cmd = ["gemini", "--version"]
 
-# ── MCP:settings.json 的 /mcpServers(标准 JSON 形态)────────────────────
+# ── MCP:settings.json 的 /mcpServers ────────────────────────────────────
+# 形状像 standard-json,规矩不是。Gemini 自己那套(httpUrl 压 url、type 只认
+# stdio/sse/http、认不出的值不报错)见 mapper::mcp::from_gemini_json。
 [[resource]]
 kind = "mcp"
 scope = "global"
 path = "~/.gemini/settings.json"
 json_pointer = "/mcpServers"
-mapper = "mcp/standard-json"
+mapper = "mcp/gemini-json"
 
 # ── Memory:全局记忆 ~/.gemini/GEMINI.md ─────────────────────────────────
 [[resource]]
@@ -53,3 +55,23 @@ scope = "global"
 path = "~/.gemini/history"
 mapper = "stats-only"
 clean_level = "l1"
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 一棵独占树,与 M1 `uninstall --data-only` 取的根一致。
+# 无 shared 节:本机 2026-08-11 确认没有别的 agent 的文件里存着 Gemini CLI 的
+# 配置键(~/.claude.json 与 ~/.codex/config.toml 的 MCP 表里只有 stitch)。
+# 反过来,~/.gemini/settings.json 里的 mcpServers.stitch 是**它自己**的注册表,
+# 随 ~/.gemini 一起走,不是共享文件。
+# schema 表达不了的残留:~/.cc-switch/cc-switch.db 的 providers 表
+# (app_type = 'gemini')存着 Gemini 的供应商档案。
+[uninstall]
+owns = ["~/.gemini"]
+
+# 本机 2026-08-11 实测:`mise which gemini` →
+#   ~/.local/share/mise/installs/npm-google-gemini-cli/latest/node_modules/.bin/gemini
+# 即 mise 的 npm 后端装的 npm:@google/gemini-cli(0.54.4)。manager 写 npm
+# (包来自 npm 注册表),但卸载必须走 mise:本机 `npm ls -g --depth 0` 里没有它。
+[[uninstall.package]]
+manager = "npm"
+detect = ["mise", "which", "gemini"]
+command = ["mise", "unuse", "--global", "npm:@google/gemini-cli"]

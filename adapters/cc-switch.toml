@@ -29,13 +29,21 @@ mapper = "stats-only"
 
 # ── Artifact:数据库滚动备份 ─────────────────────────────────────────────
 # 本机实测 10 份日备份 × 约 7.6 MB,而主库本身才 7.3 MB。旧备份过期即无用,
-# 但「留几天」是用户决定 ⇒ l2,按 --older-than 天数清并二次确认。
+# 但「留几天」是用户决定 ⇒ l2:归 `duster prune --older-than` 管,clean 不碰;
+# 逐条列出确认后归档再删,且备份类保留最新一份兜底。
+#
+# 10 份备份按代际滚动:glob 让每份备份占一行索引(自己的体积/mtime),
+# `keep_generations = 2` 声明「保留最新 2 份」——第 3 份起按数量冗余,
+# 与年龄无关,由 `duster prune --keep-generations` 独立清理;
+# 不带旗标时 prune 只报不动,收尾报告会点名这个旗标。
 [[resource]]
 kind = "artifact"
 scope = "global"
 path = "~/.cc-switch/backups"
+glob = "*.db"
 mapper = "stats-only"
 clean_level = "l2"
+keep_generations = 2
 
 [[resource]]
 kind = "artifact"
@@ -43,3 +51,45 @@ scope = "global"
 path = "~/.cc-switch/logs"
 mapper = "stats-only"
 clean_level = "l1"   # 日志,自动重建
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 十一份清单里唯一有 shared 节的一份:CC Switch 是**给别的 agent 切供应商**
+# 的工具,所以它的配置天然会落在别人的文件里。
+#
+# 本机 2026-08-11 实测到的那一处:~/.codex/config.toml 第 3 行
+#   model_catalog_json = "cc-switch-model-catalog.json"
+# 这个键是 Codex 的,但值指向 CC Switch 生成的 ~/.codex/cc-switch-model-catalog.json
+# (2690 B,mtime 与 auth.json 同一秒)。CC Switch 卸载后这个指针必须摘掉,
+# 否则 Codex 一直被指向一份没人再维护的目录。文件本身留在 ~/.codex 里——
+# 那是 Codex 的树,不是我们的,本 schema 只做键手术,不删别人的文件。
+#
+# 查过但**没有**发现 cc-switch 痕迹的地方(免得下一个人再翻一遍):
+# ~/.claude.json、~/.claude/settings.json(grep cc-switch / ccswitch 零命中)、
+# ~/.claude/plugins/{installed_plugins,known_marketplaces}.json、
+# ~/.gemini/settings.json。settings.json 里 currentProvider* 全是 *-official,
+# 也就是当前没有往任何 agent 里写第三方供应商覆盖。
+#
+# 两处 schema 表达不了的残留,记在这儿不猜:
+#   1. ~/.claude/skills 下有 8 个符号链接指进 ~/.cc-switch/skills
+#      (docx / frontend-design / mcp-builder / pdf / skill-creator /
+#       theme-factory / webapp-testing / xlsx)。删掉 ~/.cc-switch 会留下 8 条
+#      悬空链接。这已经被 uninstall 的 preflight 覆盖(它把 ~/.cc-switch 列进
+#      跨引用搜索根),不需要清单声明。
+#   2. cc-switch.db 自己就是 claude/codex/gemini/opencode 四家配置的宿主
+#      (providers.app_type、mcp_servers.enabled_*、skills.enabled_*)。它在
+#      owns 之内,随卸载一起走,方向上没问题。
+[uninstall]
+owns = ["~/.cc-switch"]
+
+[[uninstall.shared]]
+path = "~/.codex/config.toml"
+toml_key = "model_catalog_json"
+reason = "Codex model catalog pointer written by CC Switch; without CC Switch it points at an unmaintained file"
+
+# 本机 2026-08-11 实测:`brew list --cask --versions cc-switch` → `cc-switch 3.14.1`,
+# /Applications/CC Switch.app 在位。cask 探测靠退出码(在装 → 0,未装 → 1),
+# 所以 detect 直接用 `brew list --cask`。
+[[uninstall.package]]
+manager = "brew"
+detect = ["brew", "list", "--cask", "cc-switch"]
+command = ["brew", "uninstall", "--cask", "cc-switch"]

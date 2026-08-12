@@ -1,8 +1,15 @@
 # =============================================================================
 # Kimi CLI 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
-# 无 mcp 节:本机 ~/.kimi/config.toml 只有 [mcp.client] 超时配置,
-#           未见 mcp_servers 表,格式未证实。
+#
+# 无 mcp 节 —— 本机实测 2026-08-11 逐键确认:~/.kimi/config.toml 里只有
+#           [mcp.client] 一张表,内容全是超时项(客户端参数),**没有任何
+#           server 表**。不是「位置未证实」,是真的没有 MCP 注册表。
+#           这条已经查实,别再花时间重测;等 Kimi 真加了注册表再改。
 # 刻意不声明 ~/.kimi/credentials:凭据目录,连统计都不碰。
+#           同理 kimi.json({work_dirs})与 device_id 是几百字节的小配置,
+#           不值得各占一条资源。
+# 无 binary / version_cmd:`kimi` 本机不在 PATH 上,写了永远不会命中,
+#           属于无害但误导的声明——探测只靠 ~/.kimi 目录存在性。
 # =============================================================================
 
 [agent]
@@ -12,11 +19,11 @@ display_name = "Kimi CLI"
 [probe]
 # ~/.kimi 数据目录存在即视为已安装。
 any_of = ["~/.kimi"]
-binary = "kimi"
-# M0 只存不执行。
-version_cmd = ["kimi", "--version"]
 
-# ── Session:<workdir-hash>/<uuid>/context.jsonl,非 Codex 格式,只统计 ───
+# ── Session:<workdir-hash>/<uuid>/context.jsonl ─────────────────────────
+# 实测确实是真 JSONL(每行一条记录),形态上完全能上原生解析器——将来加
+# native/kimi-session 的落点就是这里。但轮次记录的 type 白名单尚未采样,
+# 现在解析等于猜字段,先 stats-only 把体积统对。
 [[resource]]
 kind = "session"
 scope = "global"
@@ -30,3 +37,19 @@ scope = "global"
 path = "~/.kimi/logs"
 mapper = "stats-only"
 clean_level = "l1"   # 日志,自动重建
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 一棵独占树,与 M1 `uninstall --data-only` 取的根一致。credentials/ 与
+# device_id 虽然清单刻意不声明为资源(凭据不碰),但卸载要整棵删——不声明
+# 是「不统计、不解析」,不是「不删」。
+#
+# 无 shared 节:~/.kimi/config.toml 里只有 [mcp.client] 客户端参数,它自己
+# 都没有 MCP 注册表,别的 agent 的文件里自然也没有它的键(本机 2026-08-11 确认)。
+#
+# 无 package 节 —— `command -v kimi` 找不到,PATH 各目录里没有 kimi,
+# mise 管的工具里没有,`uv tool list` 只有 trafilatura,pipx 本机未安装,
+# brew 与 cargo 列表里也没有。~/.kimi 最后一次改动是 2026-04-23,是残留数据。
+# 没有可归因的包管理器 ⇒ 整条不写(Kimi CLI 通常是 `uv tool install`,但本机
+# 没有证据,猜一条 pipx/uv 命令等于让用户去卸一个不存在的东西)。
+[uninstall]
+owns = ["~/.kimi"]

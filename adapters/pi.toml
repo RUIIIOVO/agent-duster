@@ -37,3 +37,20 @@ kind = "install"
 scope = "global"
 path = "~/.pi/agent/bin"
 mapper = "stats-only"
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 一棵独占树,与 M1 `uninstall --data-only` 取的根一致。刻意不把
+# ~/.pi/agent/auth.json 排除在外:卸载就是要把凭据一起带走(归档由
+# --export 负责,不由 owns 负责)。
+# 无 shared 节:本机 2026-08-11 确认没有别的 agent 的文件里存着 Pi 的配置键。
+[uninstall]
+owns = ["~/.pi"]
+
+# 本机 2026-08-11 实测:`mise which pi` →
+#   ~/.local/share/mise/installs/npm-earendil-works-pi-coding-agent/latest/node_modules/.bin/pi
+# 即 mise 的 npm 后端装的 npm:@earendil-works/pi-coding-agent(0.84.1)。
+# scope 不能错:@oh-my-pi/pi-coding-agent 是 omp,不是 pi。
+[[uninstall.package]]
+manager = "npm"
+detect = ["mise", "which", "pi"]
+command = ["mise", "unuse", "--global", "npm:@earendil-works/pi-coding-agent"]

@@ -1,11 +1,18 @@
 # =============================================================================
 # OpenCode 适配器清单。字段词汇表见 adapters/claude-code.toml 文件头注释。
-# ~/.opencode 只是 npm 安装壳(bin/ + node_modules/),配置与数据在别处
-# (XDG 目录),M0 只认领安装产物。package.json/package-lock.json 不是资源。
 #
-# 全目录都是 install:这个 agent 在 home 下**没有任何可清理产物**。
-# node_modules 曾被标 artifact/l1「npm install 即可重建」——重建要联网、
-# 要装对版本,失败就等于 OpenCode 没了,这是卸载不是清理。
+# 2026-08-11 本机实测后**整份重写**:旧清单只认领 ~/.opencode,而那里只有
+# npm 安装壳(bin/ + node_modules/),于是 OpenCode 在 duster 眼里长期是
+# 「一个 194 MB 的空壳」——配置、会话、日志全部不可见。真实布局是 XDG 三处:
+#   ~/.opencode/              npm 安装壳(bin + node_modules)
+#   ~/.config/opencode/       配置 opencode.jsonc + 又一棵 node_modules
+#   ~/.local/share/opencode/  数据 opencode.db + log/ + snapshot/ + repos/
+# 三处都要声明,少一处就漏一块。
+#
+# 凭据在库里,不在文件里:opencode.db 的 account / credential /
+# control_account 表有 access_token / refresh_token 列(附录 B 已记)。
+# 纯文本扫描对它失明,doctor --secrets 要能只读开库取列——不是本清单的事,
+# 但删除/归档 opencode.db 前必须记得它是凭据载体。
 # =============================================================================
 
 [agent]
@@ -13,22 +20,115 @@ id = "opencode"
 display_name = "OpenCode"
 
 [probe]
-# ~/.opencode 安装目录存在即视为已安装。
-any_of = ["~/.opencode"]
+# 三处任一存在即视为已安装:只装了 npm 壳、或只跑过一次留下 XDG 数据,
+# 都应该被认出来。
+any_of = ["~/.opencode", "~/.config/opencode", "~/.local/share/opencode"]
 binary = "opencode"
-# M0 只存不执行。
+# 五家 Tier2/3 里唯一在 PATH 上的(本机 1.18.13),所以这两个字段留着有用。
 version_cmd = ["opencode", "--version"]
 
-# ── Install:npm 依赖树 ──────────────────────────────────────────────────
+# ── MCP:opencode.jsonc 的 .mcp,第三种方言 ──────────────────────────────
+# 扩展名就是 JSONC(本机这份恰好没注释,但读方向必须按 JSONC 走)。
+# 方言:{"<name>": {type: "local"|"remote", command: [argv...], url,
+#                  enabled, environment}},既不是 mcpServers 也不是 TOML 表。
+[[resource]]
+kind = "mcp"
+scope = "global"
+path = "~/.config/opencode/opencode.jsonc"
+json_pointer = "/mcp"
+mapper = "mcp/opencode-json"
+
+# ── Session:SQLite 会话库 ───────────────────────────────────────────────
+# 本机实测 27 session / 65 message / 178 part,表名 session·message·part。
+# **现在只统计**:活跃 WAL 的安全只读打开策略与原生适配器在 M2 后段才落地,
+# 在那之前谎报「已解析」比不解析更糟。native/opencode-session 到位后改这里。
+# 注意只声明库文件本身:父目录 ~/.local/share/opencode 同时声明会与下面三条
+# artifact 重叠,校验层直接拒绝加载。
+# opencode.db-wal / -shm 刻意不单独声明(本机 0 B + 32 KB):它们是这个库的
+# 活体旁路文件,不是独立资源。清理词汇表里的 l0「孤儿 WAL/SHM」说的是进程
+# 已退出后的残留,给活着的 WAL 挂 clean_level 会直接引向数据损坏。
+[[resource]]
+kind = "session"
+scope = "global"
+path = "~/.local/share/opencode/opencode.db"
+mapper = "stats-only"
+
+# ── Artifact:可清理产物 ─────────────────────────────────────────────────
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.local/share/opencode/log"
+mapper = "stats-only"
+clean_level = "l1"   # 运行日志,自动重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.local/share/opencode/snapshot"
+mapper = "stats-only"
+clean_level = "l1"   # 工作区快照,下次编辑重建
+
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.local/share/opencode/repos"
+mapper = "stats-only"
+clean_level = "l1"   # 检出的工作副本,可重新 clone
+
+# ── Install:软件本体,四处 ───────────────────────────────────────────────
+# node_modules 曾被标 artifact/l1「npm install 即可重建」——重建要联网、
+# 要装对版本,失败就等于 OpenCode 没了,这是卸载不是清理。
+# 同目录的 package.json / package-lock.json 是这棵依赖树的清单,不是资源。
+[[resource]]
+kind = "install"
+scope = "global"
+path = "~/.opencode/bin"
+mapper = "stats-only"
+
 [[resource]]
 kind = "install"
 scope = "global"
 path = "~/.opencode/node_modules"
 mapper = "stats-only"
 
-# ── Install:入口二进制 ──────────────────────────────────────────────────
+# 配置目录下还有第二棵依赖树(插件/扩展装在这儿)。
 [[resource]]
 kind = "install"
 scope = "global"
-path = "~/.opencode/bin"
+path = "~/.config/opencode/node_modules"
 mapper = "stats-only"
+
+# 用户装的插件本体(本机 herdr-agent-state.js)。体积小但必须认领:
+# probe 已经认领 ~/.config/opencode,不声明它就既不入索引也不进 unclassified,
+# 谁都不统计。删了插件功能就没了,要重新装 ⇒ install,不是 artifact。
+[[resource]]
+kind = "install"
+scope = "global"
+path = "~/.config/opencode/plugins"
+mapper = "stats-only"
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# 三棵独占树,与上面 probe.any_of 一致,也与 M1 `uninstall --data-only` 取的根
+# 一致(它按 probe 里实际存在的路径取根)。少写一条就漏一块,这正是本清单
+# 2026-08-11 整份重写要解决的问题。
+# ~/.config/opencode 与 ~/.local/share/opencode 都是 opencode 独占的 XDG 目录,
+# 不与别的 agent 共用,所以是 owns 而不是 shared;opencode.jsonc 的 .mcp 是
+# **它自己**的注册表。
+#
+# 无 shared 节:本机 2026-08-11 确认没有别的 agent 的文件里存着 OpenCode 的
+# 配置键。schema 表达不了的残留:~/.cc-switch/cc-switch.db 的
+# mcp_servers.enabled_opencode / skills.enabled_opencode 列。
+#
+# 无 package 节 —— 这不是漏,是本 schema 表达不了的一条,别当缺失去补:
+# 本机 2026-08-11 实测 `command -v opencode` → ~/.opencode/bin/opencode,
+# `readlink -f` 指向它自己,是一个 139 MB 的独立二进制(1.18.13),既不在
+# `npm ls -g --depth 0`、`brew list`、`cargo install --list` 里,也不在 mise
+# 管的工具里 ⇒ 官方 curl 安装脚本装的。它没有卸载子命令:卸载 = 删
+# ~/.opencode(已由 owns 覆盖)+ 删掉 ~/.zshrc 第 36 行
+#   export PATH=/Users/laibu/.opencode/bin:$PATH
+# (上面第 35 行是安装脚本留的 `# opencode` 注释)。shell rc 的 PATH 行既不是
+# JSON pointer 也不是 TOML 点路径,[[uninstall.shared]] 表达不了;而
+# command 又不许为空,所以整条 [[uninstall.package]] 不写,比塞一条
+# `rm -rf` 或猜一条 `npm uninstall -g` 都诚实。
+[uninstall]
+owns = ["~/.opencode", "~/.config/opencode", "~/.local/share/opencode"]

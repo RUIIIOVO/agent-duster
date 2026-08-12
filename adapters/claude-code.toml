@@ -8,6 +8,7 @@
 #   [agent]        agent 身份:id(稳定标识,小写字母/数字/连字符)+ display_name
 #   [probe]        安装探测:路径存在性 + 可选二进制名 + 可选版本命令
 #   [[resource]]   资源声明,每类资源一节,可重复
+#   [uninstall]    卸载声明:独占路径 + 共享文件改键 + 包管理器线索(整节可选)
 #
 # ── [probe] 词汇表 ───────────────────────────────────────────────────────
 #   any_of      = ["~/x", ...]   任一路径存在即视为已安装
@@ -27,8 +28,22 @@
 #   toml_key     = "mcp_servers"        可选:TOML 文件内定位(点路径),
 #                                       与 json_pointer 互斥
 #   mapper       = 见下方封闭词汇表     格式树 <-> UARM 的映射器
-#   glob         = "*/SKILL.md"         可选:目录型资源的条目匹配模式
+#   glob         = "*/SKILL.md"         可选:目录型资源的条目匹配模式。
+#                                       对 stats-only 资源,每份命中条目
+#                                       一行索引(自己的体积/mtime)——代际
+#                                       资源(备份)靠它才能被 prune 逐份看见。
 #   clean_level  = l0 | l1 | l2         **artifact 必填,其余 kind 禁写**
+#   keep_generations = 2                可选,**仅 l2 artifact 可写**:
+#                                       这份资源是「按代际滚动」的(数据库滚动
+#                                       备份等),每份代际一行索引(要求同时声明
+#                                       glob,且 glob 不含 `/`),这里写保留
+#                                       最新几份。超编代际**按数量冗余、与年龄
+#                                       无关**,由 `prune --keep-generations`
+#                                       独立清理;不带旗标时 prune 只报不动。
+#   install_paths = ["node_modules", ...]
+#                                       可选,**仅 skill 可写**:资源目录内部
+#                                       属于「软件本体」的裸目录名(不是路径,
+#                                       不含 `/` 与 `~`),按名匹配任意层级。
 #
 # ── artifact vs install:清理安全的分界线 ─────────────────────────────────
 #   判据只有一条:**删了要不要重新安装**。跟占多大无关。
@@ -41,20 +56,30 @@
 #   1 GB 的扩展目录是 install;800 MB 的日志库是 artifact。把 install 写成
 #   artifact,等于给"卸载用户软件"发了许可证——校验层会直接拒绝加载。
 #
+#   这条分界线在资源**内部**同样成立:一个 skill 目录里既有用户写的内容,
+#   也有 `npm i` / 编译出来的东西。skill 资源用 `install_paths` 声明后者
+#   (本机实测:~/.claude/skills 的 1.1 GB 里只有 36.6 MB 是用户内容),
+#   命中的子树按 install 计——不进 skill 体积、不进归档包、不进副本检测的树哈希。
+#   注意它与「重叠路径禁止」不冲突:没有新增 resource 声明,只是给同一条
+#   资源的字节数分了两个桶,总量仍然只算一次。
+#
 # ── clean_level 封闭词汇表(只有三档,artifact 专用)────────────────────
-#   ⚠️ `duster clean` 尚未实现(M1)。下面每档的「clean 默认…」写的是
+#   级别同时决定**由哪个命令处理**:`duster clean` 吃 l0 + l1,`duster prune` 吃 l2。
+#   不是同一命令的三个档位——同意模型不同:clean 无需逐项同意,prune 必须逐项过目。
+#
+#   ⚠️ `clean` / `prune` 尚未实现(M1)。下面每档的「由…处理」写的是
 #      **约定的目标行为**,不是今天已生效的行为。今天生效的只有分类本身:
 #      级别决定 scan/status 摘要行里这一项算进哪一档可回收量。
 #
 #   l0  无损回收:SQLite 空闲页(VACUUM)、孤儿 WAL/SHM、`.tmp-*` 崩溃残留。
 #                数据一条不少。计入可回收量的**只有空洞**(实测 freelist ×
 #                page_size),不是整个文件——文件里的活数据不算收益。
-#                clean 默认执行。
+#                由 clean 处理,默认执行。
 #   l1  可再生  :缓存、日志、临时目录、运行时残留。删完自动重建,不影响使用。
-#                整项计入可回收量。clean 默认执行。
+#                整项计入可回收量。由 clean 处理,默认执行。
 #   l2  有时效  :滚动备份、归档。功能不缺,但重建有人工代价(如重新登录、
-#                重新下载)。整项计入可回收量。
-#                按 --older-than 天数阈值清,且必须二次确认。clean 默认**不**执行。
+#                重新下载)。整项计入可回收量。**由 prune 处理,clean 看不见它**:
+#                必须显式 `--older-than`,逐条列出后确认,不可再生的先归档再永久删除。
 #
 #   没有更高档:"删了等于卸载"的东西不是 artifact,是 install。
 #
@@ -82,6 +107,40 @@
 #   native/codex-session   Codex JSONL 会话(原生适配器逃生舱)
 #   stats-only             不解析内容,只做体积/数量统计
 #                          (artifact / install 只能用这个)
+#
+# ── [uninstall] 词汇表:卸载要动的三种所有权 ──────────────────────────────
+#   整节可选。三个字段不是三个档位,是三种**所有权**,少一类就卸不干净:
+#
+#   owns = ["~/.claude", ...]    这个 agent 独占的树。整棵删掉才算卸载,
+#                                包括清单没声明的子目录——uninstall 的所有权
+#                                模型与 clean/prune 相反。留空则由
+#                                [probe] + [[resource]] 推导(取最外层根)。
+#
+#   [[uninstall.shared]]         写在**别人文件里**的那一个键。可重复。
+#     path         = "~/.claude.json"        共享文件,`~` 开头、不展开。
+#                                            **不得落在任一 owns 之内**——
+#                                            一个文件要么是我们的(删),要么
+#                                            是别人的(改键),不可能两者都是。
+#     json_pointer = "/mcpServers/foo"       RFC 6901,与 toml_key 互斥
+#     toml_key     = "mcp_servers.foo"       点路径,与 json_pointer 互斥
+#                                            二者**必须且只能**写一个:没有键的
+#                                            共享改写等于重写别人的文件。
+#     reason       = "MCP entry pointing at this agent"
+#                                            动刀前给用户看的一句话,**英文**。
+#
+#   [[uninstall.package]]        软件本体是怎么装上来的。可重复(多条安装
+#                                路线各写一条,靠 detect 挑出本机适用的那条)。
+#     manager = npm | brew | curl | pipx | cargo      封闭词汇表
+#     detect  = ["npm", "ls", "-g", "--depth", "0", "@foo/bar"]
+#                                只读探测命令(argv),duster **可以**执行它。
+#     command = ["npm", "uninstall", "-g", "@foo/bar"]
+#                                卸载命令(argv),duster **只打印、永不代跑**。
+#                                不得为空;没线索就整条不写——空命令的线索
+#                                什么都没线索到。猜一条 `npm uninstall -g`
+#                                比不写危险得多。
+#
+#   为什么 command 不代跑:包管理器的卸载会动 duster 认领范围之外的文件
+#   (PATH 上的 shim、别的项目共用的依赖)。代跑一次,就再也说不清是谁删的。
 # =============================================================================
 
 [agent]
@@ -104,12 +163,16 @@ json_pointer = "/mcpServers"
 mapper = "mcp/standard-json"
 
 # ── Skill:每个技能一个目录,目录下 SKILL.md 是元数据载体 ────────────────
+# 本机实测(2026-08-11):这一棵 1.1 GB 里 721 MB 是 node_modules、301 MB 是
+# dist/bin 编译产物,真·用户内容只有 36.6 MB。install_paths 把它们划归
+# install 桶——统计不混、归档不装、副本检测不哈希。
 [[resource]]
 kind = "skill"
 scope = "global"
 path = "~/.claude/skills"
 glob = "*/SKILL.md"
 mapper = "skill/frontmatter-md"
+install_paths = ["node_modules", "dist", "bin", ".git"]
 
 # ── Memory:全局记忆 ~/.claude/CLAUDE.md ─────────────────────────────────
 # 注意:项目级 CLAUDE.md 属 project scope,由项目扫描发现,暂不入清单。
@@ -164,3 +227,33 @@ scope = "global"
 path = "~/.claude/shell-snapshots"
 mapper = "stats-only"
 clean_level = "l1"   # shell 环境快照,下次启动重建
+
+# ── Uninstall ───────────────────────────────────────────────────────────
+# owns 与 M1 `uninstall --data-only` 实际删的两条根一致(plan_uninstall 取
+# probe 里**存在**的路径当根),这里显式写出来是为了把它钉住:将来若新增一条
+# 落在 ~/.claude 之外的 resource,删除范围不会跟着悄悄变宽。
+# ~/.claude.json 是 Claude Code 自己的全局配置(内含它的 /mcpServers 注册表),
+# 删它就是删 Claude Code 的 MCP 注册表——这正是卸载的语义,不是共享文件。
+#
+# 无 shared 节:本机 2026-08-11 逐个文件确认,没有任何**别的 agent 的文件**
+# 里存着 Claude Code 的配置键。查过的地方:~/.codex/config.toml 的
+# [mcp_servers](只有 stitch)、~/.config/opencode/opencode.jsonc(只有
+# $schema)、~/.gemini/settings.json 的 mcpServers(只有 stitch)、
+# ~/.cc-switch/backups(只有自己的 db_backup_*.db)。
+# 一个 schema 表达不了的残留记在这儿:~/.cc-switch/cc-switch.db 的
+# providers 表(app_type = 'claude')存着 Claude Code 的供应商档案,SQLite
+# 行级手术不在本 schema 的能力内,由 doctor / 人工处理。
+[uninstall]
+owns = ["~/.claude", "~/.claude.json"]
+
+# 本机 2026-08-11 实测:`mise which claude` →
+#   ~/.local/share/mise/installs/npm-anthropic-ai-claude-code/latest/node_modules/.bin/claude
+# 即 mise 的 npm 后端装的 npm:@anthropic-ai/claude-code(2.1.226),声明在
+# ~/.config/mise/config.toml。manager 写 npm 是因为包确实来自 npm 注册表;
+# **卸载命令必须走 mise**——`npm uninstall -g` 在这台机器上找不到这个包
+# (`npm ls -g --depth 0` 里只有 corepack 与 npm),照着 npm 猜等于给用户
+# 一条会失败的命令。`mise unuse` 会连装出来的版本一起 prune(其自述如此)。
+[[uninstall.package]]
+manager = "npm"
+detect = ["mise", "which", "claude"]
+command = ["mise", "unuse", "--global", "npm:@anthropic-ai/claude-code"]
