@@ -99,6 +99,20 @@ pub fn status(index_path: Option<&Path>) -> Result<StatusReport> {
             a.kind_bytes.insert(kind, size.max(0) as u64);
             a.bytes += size.max(0) as u64;
         }
+
+        // 资源目录**内部**的软件本体（skill 里的 node_modules / dist / bin）。
+        // `size` 已经把它扣掉了，这里补回 install 桶——不补的话
+        // 本机 ~/.claude/skills 的 1 GB 编译产物会从所有视图里凭空消失，
+        // 「SIZE 加起来对不上 du」正是这一列存在的原因。
+        let embedded: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(install_bytes), 0) FROM resource WHERE agent_id = ?1",
+            (a.agent_id.as_str(),),
+            |row| row.get(0),
+        )?;
+        if embedded > 0 {
+            *a.kind_bytes.entry("install".to_string()).or_insert(0) += embedded as u64;
+            a.bytes += embedded as u64;
+        }
         total_bytes += a.bytes;
 
         // 汇总 reclaimable 而不是 size:l0 的文件里活数据还在,

@@ -14,3 +14,10 @@ anyhow = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# 仅测试夹具用：M1 验收要造一个「文件很大、活数据很少」的真 SQLite 库，
+# 好让 l0 的 VACUUM 有东西可回收。生产代码里 duster-core 不认识 rusqlite，
+# 一切 SQL 都在 duster-index 后面。
+rusqlite = { workspace = true }
