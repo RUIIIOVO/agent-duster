@@ -14,9 +14,16 @@ duster-core = { workspace = true }
 # 只为共享的封闭词汇表（CleanLevel 的档位与展示标签）。
 # model 是最底层、零 I/O，CLI 直依赖它不构成越层。
 duster-model = { workspace = true }
+# 只为 `path::display_tilde`：路径的 `~` 显示口径全项目共用一份，
+# 外壳再抄一遍就是第二套写法。
+duster-fs = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dialoguer = { workspace = true }
 console = { workspace = true }
+
+[dev-dependencies]
+# 外壳测试用的假 home 与假索引：一律 tempdir，绝不碰真实 $HOME。
+tempfile = { workspace = true }

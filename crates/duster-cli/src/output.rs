@@ -15,7 +15,7 @@
 //! | 1 | [`EXIT_ERROR`] | 一般错误（IO 失败、解析失败等） |
 //! | 2 | [`EXIT_USAGE`] | 用法错误（clap 默认，参数/子命令不合法） |
 //! | 3 | [`EXIT_PARTIAL`] | 部分成功（如 scan 某 agent 失败但整体继续，细节进 warnings） |
-//! | 4 | [`EXIT_CONFIRM_DENIED`] | 需要确认被拒绝 / dry-run 仅预览未执行（留给 clean） |
+//! | 4 | [`EXIT_CONFIRM_DENIED`] | 需要确认被拒绝 / dry-run 仅预览未执行（留给 clean / prune / uninstall） |
 //! | 5 | [`EXIT_LOCKED`] | 锁冲突（agent 正在运行 / 索引被其他进程占用） |
 //!
 //! # `--json` 信封 schema
@@ -33,7 +33,7 @@
 //! ```
 //!
 //! - `ok`：`error == null` 时为 `true`；有 warnings 不影响 `ok`。
-//! - `command`：子命令名（`scan` / `status` / `clean` ...）。
+//! - `command`：子命令名（`scan` / `status` / `clean` / `prune` ...）。
 //! - `data`：命令私有结构，成功时由各命令自定义；出错时为 `null`。
 //! - `warnings`：非致命问题列表，永远是数组（可能为空）。
 //! - `error`：`null` 或 `{"code": "机器可读短码", "message": "人话"}`。
@@ -51,16 +51,37 @@ use std::io::Write;
 pub const EXIT_OK: i32 = 0;
 /// 一般错误。
 pub const EXIT_ERROR: i32 = 1;
-/// 用法错误（clap 解析失败时的默认退出码，列在这里只为文档完整）。
-#[allow(dead_code)] // clap 自行返回 2,代码里不引用;保留为契约文档。
+/// 用法错误。clap 解析失败时自行返回 2;外壳在「命令根本没法执行」时也用它
+/// (`prune` 缺 `--older-than`、`--older-than` 值不合法),脚本不必区分是谁发现的。
 pub const EXIT_USAGE: i32 = 2;
 /// 部分成功：整体流程走完，但个别子项失败（细节写进 warnings）。
 pub const EXIT_PARTIAL: i32 = 3;
 /// 需要确认被拒绝 / dry-run 仅预览未执行。
-#[allow(dead_code)] // 留给 M1 的 `duster clean`,先占住语义。
+///
+/// `clean` / `prune` / `uninstall` 默认只出计划，一个字节都不动即落这一档——
+/// 脚本据此把「什么都没做」与「做完了」分开。core 明说"没动过"的拒绝
+/// （`--json` 无 `--yes`、归档未表态、确认串不符、前置检查未过）同落这里。
 pub const EXIT_CONFIRM_DENIED: i32 = 4;
 /// 锁冲突：目标 agent 运行中或索引被其他进程占用。
 pub const EXIT_LOCKED: i32 = 5;
+
+/// 取两个退出码里更坏的那个。退出码的数值本身无序（`EXIT_PARTIAL` 是 3、
+/// `EXIT_CONFIRM_DENIED` 是 4，后者反而更轻），所以不能用 `max`。
+/// 未知码按「比 EXIT_ERROR 还坏」处理。
+pub fn worse(a: i32, b: i32) -> i32 {
+    fn rank(code: i32) -> u8 {
+        match code {
+            EXIT_OK => 0,
+            EXIT_CONFIRM_DENIED => 1,
+            EXIT_PARTIAL => 2,
+            EXIT_USAGE => 3,
+            EXIT_LOCKED => 4,
+            EXIT_ERROR => 5,
+            _ => 6, // 未知码比任何已知码都坏
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
+}
 
 // ---------------------------------------------------------------------------
 // 输出模式
@@ -221,6 +242,8 @@ pub struct Table {
     right: Vec<bool>,
     /// 该列数据行的前景色；表头恒为 bold。
     color: Vec<Option<Style>>,
+    /// flex 列的列号：它在 stdout 是 TTY 时吃掉终端余量（见 [`Table::flex_col`]）。
+    flex: Option<usize>,
 }
 
 /// 表格缩进：给终端留出呼吸感，也把表格和摘要行区分开。
@@ -239,6 +262,7 @@ impl Table {
             rows: Vec::new(),
             right: vec![false; cols],
             color: vec![None; cols],
+            flex: None,
         }
     }
 
@@ -258,6 +282,14 @@ impl Table {
         }
     }
 
+    /// 指定一列吃终端余量：其余列按内容取宽，这一列截到剩下的宽度。
+    ///
+    /// 只在 stdout 是 TTY 时生效——重定向到文件时截掉路径会毁掉逐行核对，
+    /// 而「人类模式的表格能完整落进文件」是文档化契约。越界下标忽略。
+    pub fn flex_col(&mut self, col: usize) {
+        self.flex = Some(col);
+    }
+
     /// 追加一行。多出表头的列会被忽略。
     pub fn push_row<S: Into<String>>(&mut self, row: Vec<S>) {
         let mut cells: Vec<String> = row.into_iter().map(Into::into).collect();
@@ -272,7 +304,13 @@ impl Table {
 
     /// 渲染为多行字符串（最后一行无多余换行）。
     pub fn render(&self) -> String {
-        let widths = self.widths();
+        self.render_at(stdout_term_cols())
+    }
+
+    /// 按给定终端宽度渲染。`None` = 拿不到宽度（管道 / 非 TTY），flex 列
+    /// 不收缩，表格维持旧的全宽行为。
+    fn render_at(&self, total: Option<usize>) -> String {
+        let widths = self.widths_for(total);
         let bold = Style::new().bold();
         let dim = muted();
 
@@ -304,6 +342,21 @@ impl Table {
         widths
     }
 
+    /// 渲染列宽：拿到终端宽度且设了 flex 列时，把它截到余量（可能为 0，
+    /// 这时该列渲染成省略号），其余列保持内容宽；拿不到宽度就原样返回。
+    fn widths_for(&self, total: Option<usize>) -> Vec<usize> {
+        let widths = self.widths();
+        let (Some(flex), Some(total)) = (self.flex, total) else {
+            return widths;
+        };
+        let Some(flex_w) = widths.get(flex).copied() else {
+            return widths; // 越界下标当没设过。
+        };
+        let mut widths = widths;
+        widths[flex] = flex_w.min(flex_avail(&widths, flex, total));
+        widths
+    }
+
     /// 渲染单行：先按纯文本算补白，再给单元格套色，行尾不补空格。
     fn render_line(
         &self,
@@ -319,7 +372,16 @@ impl Table {
             if i > 0 {
                 out.push_str("  ");
             }
-            let cell = cells.get(i).map(String::as_str).unwrap_or("");
+            let raw = cells.get(i).map(String::as_str).unwrap_or("");
+            // flex 列按余量截断；其余列内容即宽，截了也是原样。先截断后着色，
+            // 否则会剪断 ANSI 序列。
+            let truncated;
+            let cell = if self.flex == Some(i) {
+                truncated = truncate_width(raw, *width);
+                truncated.as_str()
+            } else {
+                raw
+            };
             let pad = width.saturating_sub(display_width(cell));
             // 占位横杠一律置灰，让真实数字自己跳出来。
             let style = if cell == DASH {
@@ -341,6 +403,33 @@ impl Table {
             }
         }
     }
+}
+
+/// flex 列能拿到的宽度：终端总宽 - 缩进 - 其余列的内容宽 - 列间空隙。
+///
+/// 可能为 0（终端比固定列还窄），这时 flex 列渲染成省略号而不是撑破屏幕；
+/// 只要余量 ≥ 1，「横线 + 缩进 ≤ 终端宽」就恒成立（见 [`Table::flex_col`]）。
+fn flex_avail(widths: &[usize], flex: usize, total: usize) -> usize {
+    let other: usize = widths
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != flex)
+        .map(|(_, w)| *w)
+        .sum();
+    let gaps = 2 * widths.len().saturating_sub(1);
+    total.saturating_sub(display_width(INDENT) + other + gaps)
+}
+
+/// stdout 的终端列数；非 TTY 或取不到尺寸时返回 None。
+///
+/// 管道 / 重定向时 flex 列不收缩——表格完整落进文件是输出契约的一部分，
+/// 截路径只发生在真的有人在看屏幕的时候。
+fn stdout_term_cols() -> Option<usize> {
+    let term = console::Term::stdout();
+    if !term.is_term() {
+        return None;
+    }
+    term.size_checked().map(|(_, cols)| cols as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -493,9 +582,124 @@ mod tests {
         assert_eq!(truncate_width("一二", 0), "…");
     }
 
+    /// flex 列在窄终端下：最后一列被截断、横线不超出给定宽度。这是「表格
+    /// 不溢出终端」那条契约的测试形态——render_at 收到的宽度就是终端宽度。
+    #[test]
+    fn flex_列在窄宽下截断且横线不超宽() {
+        let path = "~/.codex/skills/a-very-long-skill-name-that-would-overflow-any-narrow-terminal";
+        let mut t = Table::new(vec!["AGENT", "SIZE", "PATH"]);
+        t.right_align(&[1]);
+        t.push_row(vec!["codex", "1.2 GB", path]);
+        t.flex_col(2);
+
+        let rendered = t.render_at(Some(40));
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // 横线那行含缩进也不超过 40 列。
+        assert!(
+            display_width(lines[1]) <= 40,
+            "横线超宽 {}: {lines:?}",
+            display_width(lines[1])
+        );
+        // 路径单元格被截断：原文不在，尾部是省略号。
+        let path_line = lines[2];
+        assert!(path_line.contains('…'), "路径应被截断: {path_line}");
+        assert!(!path_line.contains("would-overflow"), "{path_line}");
+        // 整行（含缩进）同样不超过 40 列。
+        assert!(display_width(path_line) <= 40, "{path_line}");
+    }
+
+    /// 不设 flex 列时表格逐字不变（含给一个任意宽度）：守卫所有现存的列表格，
+    /// 免得 flex 的宽度账把哪一列挤掉。
+    #[test]
+    fn 无_flex_列时表格与旧行为逐字一致() {
+        let mut t = Table::new(vec!["AGENT", "SIZE"]);
+        t.right_align(&[1]);
+        t.push_row(vec!["codex", "1.2 GB"]);
+        t.push_row(vec!["gemini-cli", "3.1 MB"]);
+        let rendered = t.render_at(None);
+        // 没有 flex 列时,给不给宽度结果一模一样——flex 是唯一会动宽度的东西。
+        assert_eq!(rendered, t.render_at(Some(40)));
+        // 旧形状:表头 + 横线 + 数据行,行尾无补齐空格。
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].starts_with("  ─"));
+        assert!(rendered.lines().all(|l| !l.ends_with(' ')));
+        // 越界 flex 下标当没设过,表格原样。
+        let mut u = Table::new(vec!["A", "B"]);
+        u.push_row(vec!["x", "y"]);
+        u.flex_col(7);
+        assert_eq!(u.render_at(Some(10)), u.render_at(None));
+    }
+
     #[test]
     fn output_mode_glue() {
         assert_eq!(is_json_mode(true), OutputMode::Json);
         assert_eq!(is_json_mode(false), OutputMode::Human);
+    }
+
+    /// 退出码是脚本可见契约：数值一旦漂移，`|| echo nothing-was-done` 这类
+    /// 判断会静默变成别的意思。六个码钉死在这里。
+    #[test]
+    fn exit_codes_are_stable() {
+        assert_eq!(
+            [
+                EXIT_OK,
+                EXIT_ERROR,
+                EXIT_USAGE,
+                EXIT_PARTIAL,
+                EXIT_CONFIRM_DENIED,
+                EXIT_LOCKED,
+            ],
+            [0, 1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn worse_partial_比_confirm_denied_更坏() {
+        // `max` 会在这里算错(3 < 4),但语义上 partial 比 confirm denied 坏。
+        assert_eq!(worse(EXIT_PARTIAL, EXIT_CONFIRM_DENIED), EXIT_PARTIAL);
+    }
+
+    #[test]
+    fn worse_ok_永远让位() {
+        let codes = [
+            EXIT_OK,
+            EXIT_ERROR,
+            EXIT_LOCKED,
+            EXIT_USAGE,
+            EXIT_PARTIAL,
+            EXIT_CONFIRM_DENIED,
+        ];
+        for &c in &codes {
+            assert_eq!(worse(EXIT_OK, c), c, "EXIT_OK 不应覆盖任何非零码");
+        }
+    }
+
+    #[test]
+    fn worse_未知码最坏() {
+        assert_eq!(worse(EXIT_ERROR, 99), 99);
+        assert_eq!(worse(EXIT_OK, 99), 99);
+    }
+
+    #[test]
+    fn worse_可交换() {
+        let codes = [
+            EXIT_OK,
+            EXIT_ERROR,
+            EXIT_LOCKED,
+            EXIT_USAGE,
+            EXIT_PARTIAL,
+            EXIT_CONFIRM_DENIED,
+        ];
+        for a in &codes {
+            for b in &codes {
+                assert_eq!(
+                    worse(*a, *b),
+                    worse(*b, *a),
+                    "worse 必须可交换: a={a}, b={b}"
+                );
+            }
+        }
     }
 }
