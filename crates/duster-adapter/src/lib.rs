@@ -11,6 +11,7 @@
 //! 本 crate 不认识用例层——依赖方向严格向下。
 
 pub mod codec;
+pub mod guard;
 pub mod manifest;
 pub mod mapper;
 pub mod native;

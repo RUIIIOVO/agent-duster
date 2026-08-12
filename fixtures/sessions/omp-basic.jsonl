@@ -1,0 +1,12 @@
+{"type":"title","v":1,"title":"","updatedAt":"2026-08-01T10:00:00.000Z","pad":" "}
+{"type":"session","version":3,"id":"019fd000-0000-7000-8000-000000000001","timestamp":"2026-08-01T10:00:00.000Z","cwd":"/Users/tester/projects/demo"}
+{this line is intentionally broken json to prove bad lines are skipped
+{"type":"session_init","id":"s1","timestamp":"2026-08-01T10:00:00.100Z","systemPrompt":"<system-conventions>placeholder</system-conventions>"}
+{"type":"message","id":"m1","parentId":"root","timestamp":"2026-08-01T10:00:00.200Z","message":{"role":"user","content":[{"type":"text","text":"帮我看看这个报错"}]}}
+{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-08-01T10:00:00.500Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"lorem cogitatio placeholder"},{"type":"text","text":"先看日志,再定位配置。"}]}}
+{"type":"custom","customType":"tool_execution_start","id":"c1","parentId":"m2","timestamp":"2026-08-01T10:00:01.000Z","data":{"toolCallId":"toolu_placeholder","toolName":"read","args":{"path":"demo.rs"}}}
+{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-08-01T10:00:01.200Z","message":{"role":"toolResult","toolCallId":"toolu_placeholder","toolName":"read","content":[{"type":"text","text":"error: demo.rs:12 no such file"}]}}
+{"type":"message","id":"m4","parentId":"m3","timestamp":"2026-08-01T10:00:01.500Z","message":{"role":"assistant","content":[{"type":"toolCall","name":"read","input":{"path":"demo.rs"}}]}}
+{"type":"title_change","id":"t1","parentId":"m2","timestamp":"2026-08-01T10:00:02.000Z","title":"演示会话","source":"auto"}
+{"type":"message","id":"m5","parentId":"m3","timestamp":"2026-08-01T10:00:03.000Z","message":{"role":"assistant","content":"收到,已修复。"}}
+{"type":"model_change","id":"mc1","timestamp":"2026-08-01T10:00:04.000Z","model":"sonnet"}

@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 duster-model = { workspace = true }
 anyhow = { workspace = true }
+blake3 = { workspace = true }
+# 原生适配器逃生舱要读 agent 自家的 SQLite 会话库（opencode / omp）。
+# 分层不允许适配层依赖 duster-index，所以只读打开策略在这里再写一遍。
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

@@ -5,6 +5,11 @@
 //! 路径一律保留 `~` 开头的字符串，展开由运行时负责；
 //! `version_cmd` 在 M0 只存不执行。字段与词汇表的唯一范本见
 //! `adapters/claude-code.toml` 文件头注释。
+//!
+//! `[uninstall]` 是唯一一个**描述动作**而不是描述资源的小节：卸载要动
+//! 三种所有权不同的东西——自己独占的树（删）、写在别人文件里的键（改）、
+//! 软件本体的安装方式（只打印命令，绝不代跑）。它仍然不做 IO：路径照样
+//! 留 `~`，`detect` / `command` 照样只是 argv。
 
 use anyhow::{Context, Result, bail};
 use duster_model::{CleanLevel, ResourceKind};
@@ -53,6 +58,10 @@ pub struct Manifest {
     /// 资源声明；TOML 里写作 `[[resource]]`。
     #[serde(default, rename = "resource")]
     pub resources: Vec<ResourceSection>,
+    /// 卸载声明；TOML 里写作 `[uninstall]`。整节可选，缺省语义见
+    /// [`Manifest::owned_roots`]。
+    #[serde(default)]
+    pub uninstall: Option<UninstallSection>,
 }
 
 /// `[agent]`：身份。
@@ -104,6 +113,106 @@ pub struct ResourceSection {
     /// 仅 artifact 资源：清理级别。artifact 必填，其余 kind 禁写。
     #[serde(default)]
     pub clean_level: Option<CleanLevel>,
+    /// 仅 l2 artifact：这份资源是「按代际滚动」的（数据库滚动备份等），
+    /// 每份代际一行索引（要求同时声明 `glob`），这里写保留最新几份。
+    ///
+    /// 语义与 `--older-than` 正交：第 8 份副本冗余不冗余看数量不看年龄，
+    /// 所以它绕开年龄阈值，由 `prune --keep-generations` 独立处理。
+    /// 其余 kind / 级别禁写（校验层拒绝加载）。
+    #[serde(default)]
+    pub keep_generations: Option<u32>,
+    /// 仅 skill 资源：目录内属于「软件本体」的一级子目录名，如
+    /// `["node_modules", "dist", "bin", ".git"]`。
+    ///
+    /// artifact / install 的二分法在资源**内部**也要成立：一个 skill 目录
+    /// 里既有用户内容（可归档、可去重）也有装出来的东西（删了要重装）。
+    /// 命中这里的子树只统计进 install 桶，不进 skill 体积、不进归档包、
+    /// 不进副本检测的树哈希。写的是**裸目录名**（按名匹配任意层级），不是路径。
+    #[serde(default)]
+    pub install_paths: Vec<String>,
+}
+
+/// `[uninstall]`：卸载这个 agent 要动的三类东西。整节可选。
+///
+/// 三个字段是三种**所有权**，不是三个档位：
+/// `owns` 是随 agent 一起死的树（整棵删）；`shared` 是它写在**别人**文件里
+/// 的那几个键（只能逐键动刀，永不删文件）；`package` 是软件本体的安装方式
+/// （duster 只打印，永不代跑）。三者互不替代，少一类就卸不干净。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UninstallSection {
+    /// 本 agent 独占的路径，一律 `~` 开头。留空表示「按 [`Manifest::owned_roots`]
+    /// 从 `[probe]` + `[[resource]]` 推导」——写清单的人不必把根抄两遍。
+    #[serde(default)]
+    pub owns: Vec<String>,
+    /// 共享文件里的定点改写；TOML 里写作 `[[uninstall.shared]]`。
+    #[serde(default)]
+    pub shared: Vec<SharedEdit>,
+    /// 包管理器线索；TOML 里写作 `[[uninstall.package]]`。
+    #[serde(default)]
+    pub package: Vec<PackageHint>,
+}
+
+/// `[[uninstall.shared]]`：**别的 agent 也拥有**的那个文件里，属于本 agent
+/// 的那一个键。
+///
+/// 与 `owns` 的差别不是粒度而是所有权：这个文件不是我们的，所以只能摘掉
+/// 一个键，不能删文件、不能清空表。`json_pointer` / `toml_key` 二选一且必选
+/// 一个——没有键的「共享改写」等于重写整个文件，那不叫卸载。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedEdit {
+    /// 共享文件路径，`~` 开头、不展开。不得落在任一 `owns` 之内。
+    pub path: String,
+    /// JSON 文件内定位（RFC 6901），如 `/mcpServers/foo`。与 `toml_key` 互斥。
+    #[serde(default)]
+    pub json_pointer: Option<String>,
+    /// TOML 文件内定位（点路径），如 `mcp_servers.foo`。与 `json_pointer` 互斥。
+    #[serde(default)]
+    pub toml_key: Option<String>,
+    /// 动刀前给用户看的一句话，**英文**：这个键是什么、为什么该跟着一起走。
+    pub reason: String,
+}
+
+/// `[[uninstall.package]]`：软件本体是怎么装上来的。
+///
+/// `detect` 是只读探测，duster **可以**执行它来判断这条线索在本机是否适用；
+/// `command` 是卸载命令，duster **只打印**。这条边界是刻意的：包管理器的
+/// 卸载会动 duster 认领范围之外的文件（PATH 上的 shim、别的项目的依赖），
+/// 代跑一次就再也说不清是谁删的。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageHint {
+    pub manager: PackageManager,
+    /// 只读探测命令（argv）。留空表示这条线索无法探测，只能无条件打印。
+    #[serde(default)]
+    pub detect: Vec<String>,
+    /// 卸载命令（argv）。**永不自动执行**，只打印给用户。不得为空。
+    pub command: Vec<String>,
+}
+
+/// 包管理器封闭词汇表。清单里只能写这五个名字，serde 解析即校验。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageManager {
+    Npm,
+    Brew,
+    Curl,
+    Pipx,
+    Cargo,
+}
+
+impl PackageManager {
+    /// 清单里的字面名，也是打印给用户看的那个词。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Brew => "brew",
+            Self::Curl => "curl",
+            Self::Pipx => "pipx",
+            Self::Cargo => "cargo",
+        }
+    }
 }
 
 /// 清单层作用域。与 `duster_model::Scope` 不同：这里 project 不携带具体
@@ -115,7 +224,7 @@ pub enum ManifestScope {
     Project,
 }
 
-/// mapper 封闭词汇表。清单里只能写这七个名字，serde 解析即校验。
+/// mapper 封闭词汇表。清单里只能写这些名字，serde 解析即校验。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum MapperName {
     /// 标准 JSON `mcpServers` 映射（Claude Code / 多数 agent）。
@@ -124,6 +233,17 @@ pub enum MapperName {
     /// Codex `config.toml` 的 `mcp_servers` 表。
     #[serde(rename = "mcp/codex-toml")]
     McpCodexToml,
+    /// opencode `opencode.jsonc` 的 `.mcp` 表。第三种方言：条目自带
+    /// `type = "local" | "remote"`，`local` 用 `command: [...]`（argv 数组，
+    /// 不拆 command/args），`remote` 用 `url`；另有 `enabled` 与 `environment`。
+    #[serde(rename = "mcp/opencode-json")]
+    McpOpencodeJson,
+    /// Gemini CLI `~/.gemini/settings.json` 的 `mcpServers` 表。第四种方言：
+    /// 键名与 standard-json 高度重合，但传输判定规则是 Gemini 自己的一套
+    /// （`httpUrl` 压过 `url`、`type` 只认 stdio/sse/http、不认的值不报错而是
+    /// 退回按端点推断）。详见 [`crate::mapper::mcp::from_gemini_json`]。
+    #[serde(rename = "mcp/gemini-json")]
+    McpGeminiJson,
     /// `SKILL.md` YAML frontmatter（name/description）。
     #[serde(rename = "skill/frontmatter-md")]
     SkillFrontmatterMd,
@@ -136,6 +256,15 @@ pub enum MapperName {
     /// Codex JSONL 会话（原生适配器逃生舱）。
     #[serde(rename = "native/codex-session")]
     NativeCodexSession,
+    /// opencode 的 `opencode.db`（SQLite，一个库装所有会话）。
+    #[serde(rename = "native/opencode-session")]
+    NativeOpencodeSession,
+    /// omp 的 `history.db`（SQLite，活跃 WAL）。
+    #[serde(rename = "native/omp-session")]
+    NativeOmpSession,
+    /// omp 会话 jsonl（`sessions/<路径编码>/<时间戳>_<uuid>.jsonl`）。
+    #[serde(rename = "native/omp-jsonl-session")]
+    NativeOmpJsonlSession,
     /// 不解析内容，只做体积/数量统计。任何 kind 都可用。
     #[serde(rename = "stats-only")]
     StatsOnly,
@@ -147,10 +276,15 @@ impl MapperName {
         match self {
             Self::McpStandardJson => "mcp/standard-json",
             Self::McpCodexToml => "mcp/codex-toml",
+            Self::McpOpencodeJson => "mcp/opencode-json",
+            Self::McpGeminiJson => "mcp/gemini-json",
             Self::SkillFrontmatterMd => "skill/frontmatter-md",
             Self::MemoryMarkdown => "memory/markdown",
             Self::NativeClaudeSession => "native/claude-session",
             Self::NativeCodexSession => "native/codex-session",
+            Self::NativeOpencodeSession => "native/opencode-session",
+            Self::NativeOmpSession => "native/omp-session",
+            Self::NativeOmpJsonlSession => "native/omp-jsonl-session",
             Self::StatsOnly => "stats-only",
         }
     }
@@ -160,10 +294,17 @@ impl MapperName {
     fn fits(self, kind: ResourceKind) -> bool {
         match self {
             Self::StatsOnly => true,
-            Self::McpStandardJson | Self::McpCodexToml => kind == ResourceKind::Mcp,
+            Self::McpStandardJson
+            | Self::McpCodexToml
+            | Self::McpOpencodeJson
+            | Self::McpGeminiJson => kind == ResourceKind::Mcp,
             Self::SkillFrontmatterMd => kind == ResourceKind::Skill,
             Self::MemoryMarkdown => kind == ResourceKind::Memory,
-            Self::NativeClaudeSession | Self::NativeCodexSession => kind == ResourceKind::Session,
+            Self::NativeClaudeSession
+            | Self::NativeCodexSession
+            | Self::NativeOpencodeSession
+            | Self::NativeOmpSession
+            | Self::NativeOmpJsonlSession => kind == ResourceKind::Session,
         }
     }
 }
@@ -237,6 +378,74 @@ impl Manifest {
                 _ => {}
             }
 
+            // keep_generations 只在 l2 artifact 上有意义,而且必须带 glob:
+            // 「保留最新 N 份代际」的前提是每份代际占一行索引,没有 glob 的
+            // stats-only 永远只有一行——N 再大也只会 keep 那唯一一份,声明
+            // 就成了静默无效。glob 还必须是直接子项模式(不含 `/`):代际是
+            // 「一个目录里滚动的几份文件」,通配跨目录会让同一份资源的两份
+            // 代际被 plan 分到两个组里,各留 N 份,与声明的意图不符。两种
+            // 都是"写了也不生效"的清单 bug,照例拒绝加载而不是悄悄忽略。
+            if let Some(n) = r.keep_generations {
+                if r.clean_level != Some(CleanLevel::L2) {
+                    bail!(
+                        "{at}: keep_generations is only meaningful for l2 artifacts (time- \
+                         limited, prune-owned). Declared on level {:?} it either never fires \
+                         or gives a non-prune command a second deletion authority — \
+                         declare clean_level = \"l2\" or drop the field",
+                        r.clean_level
+                    );
+                }
+                if n == 0 {
+                    bail!(
+                        "{at}: keep_generations = 0 would delete every generation including \
+                         the last fallback copy. The minimum is 1 — keep the newest one, \
+                         which is what a backup is for"
+                    );
+                }
+                match &r.glob {
+                    None => bail!(
+                        "{at}: keep_generations requires glob — without it this resource is \
+                         a single row, so there are no generations to keep the newest N of"
+                    ),
+                    Some(g) if g.contains('/') => bail!(
+                        "{at}: keep_generations glob `{g}` crosses directories; generations \
+                         are the rolling files of one folder, and a `*`-across-subdirs \
+                         pattern would split one resource's generations into per-folder \
+                         groups. Declare the folder that actually rolls"
+                    ),
+                    Some(_) => {}
+                }
+            }
+
+            // install_paths 只在 skill 上有意义:它解的是「一个资源目录内部
+            // 混着用户内容与软件本体」这一个问题,而这只在 skill 目录里发生。
+            // 写在 artifact 上等于给"清理时跳过一部分"开后门,写在 install
+            // 上是同义反复——两种都拒绝加载,免得清单变成许愿池。
+            if !r.install_paths.is_empty() {
+                if r.kind != ResourceKind::Skill {
+                    bail!(
+                        "{at}: install_paths may only be declared on skill resources; \
+                         kind `{:?}` is either wholly install or wholly cleanable — \
+                         split it into two resources instead",
+                        r.kind
+                    );
+                }
+                for name in &r.install_paths {
+                    if name.is_empty() {
+                        bail!("{at}: install_paths must not contain an empty entry");
+                    }
+                    // 裸目录名,按名匹配任意层级(`gstack/node_modules` 与
+                    // `gstack/pkg/a/node_modules` 都要命中)。收路径进来会
+                    // 让人以为支持通配/相对定位,实际不支持。
+                    if name.contains('/') || name.contains('~') {
+                        bail!(
+                            "{at}: install_paths entry `{name}` must be a bare directory name, \
+                             not a path (no `/`, no `~`); it is matched by name at any depth"
+                        );
+                    }
+                }
+            }
+
             // 重叠路径禁止：体积按声明路径独立聚合，父子同时声明会双算，
             // 「总共多少 GB / 能清多少」当场失真。真要拆细粒度，得先让
             // scan 支持子树扣减；在那之前，清单层直接把它拦在门外。
@@ -252,7 +461,106 @@ impl Manifest {
                 }
             }
         }
+
+        // ── [uninstall]：三种所有权各有各的失败模式，全部挡在加载期 ─────
+        if let Some(u) = &self.uninstall {
+            for path in &u.owns {
+                ensure_tilde(id, "uninstall.owns entry", path)?;
+            }
+            // 拿 owned_roots 而不是 u.owns：`owns` 留空时根是推导出来的，
+            // 「共享文件不得落在自己树里」这条对推导出来的根同样要成立。
+            let roots = self.owned_roots();
+            for (i, s) in u.shared.iter().enumerate() {
+                let at = format!("[{id}] uninstall.shared #{} (path = {})", i + 1, s.path);
+                ensure_tilde(id, "uninstall.shared.path", &s.path)?;
+                match (&s.json_pointer, &s.toml_key) {
+                    (Some(_), Some(_)) => bail!(
+                        "{at}: json_pointer and toml_key are mutually exclusive; \
+                         declare only the one that matches the file's format"
+                    ),
+                    (None, None) => bail!(
+                        "{at}: declare exactly one of json_pointer (RFC 6901, e.g. \
+                         \"/mcpServers/foo\") or toml_key (dotted path, e.g. \
+                         \"mcp_servers.foo\"). A shared edit with no key would rewrite a \
+                         file another agent owns — if the whole path really is ours, \
+                         declare it in owns instead"
+                    ),
+                    (Some(ptr), None) if !ptr.starts_with('/') => bail!(
+                        "{at}: json_pointer `{ptr}` must start with `/` (RFC 6901); \
+                         write \"/mcpServers/foo\", not \"mcpServers/foo\""
+                    ),
+                    (None, Some(key)) if key.is_empty() => bail!(
+                        "{at}: toml_key must not be empty; an empty dotted path means the \
+                         document root, which would clear a file another agent owns. \
+                         Write the table that belongs to this agent, e.g. \"mcp_servers.foo\""
+                    ),
+                    _ => {}
+                }
+                if s.reason.trim().is_empty() {
+                    bail!(
+                        "{at}: reason must not be empty; it is the English line shown to the \
+                         user right before duster edits someone else's file. Write what the \
+                         key is, e.g. \"MCP entry pointing at this agent\""
+                    );
+                }
+                if let Some(root) = roots.iter().find(|r| path_contains(r, &s.path)) {
+                    bail!(
+                        "{at}: this path sits inside owned root `{root}`, which uninstall \
+                         deletes outright — a file is either ours to delete or someone \
+                         else's to edit, never both. Drop this shared edit, or narrow owns \
+                         so it no longer covers the file"
+                    );
+                }
+            }
+            for (i, p) in u.package.iter().enumerate() {
+                if p.command.is_empty() {
+                    bail!(
+                        "[{id}] uninstall.package #{} (manager = {}): command must not be \
+                         empty; it is the argv duster prints for the user to run, e.g. \
+                         [\"npm\", \"uninstall\", \"-g\", \"@foo/bar\"]. If this agent has no \
+                         package-manager uninstall on record, drop the whole \
+                         [[uninstall.package]] entry — an empty command is a hint that \
+                         hints nothing",
+                        i + 1,
+                        p.manager.as_str()
+                    );
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// 本 agent 独占的路径根：`uninstall.owns` 有内容就照写，否则由
+    /// `[probe]` 的探测路径 + `[[resource]]` 的资源路径推导。
+    ///
+    /// 推导时会把落在另一个候选之内的路径丢掉，只留最外层——这样调用方拿到
+    /// 的一定是互不包含的根，删一遍就够，不会父子各删一次。返回值仍是 `~`
+    /// 开头的字符串，展开由调用方负责。
+    pub fn owned_roots(&self) -> Vec<String> {
+        if let Some(u) = &self.uninstall
+            && !u.owns.is_empty()
+        {
+            return u.owns.clone();
+        }
+        let candidates: Vec<&String> = self
+            .probe
+            .any_of
+            .iter()
+            .chain(&self.probe.all_of)
+            .chain(self.resources.iter().map(|r| &r.path))
+            .collect();
+        let mut out: Vec<String> = Vec::new();
+        for (i, c) in candidates.iter().enumerate() {
+            let nested = candidates
+                .iter()
+                .enumerate()
+                .any(|(j, o)| j != i && *o != *c && path_contains(o, c));
+            if nested || out.iter().any(|kept| kept == *c) {
+                continue;
+            }
+            out.push((*c).clone());
+        }
+        out
     }
 }
 
@@ -517,6 +825,108 @@ mapper = "mcp/standard-json"
         assert!(parse(&src).unwrap_err().to_string().contains("probe"));
     }
 
+    /// install_paths 是 skill 专属的「资源内部再分桶」开关：
+    /// 用在别的 kind 上，或写成路径，都必须当场拒绝加载。
+    #[test]
+    fn install_paths_只许写在_skill_上且必须是裸目录名() {
+        // 合法：skill + 裸目录名。
+        let ok = minimal(
+            r#"
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.demo/skills"
+mapper = "skill/frontmatter-md"
+install_paths = ["node_modules", "dist", "bin", ".git"]
+"#,
+        );
+        let m = parse(&ok).expect("skill 上的 install_paths 应当合法");
+        assert_eq!(
+            m.resources[0].install_paths,
+            ["node_modules", "dist", "bin", ".git"]
+        );
+
+        // 缺省为空 Vec，不是 None——旧清单不受影响。
+        let bare = minimal(
+            r#"
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.demo/skills"
+mapper = "skill/frontmatter-md"
+"#,
+        );
+        assert!(parse(&bare).unwrap().resources[0].install_paths.is_empty());
+
+        // 非 skill：拒绝，并指出该拆成两条资源。
+        let wrong_kind = minimal(
+            r#"
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/cache"
+mapper = "stats-only"
+clean_level = "l1"
+install_paths = ["node_modules"]
+"#,
+        );
+        let err = parse(&wrong_kind).unwrap_err().to_string();
+        assert!(
+            err.contains("install_paths") && err.contains("skill"),
+            "错误应点名 install_paths 与 skill: {err}"
+        );
+
+        // 写成路径：拒绝。
+        let with_slash = minimal(
+            r#"
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.demo/skills"
+mapper = "skill/frontmatter-md"
+install_paths = ["gstack/node_modules"]
+"#,
+        );
+        let err = parse(&with_slash).unwrap_err().to_string();
+        assert!(
+            err.contains("bare directory name"),
+            "错误应说明只收裸目录名: {err}"
+        );
+
+        // 带 `~` 同样拒绝（免得有人以为能写 `~/x`）。
+        let with_tilde = with_slash.replace("gstack/node_modules", "~node_modules");
+        assert!(
+            parse(&with_tilde)
+                .unwrap_err()
+                .to_string()
+                .contains("bare directory name")
+        );
+
+        // 空串拒绝：会把整棵树当 install。
+        let empty = with_slash.replace("\"gstack/node_modules\"", "\"\"");
+        assert!(parse(&empty).unwrap_err().to_string().contains("empty"));
+    }
+
+    /// 三份内置清单的 skill 资源必须声明同一套 install_paths——
+    /// status 体积口径、归档排除、副本检测的树哈希都读这一个定义，
+    /// 任何一份走样都会让「同一个 skill 在两个 agent 下体积不同」。
+    #[test]
+    fn 内置清单的_skill_install_paths_一致() {
+        const EXPECTED: [&str; 4] = ["node_modules", "dist", "bin", ".git"];
+        for id in ["claude-code", "codex", "omp"] {
+            let m = load_builtin()
+                .into_iter()
+                .find(|m| m.agent.id == id)
+                .unwrap_or_else(|| panic!("内置应包含 {id}"));
+            let skill = m
+                .resources
+                .iter()
+                .find(|r| r.kind == ResourceKind::Skill)
+                .unwrap_or_else(|| panic!("{id} 应有 skill 资源"));
+            assert_eq!(skill.install_paths, EXPECTED, "{id} 的 install_paths 走样");
+        }
+    }
+
     /// artifact 必须自带 clean_level：漏写等于让 clean 面对一个不知道
     /// 该不该动的目录，错误信息必须把人引向 `install`。
     #[test]
@@ -550,6 +960,116 @@ clean_level = "l1"
         );
         let err = parse(&src).unwrap_err().to_string();
         assert!(err.contains("never cleaned"), "{err}");
+    }
+
+    /// `keep_generations` 只在 l2 artifact 上有意义。写在 l1 上等于给
+    /// clean 一把第二重删除权（clean 本就整项删，没有"保留 N 份"一说），
+    /// 写在别的 kind 上等于给不可清理的东西发代际清理许可——都拒绝加载。
+    #[test]
+    fn keep_generations_outside_l2_is_rejected() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/cache"
+mapper = "stats-only"
+clean_level = "l1"
+keep_generations = 2
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("l2"), "{err}");
+        assert!(err.contains("keep_generations"), "{err}");
+
+        // 非 artifact 更不许写。
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.demo/skills"
+mapper = "skill/frontmatter-md"
+keep_generations = 2
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("l2"), "{err}");
+    }
+
+    /// `keep_generations` 必须带直接子项的 glob：没有 glob 的 stats-only
+    /// 永远只有一行，「保留最新 N 份」无从谈起；glob 带 `/` 会让同一份
+    /// 资源的代际被 plan 按子目录拆组。两种都是写了也不生效的清单 bug。
+    #[test]
+    fn keep_generations_without_direct_glob_is_rejected() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/backups"
+mapper = "stats-only"
+clean_level = "l2"
+keep_generations = 2
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("requires glob"), "{err}");
+
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/backups"
+mapper = "stats-only"
+clean_level = "l2"
+glob = "**/*.db"
+keep_generations = 2
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("crosses directories"), "{err}");
+    }
+
+    /// N = 0 会把唯一副本一起删掉,违反「绝不动唯一副本」红线。
+    #[test]
+    fn keep_generations_zero_is_rejected() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/backups"
+mapper = "stats-only"
+clean_level = "l2"
+glob = "*.db"
+keep_generations = 0
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("0"), "{err}");
+        assert!(err.contains("minimum is 1"), "{err}");
+    }
+
+    /// 合法形态:l2 + 直接子项 glob + N ≥ 1。
+    #[test]
+    fn keep_generations_valid_form_parses() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "artifact"
+scope = "global"
+path = "~/.demo/backups"
+mapper = "stats-only"
+clean_level = "l2"
+glob = "*.db"
+keep_generations = 2
+"#,
+        );
+        let m = parse(&src).unwrap();
+        let r = &m.resources[0];
+        assert_eq!(r.keep_generations, Some(2));
     }
 
     /// 父子路径同时声明会把同一批字节算两遍，直接拒绝加载。
@@ -639,5 +1159,312 @@ binary = "other"
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such-dir");
         assert!(load_user_dir(&missing).unwrap().is_empty());
+    }
+
+    /// `[uninstall]` 整节可选：老清单一个字不改也要照样加载，
+    /// 且 `owned_roots` 要能从 `[probe]` + `[[resource]]` 把根推出来。
+    #[test]
+    fn 没有_uninstall_节的清单照样加载_且根由_probe_与_resource_推导() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "skill"
+scope = "global"
+path = "~/.demo/skills"
+mapper = "skill/frontmatter-md"
+
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.config/demo/AGENTS.md"
+mapper = "memory/markdown"
+"#,
+        );
+        let m = parse(&src).expect("缺 [uninstall] 不该影响加载");
+        assert!(m.uninstall.is_none());
+        // ~/.demo/skills 落在 probe 根 ~/.demo 之内被丢掉，只留最外层；
+        // ~/.config/demo/AGENTS.md 不在任何 probe 根里，必须留下。
+        assert_eq!(m.owned_roots(), ["~/.demo", "~/.config/demo/AGENTS.md"]);
+    }
+
+    /// 显式 `owns` 优先于推导：清单作者说了算，不许被 resource 悄悄扩宽。
+    #[test]
+    fn 显式_owns_覆盖推导结果() {
+        let src = minimal(
+            r#"
+[[resource]]
+kind = "memory"
+scope = "global"
+path = "~/.config/demo/AGENTS.md"
+mapper = "memory/markdown"
+
+[uninstall]
+owns = ["~/.demo"]
+"#,
+        );
+        let m = parse(&src).unwrap();
+        assert_eq!(m.owned_roots(), ["~/.demo"]);
+        // 三个字段都缺省成空 Vec，不是 None——消费侧不必到处 unwrap_or_default。
+        let u = m.uninstall.as_ref().unwrap();
+        assert!(u.shared.is_empty() && u.package.is_empty());
+    }
+
+    /// `owns` 走 `ensure_tilde`：绝对路径会让「删整棵树」指向任意位置。
+    #[test]
+    fn uninstall_owns_必须是波浪号路径() {
+        let src = minimal(
+            r#"
+[uninstall]
+owns = ["/opt/demo"]
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("uninstall.owns entry"), "{err}");
+        assert!(err.contains("~/"), "错误要说清该写成什么: {err}");
+    }
+
+    /// shared 是「别人文件里的一个键」：键必须有且只有一个定位方式。
+    #[test]
+    fn uninstall_shared_的定位键必须二选一() {
+        let both = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.shared]]
+path = "~/.other.json"
+json_pointer = "/mcpServers/demo"
+toml_key = "mcp_servers.demo"
+reason = "MCP entry pointing at this agent"
+"#,
+        );
+        let err = parse(&both).unwrap_err().to_string();
+        assert!(
+            err.contains("json_pointer") && err.contains("toml_key"),
+            "错误应同时点名两个字段: {err}"
+        );
+
+        // 一个都不写：等于要重写别人的整个文件。
+        let neither = both
+            .replace("json_pointer = \"/mcpServers/demo\"\n", "")
+            .replace("toml_key = \"mcp_servers.demo\"\n", "");
+        let err = parse(&neither).unwrap_err().to_string();
+        assert!(err.contains("json_pointer"), "{err}");
+        assert!(
+            err.contains("owns"),
+            "错误要指出「整条路径真是我们的就写 owns」: {err}"
+        );
+
+        // json_pointer 少了开头的 `/`。
+        let bad_ptr = both.replace(
+            "json_pointer = \"/mcpServers/demo\"\ntoml_key = \"mcp_servers.demo\"",
+            "json_pointer = \"mcpServers/demo\"",
+        );
+        let err = parse(&bad_ptr).unwrap_err().to_string();
+        assert!(
+            err.contains("json_pointer") && err.contains("RFC 6901"),
+            "{err}"
+        );
+
+        // toml_key 空串 = 文档根，会清空别人的文件。
+        let empty_key = both.replace(
+            "json_pointer = \"/mcpServers/demo\"\ntoml_key = \"mcp_servers.demo\"",
+            "toml_key = \"\"",
+        );
+        let err = parse(&empty_key).unwrap_err().to_string();
+        assert!(err.contains("toml_key") && err.contains("root"), "{err}");
+
+        // reason 是动刀前给用户看的唯一一句话，空着等于无声改写别人的文件。
+        let no_reason = both
+            .replace("toml_key = \"mcp_servers.demo\"\n", "")
+            .replace(
+                "reason = \"MCP entry pointing at this agent\"",
+                "reason = \"   \"",
+            );
+        let err = parse(&no_reason).unwrap_err().to_string();
+        assert!(err.contains("reason"), "{err}");
+    }
+
+    /// 一个文件要么是我们的（删），要么是别人的（改键），不可能两者都是。
+    /// 这条对显式 `owns` 与推导出来的根同样成立。
+    #[test]
+    fn uninstall_shared_不许落在_owns_之内() {
+        let explicit = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.shared]]
+path = "~/.demo/config.json"
+json_pointer = "/mcpServers/demo"
+reason = "MCP entry pointing at this agent"
+"#,
+        );
+        let err = parse(&explicit).unwrap_err().to_string();
+        assert!(err.contains("inside owned root"), "{err}");
+        assert!(err.contains("~/.demo"), "错误要点名那个根: {err}");
+
+        // 没写 owns 时根是推导的，同一条规则照样要拦住。
+        let derived = explicit.replace("owns = [\"~/.demo\"]\n", "");
+        assert!(
+            parse(&derived)
+                .unwrap_err()
+                .to_string()
+                .contains("inside owned root")
+        );
+
+        // 只是同前缀的兄弟文件，必须放行（~/.demo-shared 不在 ~/.demo 里）。
+        let sibling = explicit.replace("~/.demo/config.json", "~/.demo-shared.json");
+        assert!(parse(&sibling).is_ok(), "同前缀兄弟路径不该被拦");
+    }
+
+    /// package 是「打印给用户去跑的那条命令」：空命令什么都没告诉用户，
+    /// manager 只认封闭词汇表里的五个。
+    #[test]
+    fn uninstall_package_必须有命令且_manager_是封闭词汇表() {
+        let empty_cmd = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.package]]
+manager = "npm"
+detect = ["npm", "ls", "-g", "--depth", "0", "demo"]
+command = []
+"#,
+        );
+        let err = parse(&empty_cmd).unwrap_err().to_string();
+        assert!(err.contains("command"), "{err}");
+        assert!(
+            err.contains("[[uninstall.package]]"),
+            "错误要指出该整条删掉: {err}"
+        );
+
+        // detect 可以为空（无从探测就无条件打印），command 不行。
+        let no_detect = empty_cmd
+            .replace(
+                "detect = [\"npm\", \"ls\", \"-g\", \"--depth\", \"0\", \"demo\"]\n",
+                "",
+            )
+            .replace(
+                "command = []",
+                "command = [\"npm\", \"uninstall\", \"-g\", \"demo\"]",
+            );
+        let m = parse(&no_detect).expect("detect 缺省应当合法");
+        let p = &m.uninstall.as_ref().unwrap().package[0];
+        assert_eq!(p.manager, PackageManager::Npm);
+        assert_eq!(p.manager.as_str(), "npm");
+        assert!(p.detect.is_empty());
+
+        // 词汇表外的名字：serde 解析即拒绝。
+        let bad = no_detect.replace("manager = \"npm\"", "manager = \"yarn\"");
+        assert!(parse(&bad).unwrap_err().to_string().contains("yarn"));
+    }
+
+    /// 内置清单的 `[uninstall]` 必须**实测填满**，不许空着混过加载校验。
+    /// 断言写成本机 2026-08-11 的实测结论：谁归 mise 的 npm 包、谁归 brew cask、
+    /// 谁查不到包管理器所以整条不写。清单被水改时这里会当场红。
+    #[test]
+    fn 内置清单的_uninstall_节全部实测填满() {
+        let manifests = load_builtin();
+        assert_eq!(manifests.len(), 11);
+
+        for m in &manifests {
+            let u = m
+                .uninstall
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} 缺 [uninstall] 节", m.agent.id));
+            assert!(!u.owns.is_empty(), "{} 的 owns 不许为空", m.agent.id);
+            // owns 必须与 M1 `uninstall --data-only` 的删除根一致：
+            // plan_uninstall 拿 probe 里实际存在的路径当根，所以 owns 就该是
+            // probe 的那几条，一条不多一条不少。
+            let probe_roots: Vec<&String> = m.probe.any_of.iter().chain(&m.probe.all_of).collect();
+            assert_eq!(
+                u.owns.iter().collect::<Vec<_>>(),
+                probe_roots,
+                "{} 的 owns 与 probe 根不一致（会和 M1 --data-only 删的东西对不上）",
+                m.agent.id
+            );
+            assert_eq!(m.owned_roots(), u.owns);
+            // 用户能看见的字符串必须是英文：reason 会在改别人文件前打印出来。
+            for s in &u.shared {
+                assert!(
+                    s.reason.is_ascii() && !s.reason.trim().is_empty(),
+                    "{} 的 shared.reason 必须是非空 ASCII 英文",
+                    m.agent.id
+                );
+            }
+        }
+
+        let get = |id: &str| {
+            manifests
+                .iter()
+                .find(|m| m.agent.id == id)
+                .unwrap_or_else(|| panic!("内置应包含 {id}"))
+                .uninstall
+                .clone()
+                .unwrap()
+        };
+
+        // 多根：OpenCode 的三处 XDG 目录一条都不能少。
+        assert_eq!(
+            get("opencode").owns,
+            [
+                "~/.opencode",
+                "~/.config/opencode",
+                "~/.local/share/opencode"
+            ]
+        );
+        assert_eq!(get("claude-code").owns, ["~/.claude", "~/.claude.json"]);
+
+        // shared：本机实测只有 cc-switch 一家把自己的键写进了别人的文件
+        // （~/.codex/config.toml 的 model_catalog_json 指向它生成的目录）。
+        let with_shared: Vec<&str> = manifests
+            .iter()
+            .filter(|m| !m.uninstall.as_ref().unwrap().shared.is_empty())
+            .map(|m| m.agent.id.as_str())
+            .collect();
+        assert_eq!(with_shared, ["cc-switch"]);
+        let ccs = get("cc-switch");
+        assert_eq!(ccs.shared.len(), 1);
+        assert_eq!(ccs.shared[0].path, "~/.codex/config.toml");
+        assert_eq!(
+            ccs.shared[0].toml_key.as_deref(),
+            Some("model_catalog_json")
+        );
+        assert_eq!(ccs.shared[0].json_pointer, None);
+
+        // package：五个 mise 管的 npm 包 + 一个 brew cask，其余五家查不到
+        // 包管理器，整条不写（空列表是诚实，猜一条 npm uninstall -g 是危险）。
+        let npm_managed = [
+            ("claude-code", "npm:@anthropic-ai/claude-code", "claude"),
+            ("codex", "npm:@openai/codex", "codex"),
+            ("gemini-cli", "npm:@google/gemini-cli", "gemini"),
+            ("omp", "npm:@oh-my-pi/pi-coding-agent", "omp"),
+            ("pi", "npm:@earendil-works/pi-coding-agent", "pi"),
+        ];
+        for (id, pkg, bin) in npm_managed {
+            let u = get(id);
+            assert_eq!(u.package.len(), 1, "{id} 应恰好一条 package 线索");
+            let p = &u.package[0];
+            assert_eq!(p.manager, PackageManager::Npm);
+            assert_eq!(p.detect, ["mise", "which", bin]);
+            assert_eq!(p.command, ["mise", "unuse", "--global", pkg]);
+        }
+
+        let brew = get("cc-switch");
+        assert_eq!(brew.package.len(), 1);
+        assert_eq!(brew.package[0].manager, PackageManager::Brew);
+        assert_eq!(
+            brew.package[0].command,
+            ["brew", "uninstall", "--cask", "cc-switch"]
+        );
+
+        for id in ["opencode", "cursor", "qoder", "kimi-cli", "copilot-cli"] {
+            assert!(
+                get(id).package.is_empty(),
+                "{id} 在本机查不到包管理器，package 必须留空"
+            );
+        }
     }
 }
