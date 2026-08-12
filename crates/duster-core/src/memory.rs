@@ -210,13 +210,29 @@ pub fn show(index_path: Option<&Path>, home: Option<&Path>, key: &str) -> Result
 
     match rowid {
         Some(id) => read_sqlite_body(&path, id),
-        None if foreign::is_sqlite(&path) => bail!(
-            "{}: SQLite memory store; use `<database>{}<rowid>` as the key (see `duster memory list`)",
-            path.display(),
-            ROWID_SEP
-        ),
+        None if foreign::is_sqlite(&path) => sqlite_store_hint(&path),
         None => codec::read_to_string_capped(&path, TITLE_READ_CAP)
             .with_context(|| format!("failed to read memory: {}", path.display())),
+    }
+}
+
+/// 裸路径指到一个 SQLite 库时的答复——**分情况**，不能一口咬定
+/// 「key 少了 rowid」。
+///
+/// 库读得出记忆（真 codex store）：确实是 key 掉了 rowid，指路补
+/// `<库路径>#<行号>`；
+/// 读不出（不是记忆库 / 锁着 / schema 不认识）：[`list`] 里那种降级条目
+/// **根本没有行号可补**，`cc-switch.db` 这类库在视图里只承担体积记账，
+/// 没有正文可看。这时按「补 rowid」去答，等于把用户带向一个不存在的行号。
+/// 如实说原因，并把用户引回 `memory list`——完整解释（warning）在那里。
+fn sqlite_store_hint(db: &Path) -> Result<String> {
+    match read_sqlite_rows(db) {
+        Ok(_) => bail!(
+            "{}: SQLite memory store; use `<database>{}<rowid>` as the key (see `duster memory list`)",
+            db.display(),
+            ROWID_SEP
+        ),
+        Err(reason) => bail!("{}: {reason} (see `duster memory list`)", db.display()),
     }
 }
 
@@ -930,6 +946,59 @@ mod tests {
             "{:?}",
             list.warnings
         );
+    }
+
+    /// 裸库路径该分情况答复：真 codex store 才指路补 `#<rowid>`，降级条目
+    /// （cc-switch.db 那类）根本没有行号可补，得说清「不是记忆库」——
+    /// regression：用户照旧提示去补一个不存在的行号。
+    #[test]
+    fn show_裸库路径按库形态分别答复() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // 真 codex store：裸路径 = key 掉了 rowid，指路补 `#<rowid>`。
+        let good = home.join(".codex/memories_1.sqlite");
+        std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+        {
+            let c = rusqlite::Connection::open(&good).unwrap();
+            c.execute_batch(
+                "CREATE TABLE stage1_outputs(
+                     thread_id TEXT PRIMARY KEY,
+                     raw_memory TEXT NOT NULL,
+                     rollout_summary TEXT NOT NULL,
+                     rollout_slug TEXT,
+                     generated_at INTEGER NOT NULL);
+                 INSERT INTO stage1_outputs VALUES ('t1', 'body', 'summary', NULL, 1700000000);",
+            )
+            .unwrap();
+        }
+        // 假 store：表不是记忆表，list 里降级成整库一条——没有行号可补。
+        let fake = home.join(".cc-switch/cc-switch.db");
+        std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+        {
+            let c = rusqlite::Connection::open(&fake).unwrap();
+            c.execute_batch("CREATE TABLE providers(a TEXT); INSERT INTO providers VALUES('x');")
+                .unwrap();
+        }
+        let db = seed(
+            home,
+            &[
+                ("codex", "memories", good.clone()),
+                ("cc-switch", "cc-switch.db", fake.clone()),
+            ],
+        );
+
+        let err = show(Some(&db), Some(home), &good.display().to_string()).unwrap_err();
+        assert!(
+            err.to_string().contains("use `<database>#<rowid>`"),
+            "{err}"
+        );
+
+        let err = show(Some(&db), Some(home), &fake.display().to_string()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stage1_outputs"), "{msg}");
+        assert!(!msg.contains("use `<database>#<rowid>`"), "{msg}");
+        assert!(msg.contains("memory list"), "{msg}");
     }
 
     /// 索引行指向的文件没了：记一条 warning，不报错、不假装它还在。
