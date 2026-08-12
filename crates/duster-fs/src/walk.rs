@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, bail};
 use jwalk::WalkDirGeneric;
@@ -31,16 +32,26 @@ pub struct WalkOptions {
 /// 目录体积统计结果。
 #[derive(Debug, Clone, Default)]
 pub struct DirStats {
-    /// 全部非目录条目（文件 + 符号链接）的字节数总和。
+    /// 全部非目录条目（文件 + 符号链接）的字节数总和。**含 prune 子树**。
     pub total_bytes: u64,
-    /// 非目录条目数量。
+    /// 落在 [`WalkOptions::prune_dirs`] 子树里的字节数，是 `total_bytes`
+    /// 的**子集**而非补集。skill 目录里的 `node_modules`/`dist` 属于
+    /// install（删了要重装），上层用 `total_bytes - pruned_bytes` 才是
+    /// 真·用户内容体积。prune_dirs 为空时恒为 0。
+    pub pruned_bytes: u64,
+    /// 非目录条目数量。**含 prune 子树**。
     pub file_count: u64,
+    /// 整棵树内全部非目录条目 mtime 的最大值（纳秒）；空树为 0。
+    ///
+    /// skill 的「上次使用」就是这个数，而不是根目录自身的 mtime——
+    /// 目录 mtime 只在直接子项增删时变，改一个深层文件它一动不动。
+    pub max_mtime_ns: i64,
     /// 一级子目录及其子树聚合体积，按字节数降序（同值按路径升序）。
     pub children: Vec<(PathBuf, u64)>,
 }
 
-/// 带每条目字节数的统计遍历器。
-type StatsWalk = WalkDirGeneric<((), Option<u64>)>;
+/// 带每条目「字节数 + mtime 纳秒」的统计遍历器。
+type StatsWalk = WalkDirGeneric<((), Option<(u64, i64)>)>;
 /// 带每条目元数据的逐文件遍历器。
 type FilesWalk = WalkDirGeneric<((), Option<Metadata>)>;
 
@@ -64,32 +75,36 @@ fn resolve_dir_root(root: &Path) -> anyhow::Result<PathBuf> {
     bail!("root path is not a directory: {}", root.display());
 }
 
-/// 并行统计 `root` 子树：总字节数、文件数、一级子目录聚合体积（降序）。
+/// 并行统计 `root` 子树：总字节数、文件数、最大 mtime、一级子目录聚合体积（降序）。
 ///
-/// prune 目录的子树同样计入聚合结果——聚合体积本就要求走完整棵子树，
-/// prune 只影响 [`walk_files`] 的逐文件上报。遍历中单条读取失败
-/// （权限不足等）跳过该条目，不中断整体统计。
+/// [`WalkOptions::prune_dirs`] **不改变** `total_bytes` / `file_count` /
+/// `children`——「这棵树有多大」要和 `du` 对得上，剪掉就成了另一个数；
+/// prune 只额外把命中子树的字节数单独记进 [`DirStats::pruned_bytes`]，
+/// 由上层决定怎么拆桶。遍历中单条读取失败（权限不足等）跳过该条目，
+/// 不中断整体统计。
 pub fn walk_stats(root: &Path, opts: &WalkOptions) -> anyhow::Result<DirStats> {
     let root = &resolve_dir_root(root)?;
-    // follow_links 恒 false、prune 不改变聚合值，opts 在此无额外分支。
-    let _ = opts;
+    // follow_links 恒 false;prune_dirs 只影响 pruned_bytes 的归属。
+    let prune: Vec<OsString> = opts.prune_dirs.iter().map(OsString::from).collect();
 
     let walker = StatsWalk::new(root)
         .follow_links(false)
         .skip_hidden(false)
         .process_read_dir(|_depth, _dir, _state, children| {
-            // 在 jwalk 的读目录线程里并行取 len，避免消费端串行 stat。
+            // 在 jwalk 的读目录线程里并行取 len+mtime,避免消费端串行 stat。
             for child in children.iter_mut().flatten() {
                 if !child.file_type.is_dir() {
                     child.client_state = std::fs::symlink_metadata(child.path())
-                        .map(|m| m.len())
+                        .map(|m| (m.len(), mtime_ns_of(&m)))
                         .ok();
                 }
             }
         });
 
     let mut total_bytes = 0u64;
+    let mut pruned_bytes = 0u64;
     let mut file_count = 0u64;
+    let mut max_mtime_ns = 0i64;
     let mut by_child: HashMap<PathBuf, u64> = HashMap::new();
 
     for entry in walker {
@@ -104,14 +119,26 @@ pub fn walk_stats(root: &Path, opts: &WalkOptions) -> anyhow::Result<DirStats> {
             }
             continue;
         }
-        let len = entry.client_state.unwrap_or(0);
+        let (len, mtime_ns) = entry.client_state.unwrap_or((0, 0));
         total_bytes += len;
         file_count += 1;
-        if entry.depth >= 2
-            && let Ok(rel) = entry.path().strip_prefix(root)
-            && let Some(first) = rel.components().next()
-        {
-            *by_child.entry(root.join(first.as_os_str())).or_insert(0) += len;
+        max_mtime_ns = max_mtime_ns.max(mtime_ns);
+        if let Ok(rel) = entry.path().strip_prefix(root) {
+            // prune 按**目录**名匹配,所以只看路径的父段,文件自身叫
+            // `dist` 不算命中。
+            if !prune.is_empty()
+                && rel.parent().is_some_and(|dirs| {
+                    dirs.components()
+                        .any(|c| prune.iter().any(|p| p.as_os_str() == c.as_os_str()))
+                })
+            {
+                pruned_bytes += len;
+            }
+            if entry.depth >= 2
+                && let Some(first) = rel.components().next()
+            {
+                *by_child.entry(root.join(first.as_os_str())).or_insert(0) += len;
+            }
         }
     }
 
@@ -120,9 +147,20 @@ pub fn walk_stats(root: &Path, opts: &WalkOptions) -> anyhow::Result<DirStats> {
 
     Ok(DirStats {
         total_bytes,
+        pruned_bytes,
         file_count,
+        max_mtime_ns,
         children,
     })
+}
+
+/// 元数据 mtime -> 纳秒;取不到(平台不支持/时钟早于纪元)记 0,不中断遍历。
+fn mtime_ns_of(meta: &Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 /// 并行遍历 `root` 子树，对每个非目录条目（文件 + 符号链接）调用
@@ -219,6 +257,96 @@ mod tests {
         assert_eq!(
             stats.children,
             vec![(root.join("node_modules"), 5000), (root.join("sub"), 2055)]
+        );
+    }
+
+    /// prune 只把字节数分流进 pruned_bytes，聚合口径一个字节都不许少。
+    #[test]
+    fn walk_stats_prune_只分流不改总量() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let expected = build_tree(root);
+
+        let opts = WalkOptions {
+            follow_links: false,
+            prune_dirs: vec!["node_modules".into()],
+        };
+        let stats = walk_stats(root, &opts).unwrap();
+
+        assert_eq!(stats.total_bytes, expected, "总量不得因 prune 缩水");
+        assert_eq!(stats.file_count, 6);
+        assert_eq!(stats.pruned_bytes, 5000, "node_modules/pkg/big.js");
+        // children 同样不受影响:它是「这棵树怎么分布」,不是「能清多少」。
+        assert_eq!(
+            stats.children,
+            vec![(root.join("node_modules"), 5000), (root.join("sub"), 2055)]
+        );
+
+        // 没声明 prune 就恒为 0——默认行为与改造前完全一致。
+        let bare = walk_stats(root, &WalkOptions::default()).unwrap();
+        assert_eq!(bare.pruned_bytes, 0);
+    }
+
+    /// prune 按目录名匹配:叫 `dist` 的**文件**不算命中。
+    #[test]
+    fn walk_stats_prune_只认目录名() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(&root.join("dist"), 64); // 同名文件
+        fs::create_dir_all(root.join("pkg/dist")).unwrap();
+        write(&root.join("pkg/dist/bundle.js"), 128);
+
+        let opts = WalkOptions {
+            follow_links: false,
+            prune_dirs: vec!["dist".into()],
+        };
+        let stats = walk_stats(root, &opts).unwrap();
+        assert_eq!(stats.total_bytes, 192);
+        assert_eq!(stats.pruned_bytes, 128, "只有 pkg/dist/ 下的才算");
+    }
+
+    /// max_mtime_ns 取树内最新文件,不是根目录自身的 mtime。
+    #[test]
+    fn walk_stats_max_mtime_取树内最新文件() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("deep/deeper")).unwrap();
+        write(&root.join("old.txt"), 10);
+        write(&root.join("deep/deeper/new.txt"), 10);
+
+        // 固定绝对时间戳,不依赖当前时钟与文件系统时间精度:
+        // old = 2001,new = 2033,而根目录自身的 mtime 是"刚才"(夹在中间)。
+        let past = UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let newest = UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+        let touch = |rel: &str, t: std::time::SystemTime| {
+            fs::File::options()
+                .write(true)
+                .open(root.join(rel))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        };
+        touch("old.txt", past);
+        touch("deep/deeper/new.txt", newest);
+
+        let stats = walk_stats(root, &WalkOptions::default()).unwrap();
+        assert_eq!(stats.max_mtime_ns, 2_000_000_000_000_000_000);
+
+        // 根目录自身的 mtime 与之无关:深层文件的改动不会传导到根。
+        let root_mtime = mtime_ns_of(&fs::metadata(root).unwrap());
+        assert!(
+            stats.max_mtime_ns > root_mtime,
+            "深层文件比根目录新,却被根目录 mtime 盖住了"
+        );
+
+        // 空树为 0。
+        let empty = tmp.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            walk_stats(&empty, &WalkOptions::default())
+                .unwrap()
+                .max_mtime_ns,
+            0
         );
     }
 

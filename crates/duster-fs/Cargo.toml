@@ -1,6 +1,6 @@
 [package]
 name = "duster-fs"
-description = "文件系统基座：并行遍历、指纹哈希、原子写、锁探测、回收站。"
+description = "文件系统基座：并行遍历、指纹哈希、原子写、锁探测、删除前归档与配置快照。"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,5 +12,9 @@ blake3 = { workspace = true }
 jwalk = { workspace = true }
 dirs = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
+tar = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
