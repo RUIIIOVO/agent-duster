@@ -4,7 +4,10 @@
 //! 全文检索使用 FTS5 `trigram` 分词器以保证 CJK 子串可搜。
 
 pub mod db;
+pub mod foreign;
+pub mod maintenance;
 pub mod meta;
+pub mod query;
 pub mod schema;
 pub mod search;
 pub mod sqlite_probe;

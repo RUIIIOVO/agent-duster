@@ -13,6 +13,15 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// 自动转全量重解析。
 pub const PARSER_EPOCH: &str = "parser_epoch";
 
+/// 技能调用证据「已采集」标记的键名。
+///
+/// 值恒为 `"1"`，由 scan 在**有会话被（重）解析**的那一轮结尾写入。
+/// 存在与否就是全部语义：旧索引升级而来、尚未重扫时 `skill_event` 是
+/// 空表，空表会读成「从没调用过」，把整机的 skill 全扫进删除计划——
+/// 「没查过」和「查过、没有」是两个事实，plan 层靠这个键区分（见
+/// `duster_core::plan` 的 skill 分支）。
+pub const SKILL_EVIDENCE_READY: &str = "skill_evidence_ready";
+
 /// 读一个键；不存在返回 `None`。
 pub fn get(conn: &Connection, key: &str) -> Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {

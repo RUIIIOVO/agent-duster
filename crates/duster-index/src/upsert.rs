@@ -36,6 +36,10 @@ pub struct ResourceRow {
     /// 清掉这一项真正能拿回的字节数；非 artifact 恒为 None。
     /// l1/l2 等于 `size`，l0 只算空洞（见 schema v3 注释）。
     pub reclaimable: Option<u64>,
+    /// 资源目录**内部**属于软件本体的字节数（skill 里的 `node_modules` /
+    /// `dist` / `bin` / `.git`）。已从 `size` 中扣除，由上层单独归入 install 桶。
+    /// 只有清单声明了 `install_paths` 的 skill 行有值（见 schema v4 注释）。
+    pub install_bytes: Option<u64>,
 }
 
 /// [`upsert_resource`] 的结果:行 id + 本次是否真的写了。
@@ -94,8 +98,8 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
 
     let rid: i64 = conn
         .query_row(
-            "INSERT INTO resource(agent_id, kind, scope, key, path, size, mtime_ns, hash_content, cheap_print, clean_level, reclaimable)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO resource(agent_id, kind, scope, key, path, size, mtime_ns, hash_content, cheap_print, clean_level, reclaimable, install_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(agent_id, kind, scope, key) DO UPDATE SET
                path = excluded.path,
                size = excluded.size,
@@ -103,7 +107,8 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
                hash_content = excluded.hash_content,
                cheap_print = excluded.cheap_print,
                clean_level = excluded.clean_level,
-               reclaimable = excluded.reclaimable
+               reclaimable = excluded.reclaimable,
+               install_bytes = excluded.install_bytes
              RETURNING rid",
             params![
                 row.agent_id,
@@ -117,12 +122,38 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
                 row.cheap_print.as_ref().map(|p| p.as_slice()),
                 row.clean_level.as_deref(),
                 row.reclaimable,
+                row.install_bytes,
             ],
             |r| r.get(0),
         )
         .with_context(|| format!("failed to upsert resource: {}/{}/{}", row.agent_id, row.kind, row.key))?;
 
     Ok(UpsertOutcome { rid, changed: true })
+}
+
+/// 设置（或清除）一条资源行的 `keep_generations`。
+///
+/// 独立于 [`upsert_resource`] 的定点 UPDATE，而不是给 [`ResourceRow`] 加字段：
+/// 全库 32 个行构造点里只有 stats-only 的 glob 分支需要写这一列，为它扩
+/// 行结构是让无关调用方都为局部需求买单。调用方（scan_stats_only）对声明了
+/// 代际的资源的**每一行**都调一次，传 `None` 即清除——清单撤掉
+/// `keep_generations` 后，下一轮 scan 把旧值清掉，plan 不会按过期声明
+/// 继续删代际。
+pub fn set_keep_generations(
+    conn: &Connection,
+    agent_id: &str,
+    kind: &str,
+    scope: &str,
+    key: &str,
+    keep: Option<u32>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE resource SET keep_generations = ?1
+         WHERE agent_id = ?2 AND kind = ?3 AND scope = ?4 AND key = ?5",
+        params![keep.map(|n| n as i64), agent_id, kind, scope, key],
+    )
+    .with_context(|| format!("failed to set keep_generations on {agent_id}/{kind}/{key}"))?;
+    Ok(())
 }
 
 /// 重建某资源(会话文件)的全部轮次:删旧 turn + fts_turn,再批量插入。
@@ -182,6 +213,35 @@ pub fn replace_turns(
 
     tx.commit()
         .context("failed to commit replace_turns transaction")
+}
+
+/// 重建某资源(会话文件)的技能调用事件:删旧行,再批量插入。
+///
+/// 与 [`replace_turns`] 同一形状与同一意图:重解析一个会话就整体替换该
+/// 会话的事件,绝不累积重复;整个替换包在一个事务里,崩溃不会留下
+/// 半新半旧的证据。`skill_event` 上没有外键之外的约束,重复解析天然幂等。
+pub fn replace_skill_events(
+    conn: &Connection,
+    rid: i64,
+    events: &[duster_model::SkillInvocation],
+) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("failed to begin replace_skill_events transaction")?;
+
+    tx.execute("DELETE FROM skill_event WHERE rid = ?1", [rid])
+        .context("failed to delete stale skill_event rows")?;
+
+    {
+        let mut ins =
+            tx.prepare("INSERT INTO skill_event(rid, skill, ts_ms) VALUES (?1, ?2, ?3)")?;
+        for ev in events {
+            ins.execute(params![rid, ev.skill, ev.ts_ms])?;
+        }
+    }
+
+    tx.commit()
+        .context("failed to commit replace_skill_events transaction")
 }
 
 /// 删除该 (agent_id, kind) 下本轮扫描没见到的旧资源行,返回删除数。
@@ -269,6 +329,7 @@ mod tests {
             cheap_print: Some(print),
             clean_level: None,
             reclaimable: None,
+            install_bytes: None,
         }
     }
 
@@ -498,5 +559,54 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(ver.as_deref(), Some("1.2.3"));
         assert_eq!(ts, 222);
+    }
+
+    /// set_keep_generations:按 (agent, kind, scope, key) 定点写值,None 即清除;
+    /// 只动目标行,别家的行不受波及。
+    #[test]
+    fn set_keep_generations_写值与清除_互不波及() {
+        let conn = open();
+        let a = upsert_resource(&conn, &row("s1", 100, [1u8; 24]))
+            .unwrap()
+            .rid;
+        let b = upsert_resource(
+            &conn,
+            &ResourceRow {
+                key: "s2".into(),
+                ..row("s1", 100, [1u8; 24])
+            },
+        )
+        .unwrap()
+        .rid;
+
+        set_keep_generations(&conn, "claude-code", "session", "global", "s1", Some(2)).unwrap();
+        let (va, vb): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT keep_generations FROM resource WHERE rid = ?1",
+                [a],
+                |r| r.get(0),
+            )
+            .and_then(|v: Option<i64>| {
+                conn.query_row(
+                    "SELECT keep_generations FROM resource WHERE rid = ?1",
+                    [b],
+                    |r| Ok((v, r.get(0)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(va, Some(2));
+        assert_eq!(vb, None, "定点写只动目标行");
+
+        // 清单撤掉声明后 scan 传 None:旧值必须被清掉,plan 不会按过期
+        // 声明继续删代际。
+        set_keep_generations(&conn, "claude-code", "session", "global", "s1", None).unwrap();
+        let v: Option<i64> = conn
+            .query_row(
+                "SELECT keep_generations FROM resource WHERE rid = ?1",
+                [a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, None, "None 清除旧值");
     }
 }
