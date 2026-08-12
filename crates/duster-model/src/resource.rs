@@ -37,8 +37,13 @@ pub enum ResourceKind {
 /// | `l1` | 可再生：缓存、日志、临时目录、运行时残留。删完 agent 照常用，内容自动重建。 | caches, logs |
 /// | `l2` | 有时效：滚动备份、归档。功能不缺，但重建有人工代价（如重新登录、重新下载）。 | stale, asks first |
 ///
+/// 级别同时决定**由哪个命令处理**：`clean` 吃 l0 + l1（可再生垃圾，真删不留副本），
+/// `prune` 吃 l2（陈旧资源，逐条列出 + 确认 + 归档后永久删除）。这不是同一命令的
+/// 三个档位——同意模型不同，见 README「三个动词」。
+///
 /// 没有更高级别：**"删了等于卸载"的东西根本不是 artifact**，
-/// 归 [`ResourceKind::Install`]，clean 永不触碰。
+/// 归 [`ResourceKind::Install`]，clean 与 prune 都永不触碰；
+/// 整体搬走只有 `duster uninstall <agent>` 一条路。
 ///
 /// 放在 model 层而不是 adapter 层：它和 [`ResourceKind`] 是同一种东西——
 /// 一张全 workspace 共享的封闭词汇表。清单解析、索引落库、CLI 展示三处

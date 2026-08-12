@@ -12,7 +12,7 @@ pub mod skill;
 pub use agent::AgentInfo;
 pub use mcp::{McpServerSpec, McpTransport};
 pub use resource::{AgentId, CleanLevel, Resource, ResourceId, ResourceKind, Scope};
-pub use session::{Role, SessionMeta, TurnRecord};
+pub use session::{Role, SessionMeta, SkillInvocation, TurnBody, TurnRecord};
 pub use skill::SkillMeta;
 
 /// 全 workspace 共享的错误类型。
