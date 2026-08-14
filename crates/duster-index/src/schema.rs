@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// 当前 schema 版本。新增迁移时递增，并在 [`migrate`] 中追加对应分支。
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// v1 全量 DDL。
 ///
@@ -144,6 +144,24 @@ CREATE TABLE skill_event(
 CREATE INDEX ix_skill_event_name ON skill_event(skill);
 ";
 
+/// v7：`resource.mapper`。
+///
+/// 清单声明的 mapper（`stats-only` / `memory/markdown` / `native/*` …）决定
+/// scan 怎么**采集**这一行，而 `memory list` 是纯读索引的（不重跑 scan、
+/// 不重解析清单），它要靠这一列把 `stats-only` 的假记忆挡在视图外——
+/// settings.json / cc-switch.db 这类行只承担体积记账，不是记忆内容。
+/// 不落库的话 list 就得回查清单，而「清单里有没有这一条」恰恰是
+/// scan 已经消化过的事实，不该在只读路径上再算一遍。
+///
+/// 可空：历史行（从 v6 就地升级而来）没有这个属性，恒为 NULL。NULL 的
+/// 语义是「未知」而不是「stats-only」——旧索引在下一轮 scan 补齐 mapper
+/// 之前，`memory list` 照旧把它们展开，绝不因升级整屏消失。
+/// 走就地 `ALTER` 而不是整库重建：v1..v6 的迁移机制就是按版本逐段 DDL，
+/// 老库原地升，代价是毫秒级（本机实测 v6→v7 仅此一条 ADD COLUMN）。
+const V7_DDL: &str = "
+ALTER TABLE resource ADD COLUMN mapper TEXT;
+";
+
 /// 把 `conn` 上的 schema 迁移到 [`SCHEMA_VERSION`]。幂等，可放心重复调用。
 pub fn migrate(conn: &Connection) -> Result<()> {
     let current: i64 = conn
@@ -190,6 +208,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             "BEGIN;\n{V6_DDL}\nPRAGMA user_version = 6;\nCOMMIT;"
         ))
         .context("failed to apply schema v6")?;
+    }
+
+    if current < 7 {
+        conn.execute_batch(&format!(
+            "BEGIN;\n{V7_DDL}\nPRAGMA user_version = 7;\nCOMMIT;"
+        ))
+        .context("failed to apply schema v7")?;
     }
 
     Ok(())
@@ -283,16 +308,19 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
-        // 既有行还在，v3/v4 新增列都存在且为 NULL（下次 scan 才会填上）。
-        let (size, level, install): (i64, Option<String>, Option<i64>) = conn
-            .query_row(
-                "SELECT size, clean_level, install_bytes FROM resource WHERE key = '~/.codex/cache'",
+        // 既有行还在，v3/v4/v7 新增列都存在且为 NULL（下次 scan 才会填上）。
+        let (size, level, install, mapper): (i64, Option<String>, Option<i64>, Option<String>) =
+            conn.query_row(
+                "SELECT size, clean_level, install_bytes, mapper FROM resource WHERE key = '~/.codex/cache'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(size, 42);
         assert_eq!(level, None);
         assert_eq!(install, None);
+        // 升级来的老行 mapper 是 NULL（未知），下一轮 scan 才补——NULL 必须
+        // 能被读出且不挡任何查询，否则整条升级路径在 v7 上就是断的。
+        assert_eq!(mapper, None);
     }
 }

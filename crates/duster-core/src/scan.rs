@@ -450,6 +450,7 @@ fn scan_db_sessions(
             clean_level: None,
             reclaimable: None,
             install_bytes: None,
+            mapper: Some(r.mapper.as_str().to_string()),
         };
         let outcome = upsert::upsert_resource(idx.conn(), &row)?;
         seen.push(key);
@@ -545,6 +546,7 @@ fn scan_mcp(
             clean_level: None,
             reclaimable: None,
             install_bytes: None,
+            mapper: Some(r.mapper.as_str().to_string()),
         };
         upsert::upsert_resource(idx.conn(), &row)
             .with_context(|| format!("failed to upsert mcp `{}`", s.name))?;
@@ -559,7 +561,7 @@ fn scan_mcp(
 /// size 记的是**用户内容**体积:清单声明的 `install_paths`(`node_modules`
 /// / `dist` / `bin` / `.git`)属于软件本体,单独记进 `install_bytes`。
 /// mtime 取子树内最新文件而非目录自身——skill 的「上次使用」定义如此。
-/// hash 留空——目录树哈希开销大,到 `skill copies` 才按需计算。
+/// hash 留空——目录树哈希开销大,到 `skill list` 才按需计算。
 fn scan_skills(
     idx: &Index,
     agent_id: &str,
@@ -597,37 +599,46 @@ fn scan_skills(
         } else {
             s.name.clone()
         };
-        let result = (|| -> Result<()> {
-            let stats = walk_stats(&s.root, &opts)?;
-            // 没声明 install_paths 就是 None,而不是 Some(0):
-            // None = 这条资源没分过桶,Some(0) = 分过桶但里面确实没东西。
-            // 上层("这个 skill 有多少是装出来的")靠这个区分未知与零。
-            let install_bytes = declared_install.then_some(stats.pruned_bytes);
-            let size = stats.total_bytes - stats.pruned_bytes;
-            let row = ResourceRow {
-                agent_id: agent_id.to_string(),
-                kind: "skill".to_string(),
-                scope: scope_str(r.scope).to_string(),
-                key: key.clone(),
-                path: s.root.display().to_string(),
-                size,
-                mtime_ns: stats.max_mtime_ns,
-                hash_content: None,
-                cheap_print: None,
-                clean_level: None,
-                reclaimable: None,
-                install_bytes,
-            };
-            upsert::upsert_resource(idx.conn(), &row)?;
-            seen.push(key.clone());
-            report.tally("skill", size, None, stats.pruned_bytes);
-            Ok(())
-        })();
-        if let Err(e) = result {
-            report
-                .warnings
-                .push(format!("failed to collect stats for skill `{key}`: {e:#}"));
-        }
+        // 悬空软链(目标目录已删)walk_stats 会解析不了根路径而报错。这份
+        // "副本"**仍然必须入库**:它是 claude 启动时当真会去加载却失败的一项,
+        // status 体检已删,`skill list` 是唯一出口;静默跳过或整体失败都会让
+        // 用户永远看不见它。size 0 / install_bytes None 是"量不出来"的最诚实
+        // 表达——None 而非 Some(0):不是"分过桶且桶里没东西",是根本没量到。
+        // 行照样 seen + tally,下一轮 scan 才不会被当 stale 清掉。
+        let (size, install_bytes, mtime_ns) = match walk_stats(&s.root, &opts) {
+            Ok(stats) => {
+                // 没声明 install_paths 就是 None,而不是 Some(0):
+                // None = 这条资源没分过桶,Some(0) = 分过桶但里面确实没东西。
+                // 上层("这个 skill 有多少是装出来的")靠这个区分未知与零。
+                let install_bytes = declared_install.then_some(stats.pruned_bytes);
+                let size = stats.total_bytes - stats.pruned_bytes;
+                (size, install_bytes, stats.max_mtime_ns)
+            }
+            Err(e) => {
+                report.warnings.push(format!(
+                    "failed to collect stats for skill `{key}` (indexed at size 0): {e:#}"
+                ));
+                (0, None, 0)
+            }
+        };
+        let row = ResourceRow {
+            agent_id: agent_id.to_string(),
+            kind: "skill".to_string(),
+            scope: scope_str(r.scope).to_string(),
+            key: key.clone(),
+            path: s.root.display().to_string(),
+            size,
+            mtime_ns,
+            hash_content: None,
+            cheap_print: None,
+            clean_level: None,
+            reclaimable: None,
+            install_bytes,
+            mapper: Some(r.mapper.as_str().to_string()),
+        };
+        upsert::upsert_resource(idx.conn(), &row)?;
+        seen.push(key.clone());
+        report.tally("skill", size, None, install_bytes.unwrap_or(0));
     }
     Ok(())
 }
@@ -660,6 +671,7 @@ fn scan_memory(
         clean_level: None,
         reclaimable: None,
         install_bytes: None,
+        mapper: Some(r.mapper.as_str().to_string()),
     };
     upsert::upsert_resource(idx.conn(), &row)?;
     seen.push(key);
@@ -772,6 +784,7 @@ fn index_session_file(
         clean_level: None,
         reclaimable: None,
         install_bytes: None,
+        mapper: Some(r.mapper.as_str().to_string()),
     };
     let outcome = upsert::upsert_resource(idx.conn(), &row)?;
     seen.push(key);
@@ -888,6 +901,7 @@ fn scan_stats_only(
         clean_level: level.map(|l| l.as_str().to_string()),
         reclaimable,
         install_bytes: None,
+        mapper: Some(r.mapper.as_str().to_string()),
     };
     upsert::upsert_resource(idx.conn(), &row)?;
     upsert::set_keep_generations(
@@ -974,6 +988,7 @@ fn scan_stats_glob(
             clean_level: level.map(|l| l.as_str().to_string()),
             reclaimable,
             install_bytes: None,
+            mapper: Some(r.mapper.as_str().to_string()),
         };
         upsert::upsert_resource(idx.conn(), &row)?;
         upsert::set_keep_generations(
@@ -1819,6 +1834,77 @@ install_paths = ["node_modules"]
         })
         .unwrap();
         assert_eq!(skill_row(&bare_index, "heavy"), (md + BLOB, None));
+    }
+
+    /// 悬空软链 skill(目标目录已删)必须照常入库:size 0、install_bytes None,
+    /// 并记一条 warning。它是 claude 启动时当真会去加载却失败的一项,
+    /// status 体检已删,`skill list` 是唯一出口——索引里没有这一行,
+    /// `skill list` 再聪明也看不见它。
+    #[test]
+    fn 悬空软链_skill_以_0_字节入库_不中断_scan() {
+        let home = TempHome::new("skilldangling");
+        put_manifest(home.path(), "skl-agent", SKILL_MANIFEST);
+        let skills = home.path().join(".skl/skills");
+        put_skill(&skills, "dir-a", "real-skill");
+        // 指向不存在目标的软链:发现阶段按目录项名产出,统计阶段量不出体积。
+        std::os::unix::fs::symlink(
+            home.path().join("gone-target"),
+            skills.join("bark-notify"),
+        )
+        .unwrap();
+
+        let index_path = home.path().join(".agent-duster/index.db");
+        let report = scan(&ScanOptions {
+            home: Some(home.path().to_path_buf()),
+            index_path: Some(index_path.clone()),
+            full: false,
+        })
+        .unwrap();
+        let a = report
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "skl-agent")
+            .expect("报告里应有 skl-agent");
+
+        // 行必须入库:两行都算 skill,不能因为一根悬空链塌成一行或整轮失败。
+        assert_eq!(a.kind_counts.get("skill"), Some(&2), "{a:#?}");
+        assert_eq!(a.resources, 2);
+        // 量不出来 = 0 字节入账,不是 Some(0)("分过桶但桶里没东西"是谎话)。
+        assert_eq!(skill_row(&index_path, "bark-notify"), (0, None));
+        assert_eq!(skill_row(&index_path, "real-skill").0 > 0, true);
+        // 悬空链必须在场,路径就是软链本身(skill list 靠它判 broken)。
+        let idx = Index::open_readonly(&index_path).unwrap();
+        let path: String = idx
+            .conn()
+            .query_row(
+                "SELECT path FROM resource WHERE kind = 'skill' AND key = 'bark-notify'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(path.ends_with("/bark-notify"), "path 串了: {path}");
+
+        // 记了 warning 但行没丢;整次扫描成功,没把 agent 拖垮。
+        assert!(
+            a.warnings
+                .iter()
+                .any(|w| w.contains("bark-notify") && w.contains("size 0")),
+            "warnings: {:?}",
+            a.warnings
+        );
+
+        // 二次扫描:行仍被 seen,不被 delete_stale_resources 清掉。
+        scan(&ScanOptions {
+            home: Some(home.path().to_path_buf()),
+            index_path: Some(index_path.clone()),
+            full: false,
+        })
+        .unwrap();
+        assert_eq!(
+            skill_keys(&index_path),
+            ["bark-notify", "real-skill"],
+            "悬空行在下一轮必须还在"
+        );
     }
 
     /// skill 的 mtime 取子树内最新文件,不是目录自身的 mtime。

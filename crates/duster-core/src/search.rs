@@ -8,7 +8,7 @@
 //! 取回来还得按 agent 抽成可读散文,否则印给用户的就是原始 JSONL 行。
 
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -16,6 +16,8 @@ use serde::Serialize;
 use duster_index::db::Index;
 use duster_index::search::TurnHit;
 use duster_model::TurnBody;
+
+use crate::freshness;
 
 pub use duster_index::search::SearchFilter;
 
@@ -27,6 +29,13 @@ const WINDOW_CHARS: usize = 80;
 
 /// 定位失败时的降级窗口:行首 char 数。
 const FALLBACK_WINDOW_CHARS: usize = 160;
+
+/// 折叠视图保留的正文行数上限,超过即截断——[`TurnDetail::has_more`] 的
+/// 判定必须与渲染层的截断规则用同一把尺子。渲染常量在 CLI 的
+/// `cmd::session::TURN_BODY_MAX_LINES`(40 行),两处是同一个数,改渲染
+/// 阈值时必须同步;判定放 core 是为了让外壳不渲染全文就能知道
+/// 「有没有第二档」。
+const TURN_FOLD_MAX_LINES: usize = 40;
 
 /// 一条检索命中。
 pub struct SearchHit {
@@ -44,18 +53,9 @@ pub struct SearchHit {
     pub highlights: Vec<(usize, usize)>,
 }
 
-/// 解析索引库路径并只读打开。库不存在时给人话提示,引导先跑 `duster scan`。
+/// 解析索引库路径并只读打开;库还没建过就先建一次(见 [`crate::freshness`])。
 fn open_index(index_path: Option<&Path>) -> Result<Index> {
-    let path: PathBuf = match index_path {
-        Some(p) => p.to_path_buf(),
-        None => duster_fs::path::expand_tilde("~/.agent-duster/index.db"),
-    };
-    if !path.is_file() {
-        bail!(
-            "index database not found: {}. Run `duster scan` first to build it.",
-            path.display()
-        );
-    }
+    let path = freshness::ensure_exists(index_path)?;
     Index::open_readonly(&path)
         .with_context(|| format!("failed to open index read-only: {}", path.display()))
 }
@@ -122,6 +122,11 @@ pub struct TurnDetail {
     pub tool: Option<String>,
     /// true = `text` 是原始行兜底(抽取失败),外壳必须明示而不是假装散文。
     pub raw_fallback: bool,
+    /// true = 折叠视图与 `--full` 全文不同:工具轮会被折叠成一行,或正文
+    /// 超过 [`TURN_FOLD_MAX_LINES`] 行被截断。外壳据此决定「read in full」
+    /// 这个动作该不该出现——折叠==全文时再给第二个按钮,按下去只会把
+    /// 同一屏原样打第二遍。
+    pub has_more: bool,
 }
 
 /// 按 tid 取轮次详情,并按索引里的 `(byte_off, byte_len)` 从源文件回读正文。
@@ -131,7 +136,7 @@ pub struct TurnDetail {
 ///
 /// - tid 不存在 → 报错(提示用 `duster search` 找有效 tid);
 /// - 源文件已删/截短/改写导致回读失败 → 报错说明(索引是派生物,
-///   源文件才是事实,重跑 `duster scan` 可修正)。
+///   源文件才是事实;重扫救不回已经没了的字节,只能去看那个文件)。
 pub fn open_turn(index_path: Option<&Path>, tid: i64) -> Result<TurnDetail> {
     let idx = open_index(index_path)?;
     let conn = idx.conn();
@@ -166,21 +171,31 @@ pub fn open_turn(index_path: Option<&Path>, tid: i64) -> Result<TurnDetail> {
     let body =
         read_turn_body(&agent_id, &resource_path, byte_off, byte_len).with_context(|| {
             format!(
-                "failed to read back the turn from {resource_path} (the source may have been \
-             deleted, truncated, or rewritten; the index is derived data — rerun \
-             `duster scan` to repair)"
+                "failed to read back the turn from {resource_path} (the source was \
+             deleted, truncated, or rewritten outside duster; re-scanning cannot bring \
+             the text back — check that file)"
             )
         })?;
 
+    let role = role.unwrap_or_default();
+    // 判定先算:它借用 body.text,而 text 字段马上要把正文搬进结构体。
+    let has_more = turn_has_more(&role, &body.text);
     Ok(TurnDetail {
         resource_path,
         agent_id,
         seq: seq.unwrap_or_default(),
-        role: role.unwrap_or_default(),
+        role,
         text: body.text,
         tool: body.tool,
         raw_fallback: body.raw_fallback,
+        has_more,
     })
+}
+
+/// 折叠视图是不是全文:工具轮(折叠成一行)或正文超过折叠行数上限。
+/// 单独成函数:判定与渲染共用同一把尺子,测试直接喂 role + text 验。
+fn turn_has_more(role: &str, text: &str) -> bool {
+    role == "tool" || text.lines().count() > TURN_FOLD_MAX_LINES
 }
 
 /// 回读一条轮次的正文。**全 workspace 唯一的回读入口**——
@@ -367,6 +382,7 @@ mod tests {
     use super::*;
     use duster_index::upsert::{self, ResourceRow};
     use duster_model::{Role, TurnRecord};
+    use std::path::PathBuf;
 
     /// 会话正文前面刻意留一行控制记录:`byte_off` 因此非零,回读必须真的定位,
     /// 而不是"整个文件读出来正好对上"。
@@ -395,6 +411,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();
@@ -463,6 +480,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();
@@ -542,15 +560,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 库不存在不再是错误:自己建一个,搜出空结果。
+    /// 「先去建索引」这个前置动作已经不属于用户了。
     #[test]
-    fn search_库不存在时提示先跑_scan() {
-        let missing = std::env::temp_dir().join(format!(
-            "duster-core-search-miss-{}/nope.db",
-            std::process::id()
-        ));
-        // SearchHit 未派生 Debug,unwrap_err 用不了;走 Option 通道取错误。
-        let err = search(Some(&missing), "hello", &all()).err().unwrap();
-        assert!(err.to_string().contains("duster scan"), "{err:#}");
+    fn search_库不存在时自动建库而不报错() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index = tmp.path().join(".agent-duster").join("index.db");
+
+        let hits = search(Some(&index), "hello", &all()).unwrap();
+        assert!(index.is_file(), "库该被建出来");
+        assert!(hits.is_empty(), "空 home 里搜不出东西");
     }
 
     #[test]
@@ -643,6 +662,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();
@@ -744,5 +764,74 @@ mod tests {
         let (snippet, highlights) = make_snippet(text, r#""引号" 与 *"#);
         let (s, e) = highlights[0];
         assert_eq!(&snippet[s..e], r#""引号" 与 *"#);
+    }
+
+    /// 折叠==全文的判定:工具轮恒有第二档(折叠成一行);正文行数在
+    /// 40 行以内折叠不截断(折叠==全文,没有第二档),超过 40 行折叠会
+    /// 截断(有第二档)。这条是「read this turn in full」动作去留的依据,
+    /// 判定错了菜单就会给一个按下去原样打第二遍的按钮。
+    #[test]
+    fn 折叠是否全文_按role与行数判定() {
+        assert!(turn_has_more("tool", "哪怕正文只有一行"), "工具轮恒折叠");
+        assert!(!turn_has_more("assistant", "只有一行"), "短正文不截断");
+        assert!(!turn_has_more("assistant", &"x\n".repeat(40)), "恰好 40 行不截断");
+        assert!(turn_has_more("assistant", &"x\n".repeat(41)), "超过 40 行截断");
+        assert!(!turn_has_more("assistant", ""), "空正文没有第二档");
+    }
+
+    /// `has_more` 经 `open_turn` 走通:短正文折叠==全文(false);超过折叠
+    /// 行数上限的长正文折叠会截断(true)。纯函数判定另测(见
+    /// 「折叠是否全文_按role与行数判定」),这里验的是字段真的随数据出来。
+    #[test]
+    fn open_turn_has_more_随正文长度出来() {
+        // 41 行正文:折叠视图只留前 40 行,于是有第二档。
+        let long: String = (0..41).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("session.jsonl");
+        std::fs::write(&src, format!("{PREFIX}{long}")).unwrap();
+        let db = dir.path().join("index.db");
+        let idx = Index::open(&db).unwrap();
+        let outcome = upsert::upsert_resource(
+            idx.conn(),
+            &ResourceRow {
+                agent_id: "claude".into(),
+                kind: "session".into(),
+                scope: "user".into(),
+                key: "session.jsonl".into(),
+                path: src.to_string_lossy().into_owned(),
+                size: (PREFIX.len() + long.len()) as u64,
+                mtime_ns: 0,
+                hash_content: None,
+                cheap_print: None,
+                clean_level: None,
+                reclaimable: None,
+                install_bytes: None,
+                mapper: None,
+            },
+        )
+        .unwrap();
+        upsert::replace_turns(
+            idx.conn(),
+            outcome.rid,
+            &[TurnRecord {
+                seq: 0,
+                role: Role::User,
+                ts_ms: None,
+                byte_off: PREFIX.len() as u64,
+                byte_len: long.len() as u64,
+                text: long.clone(),
+            }],
+        )
+        .unwrap();
+        drop(idx); // 释放写锁,让被测函数走只读路径。
+
+        // 全新库里第一条 turn 的 rowid 必为 1(与 roundtrip 那条同一约定)。
+        let d = open_turn(Some(&db), 1).unwrap();
+        assert!(d.has_more, "41 行正文折叠必截断");
+
+        // 短正文:折叠不截断,没有第二档。
+        let (_, db_short, _) = build_fixture("has-more-short");
+        let d_short = open_turn(Some(&db_short), 1).unwrap();
+        assert!(!d_short.has_more, "两行正文折叠==全文");
     }
 }

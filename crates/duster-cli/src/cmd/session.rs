@@ -23,15 +23,18 @@ use std::path::{Path, PathBuf};
 
 use clap::{Subcommand, ValueEnum};
 use console::style;
-use duster_core::plan::{PlanFilter, parse_older_than};
+use duster_core::delete::{DeleteOptions, DeleteReport};
+use duster_core::plan::parse_older_than;
 use duster_core::session::{
     self, ExportFormat, SessionDetail, SessionFilter, SessionPruneOptions, SessionRow,
 };
+use duster_core::session_migrate::{self, MigrateOptions, MigrateReport};
+use duster_fs::path::display_tilde;
 use serde::Serialize;
 
 use crate::output::{
-    EXIT_CONFIRM_DENIED, EXIT_ERROR, EXIT_OK, OutputMode, Table, accent, display_width, emit_json,
-    human_bytes, muted, ok_mark, truncate_width,
+    EXIT_OK, EXIT_PARTIAL, OutputMode, Table, accent, display_width, emit_json, human_bytes,
+    muted, ok_mark, truncate_width, warn_mark,
 };
 
 /// 列表默认只印这么多行。0 = 全部。
@@ -81,6 +84,18 @@ pub enum SessionCmd {
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
+    /// Plant a text-only copy of one conversation into another agent (lossy)
+    Migrate {
+        /// Conversation id from the ID column of `duster session list`, e.g. s42 or 42
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Where to plant it: claude-code, codex or omp
+        #[arg(long, value_name = "AGENT")]
+        to: String,
+        /// Show what would be written and stop
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Compress conversations you stopped using a while ago (content is kept)
     Prune {
         /// Only these agents, comma separated, e.g. --agent codex,omp
@@ -102,6 +117,19 @@ pub enum SessionCmd {
         #[arg(long)]
         yes: bool,
         /// Print the plan and stop (this is also what happens without --yes)
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete one conversation, after packing a readable copy into
+    /// ~/agent-duster-exports (a conversation is a chat log; once gone it is gone)
+    Rm {
+        /// Conversation id from the ID column of `duster session list`, e.g. s42 or 42
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Delete without packing a copy first (for scripts)
+        #[arg(long)]
+        no_archive: bool,
+        /// Print what would be deleted and stop
         #[arg(long)]
         dry_run: bool,
     },
@@ -148,6 +176,9 @@ pub fn run(mode: OutputMode, index: Option<&Path>, action: SessionCmd) -> i32 {
         SessionCmd::Export { rid, format, out } => {
             run_export(mode, index, rid, format, out.as_deref())
         }
+        SessionCmd::Migrate { id, to, dry_run } => {
+            run_migrate(mode, index, None, &id, &to, dry_run)
+        }
         SessionCmd::Prune {
             agents,
             older_than,
@@ -168,6 +199,9 @@ pub fn run(mode: OutputMode, index: Option<&Path>, action: SessionCmd) -> i32 {
                 execute: crate::consent_of(yes, dry_run) == crate::Consent::Granted,
             },
         ),
+        SessionCmd::Rm { id, no_archive, dry_run } => {
+            run_rm(mode, index, None, &id, no_archive, dry_run)
+        }
     }
 }
 
@@ -201,15 +235,24 @@ fn run_list(mode: OutputMode, index: Option<&Path>, args: ListArgs) -> i32 {
         limit: args.limit,
         now_ms: None,
     };
-    let rows = match session::list(index, &filter) {
-        Ok(r) => r,
+    let list = match session::list(index, &filter) {
+        Ok(l) => l,
         Err(e) => return crate::fail(mode, "session-list", &e),
     };
     match mode {
-        OutputMode::Json => emit_json("session-list", &rows, &[]),
-        OutputMode::Human => println!("{}", render_list(&rows)),
+        OutputMode::Json => emit_json("session-list", &list.rows, &list.warnings),
+        OutputMode::Human => {
+            println!("{}", render_list(&list.rows));
+            crate::render_warnings(&list.warnings);
+        }
     }
-    EXIT_OK
+    // 有 warning 意味着某场会话的源库打不开，这张表是**不全**的——
+    // 按 output.rs 的口径那是部分成功，不是成功（与 memory list 同一条规矩）。
+    if list.warnings.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_PARTIAL
+    }
 }
 
 /// 列表表格 + 一行合计。整块返回而不是边算边印:这样它能被测试逐字核对。
@@ -226,11 +269,13 @@ fn render_list(rows: &[SessionRow]) -> String {
     t.color_col(0, accent());
     // ID / TURNS / SIZE 是数字列。SIZE 带 `zst` 后缀时也右对齐——
     // 单位和标记一起贴着右边缘,数字仍然在同一条竖线上。
+    // ID 带 `s` 前缀(会话 id,与 search 的 `t<tid>` 区分开),列宽照旧
+    // 交给 Table 按 display_width 算,右对齐口径不用手调。
     t.right_align(&[0, 3, 4]);
     t.color_col(5, muted());
     for r in rows {
         t.push_row(vec![
-            r.rid.to_string(),
+            format!("s{}", r.rid),
             r.agent_id.clone(),
             project_cell(r.cwd.as_deref()),
             r.turns.to_string(),
@@ -257,7 +302,7 @@ fn render_list(rows: &[SessionRow]) -> String {
 /// cwd 是 None 时印占位横杠。**不从会话文件名反推**——Claude 的目录名
 /// `-Users-me-proj` 是不可逆编码,反推出来的路径有一半是错的,而用户会拿
 /// 这一列决定删哪场会话。
-fn project_cell(cwd: Option<&str>) -> String {
+pub(crate) fn project_cell(cwd: Option<&str>) -> String {
     let Some(cwd) = cwd else {
         return "-".to_string();
     };
@@ -272,7 +317,7 @@ fn project_cell(cwd: Option<&str>) -> String {
 
 /// 体积列。已压缩的带一个 `zst` 标记:prune 已经动过它了,而它照样读得出来——
 /// 不标出来,用户会以为这场会话还没被处理过,又跑一次 prune 找不到收益。
-fn size_cell(bytes: u64, compressed: bool) -> String {
+pub(crate) fn size_cell(bytes: u64, compressed: bool) -> String {
     if compressed {
         format!("{} zst", human_bytes(bytes))
     } else {
@@ -557,6 +602,101 @@ fn run_export(
 }
 
 // ---------------------------------------------------------------------------
+// migrate
+// ---------------------------------------------------------------------------
+
+/// `s42` / `42` -> 42。前缀只认小写 `s`(与 `session list` 印出来的一字不差),
+/// 数字只认纯 ASCII 十进制——与 `main.rs` 的 `parse_open_id` 同一套判据,
+/// 但这里没有轮次空间:migrate 只收会话 id,`t42` 也该死在这里。
+fn parse_rid(s: &str) -> Result<i64, String> {
+    let raw = s.trim();
+    let rest = match raw.as_bytes().first() {
+        Some(b's') => &raw[1..],
+        _ => raw,
+    };
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "invalid conversation id {s:?}: expected s<number> or a bare <number> \
+             from the ID column of `duster session list`, e.g. s42 or 42"
+        ));
+    }
+    rest.parse().map_err(|_| {
+        format!("invalid conversation id {s:?}: number is out of range")
+    })
+}
+
+/// `duster session migrate`:有损文本移植,全部业务在
+/// [`duster_core::session_migrate`]。这里只翻旗标、渲染回执、映射退出码。
+///
+/// `home` 只给测试注入:真实运行恒为 None(= 真实用户主目录),否则移植
+/// 会落到两个地方。
+fn run_migrate(
+    mode: OutputMode,
+    index: Option<&Path>,
+    home: Option<&Path>,
+    id: &str,
+    to: &str,
+    dry_run: bool,
+) -> i32 {
+    let rid = match parse_rid(id) {
+        Ok(r) => r,
+        Err(msg) => return crate::fail(mode, "session-migrate", &anyhow::anyhow!(msg)),
+    };
+    let report = match session_migrate::migrate(
+        index,
+        &MigrateOptions {
+            rid,
+            to: to.to_string(),
+            dry_run,
+            home: home.map(Path::to_path_buf),
+            now_ms: None,
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => return crate::fail(mode, "session-migrate", &e),
+    };
+    match mode {
+        OutputMode::Json => emit_json("session-migrate", &report, &[]),
+        OutputMode::Human => print!("{}", render_migrate(&report)),
+    }
+    EXIT_OK
+}
+
+/// 迁移回执的人读排版。整块返回而不是边算边印:这样它能被测试逐字核对
+/// (与 [`render_list`] 同一个理由)。
+///
+/// 两行:第一行是结果(种了几轮、种到哪),第二行明说这是**有损**副本——
+/// 「工具调用没带过去」必须印出来,用户拿这份副本去目标 agent 续聊时,
+/// 不该被上下文缺口吓一跳。丢弃数为 0 时不印括号:没有丢东西就不暗示丢了。
+fn render_migrate(report: &MigrateReport) -> String {
+    let target = display_tilde(Path::new(&report.target));
+    let dropped = match report.tool_turns_dropped {
+        0 => String::new(),
+        n => format!(" ({} dropped)", crate::plural(n, "tool turn")),
+    };
+    if report.dry_run {
+        format!(
+            "  {} {} into {}{}\n  {}\n",
+            muted().apply_to("would plant"),
+            style(crate::plural(report.turns_planted, "text turn")).bold(),
+            accent().apply_to(&target),
+            muted().apply_to(&dropped),
+            muted().apply_to("a text-only copy — tool calls are not carried over; drop --dry-run to write it")
+        )
+    } else {
+        format!(
+            "  {} {} {} into {}{}\n  {}\n",
+            ok_mark(),
+            muted().apply_to("planted"),
+            style(crate::plural(report.turns_planted, "text turn")).bold(),
+            accent().apply_to(&target),
+            muted().apply_to(&dropped),
+            muted().apply_to("a text-only copy — tool calls are not carried over; run `duster scan` to index it")
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // prune
 // ---------------------------------------------------------------------------
 
@@ -641,105 +781,106 @@ fn run_prune(mode: OutputMode, index: Option<&Path>, home: Option<&Path>, args: 
     crate::exec_exit_code(report.executed, failures)
 }
 
-/// 菜单版 `session prune`:阈值、范围、归档已经在菜单里问完(参数由
-/// `interactive.rs` 递进来),这里出计划 → 勾选确认 → 执行,渲染复用
-/// [`run_prune`] 那一套,一行都不新写。
+// ---------------------------------------------------------------------------
+// rm
+// ---------------------------------------------------------------------------
+
+/// `duster session rm`：归档后删除一场会话。全部业务在
+/// [`duster_core::session::remove`]——先归档后删、库型会话走适配器删库行、
+/// 删完清索引，都在那边。这里只翻旗标、渲染回执、映射退出码。
 ///
-/// 早先菜单不走勾选表,只有「全做 / 全不做」两个答案,而且那条通用路径
-/// 靠退出码 4 做控制流——两条罪状一起删了:同一张计划不该有两种权力,
-/// `clean` / `prune` 能留下一两条,会话也该能。所以这里也走勾选表。
+/// 归档默认开（会话是聊天记录，删了就没了）；`--no-archive` 是脚本用的
+/// 显式关闭。`--dry-run` 只报将删什么，一个字节都不动。
 ///
-/// `SessionPruneOptions.json` 恒 `false`:菜单只在 TTY 下存在,不存在
-/// JSON 输出这回事。`yes` 与 `dry_run` 的关系照抄 `cmd_prune` 的
-/// `build(execute)`:预览 = `dry_run: true` / `yes: false`,执行 =
-/// `dry_run: false` / `yes: true`,两者同源,不会背离。
-pub(crate) fn run_prune_interactive(
+/// `home` 只给测试注入：真实运行恒为 None（= 真实用户主目录），否则归档
+/// 会落到两个地方。
+fn run_rm(
     mode: OutputMode,
     index: Option<&Path>,
-    age: String,
-    agents: Vec<String>,
-    archive: bool,
+    home: Option<&Path>,
+    id: &str,
+    no_archive: bool,
+    dry_run: bool,
 ) -> i32 {
-    // 阈值在菜单问句里已经过 parse_older_than 校验,这里再解析一次只是
-    // 要拿到天数;理论到不了这里,失败仍按用法错误收场。
-    let days = match parse_older_than(&age) {
-        Ok(d) => d,
-        Err(e) => {
-            return crate::usage(mode, "session-prune", &format!("--older-than {age}: {e:#}"));
-        }
-    };
-    let build = |execute: bool| SessionPruneOptions {
-        index_path: index.map(Path::to_path_buf),
-        home: None,
-        agents: agents.clone(),
-        older_than_days: days,
-        export_first: false,
-        export_dir: None,
-        // 菜单里归档是当场问出来的,恒有表态。
-        archive: Some(archive),
-        dry_run: !execute,
-        yes: execute,
-        json: false,
-        now_ms: None,
-    };
-
-    // 先出计划:默认过滤器(不过滤),菜单要看到整张清单再勾。
-    let plan_report = match session::prune_filtered(&build(false), &PlanFilter::default()) {
+    let rid = match parse_rid(id) {
         Ok(r) => r,
-        Err(e) => return crate::fail(mode, "session-prune", &e),
+        Err(msg) => return crate::fail(mode, "session-rm", &anyhow::anyhow!(msg)),
     };
-
-    match crate::interactive::approve_prune_plan(&plan_report.plan) {
-        crate::interactive::PlanApproval::Run(allow) => {
-            // 执行时只放行勾过的路径:批准与执行之间计划会重算,白名单下
-            // 重算新冒出来的项不在里面,自然被挡在外面——用户从没见过
-            // 的东西不会被执行。
-            let report = match session::prune_filtered(&build(true), &PlanFilter::allow_only(allow))
-            {
-                Ok(r) => r,
-                Err(e) => return crate::fail(mode, "session-prune", &e),
-            };
-            let failures = report.outcomes.iter().filter(|o| o.error.is_some()).count();
-            if mode == OutputMode::Human {
-                let warnings = crate::merge_warnings(&report.plan.warnings, &report.warnings);
-                crate::render_archive(report.archive_path.as_deref(), report.archive_bytes);
-                crate::render_prune_outcomes(&report.outcomes);
-                if report.executed {
-                    println!();
-                    println!(
-                        "  {} {} {}",
-                        ok_mark(),
-                        style(human_bytes(report.freed_bytes)).green().bold(),
-                        muted().apply_to(
-                            "freed — the compressed conversations still read back as before"
-                        )
-                    );
-                }
-                // 没执行成的边缘情况(如 core 拒绝)与预览同口径收尾。
-                let next = format!("duster session prune --older-than {days}d --yes");
-                let hint = (!report.executed).then(|| crate::not_done_hint(false, &next));
-                crate::finish_human(&warnings, hint.as_deref());
-            }
-            crate::exec_exit_code(report.executed, failures)
-        }
-        // 什么都没动:与 clean / prune 的勾选表同一个收场(退出码 4)。
-        crate::interactive::PlanApproval::No => {
-            if mode == OutputMode::Human {
-                // 预览报告里的 warnings 也带上:与 clean / prune 被拒时一致,
-                // 「索引陈旧」这类提示不会因为用户没勾而吞掉。
-                let warnings =
-                    crate::merge_warnings(&plan_report.plan.warnings, &plan_report.warnings);
-                let next = format!("duster session prune --older-than {days}d --yes");
-                crate::finish_human(&warnings, Some(&crate::not_done_hint(true, &next)));
-            }
-            EXIT_CONFIRM_DENIED
-        }
-        // 计划本身就空:用户没被问过任何问题,勾选表已经自己印过
-        // "Nothing to do…"。这里既不说「你说了不」,也不落 4——与命令行
-        // `--yes` 撞上空计划一样,成功地什么都不用做。
-        crate::interactive::PlanApproval::Nothing => EXIT_OK,
-        crate::interactive::PlanApproval::Aborted => EXIT_ERROR,
+    let report = match duster_core::session::remove(
+        &DeleteOptions {
+            index_path: index.map(Path::to_path_buf),
+            home: home.map(Path::to_path_buf),
+            archive: !no_archive,
+            dry_run,
+        },
+        &[rid],
+    ) {
+        Ok(r) => r,
+        Err(e) => return crate::fail(mode, "session-rm", &e),
+    };
+    match mode {
+        OutputMode::Json => emit_json("session-rm", &report, &report.warnings),
+        OutputMode::Human => print!("{}", render_rm(&report, dry_run)),
     }
+    crate::render_warnings(&report.warnings);
+    if report.warnings.is_empty() {
+        EXIT_OK
+    } else {
+        // 有条没删成（源库锁住、读不出内容）→ 部分成功。
+        EXIT_PARTIAL
+    }
+}
+
+/// 删除回执的人读排版。整块返回而不是边算边印：这样它能被测试逐字核对。
+///
+/// 干跑与真跑分行文：预览说 `would delete` 并把归档去处也预告出来；
+/// 真跑说 `deleted` + 释放字节，归档包路径必须亮出来——那是用户唯一的退路。
+fn render_rm(report: &DeleteReport, dry_run: bool) -> String {
+    let mut out = format!(
+        "\n  {} {} {}\n",
+        if dry_run { warn_mark() } else { ok_mark() },
+        style(if dry_run {
+            format!(
+                "would delete {} · {}",
+                crate::plural(report.removed.len(), "conversation"),
+                human_bytes(report.freed_bytes)
+            )
+        } else {
+            format!(
+                "deleted {} · {} freed",
+                crate::plural(report.removed.len(), "conversation"),
+                human_bytes(report.freed_bytes)
+            )
+        })
+        .bold(),
+        muted().apply_to(
+            report
+                .removed
+                .iter()
+                .map(|p| display_tilde(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    );
+    match (&report.archived, dry_run) {
+        (Some(archived), _) => out.push_str(&format!(
+            "  {} {}\n",
+            muted().apply_to("archived to"),
+            accent().apply_to(display_tilde(archived))
+        )),
+        (None, true) => out.push_str(&format!(
+            "  {}\n",
+            muted().apply_to(
+                "would archive a readable copy into ~/agent-duster-exports/ unless \
+                 --no-archive is passed"
+            )
+        )),
+        (None, false) => out.push_str(&format!(
+            "  {}\n",
+            muted().apply_to("no archive was made (--no-archive)")
+        )),
+    }
+    out
 }
 
 #[cfg(test)]
@@ -788,7 +929,9 @@ mod tests {
     }
 
     fn only_rid(index: &Path) -> i64 {
-        let rows = session::list(Some(index), &SessionFilter::default()).unwrap();
+        let rows = session::list(Some(index), &SessionFilter::default())
+            .unwrap()
+            .rows;
         assert_eq!(rows.len(), 1, "夹具里只该有一场会话");
         rows[0].rid
     }
@@ -840,6 +983,42 @@ mod tests {
         assert!(out.contains("2 KB"), "页脚要报合计体积:{out}");
         // 空结果不印表头,只给一句下一步。
         assert!(render_list(&[]).contains("duster scan"));
+    }
+
+    /// ID 列带 `s` 前缀,且前缀没把数字列的对齐带歪:ID 是右对齐列,
+    /// `s7` 与 `s500` 宽度不同,AGENT 列(紧跟其后)的起点必须一致——
+    /// 这只有列宽按 display_width 取最大值、右缘对齐才成立。CJK 行
+    /// 混进来也不能歪(项目列宽度同样走 display_width)。
+    #[test]
+    fn list_表_id_带_s_前缀且列对齐不歪() {
+        fn wide_row(rid: i64, project: &str) -> SessionRow {
+            SessionRow {
+                rid,
+                agent_id: "codex".into(),
+                key: "k.jsonl".into(),
+                path: "/tmp/k.jsonl".into(),
+                cwd: Some(project.to_string()),
+                bytes: 1024,
+                turns: 4,
+                last_turn_ms: None,
+                compressed: false,
+            }
+        }
+        let out = render_list(&[
+            wide_row(7, "/Users/me/Code/agent-duster"),
+            wide_row(500, "/Users/me/Code/项目"),
+        ]);
+        // ID 格带 s 前缀。
+        assert!(out.contains("s7"), "{out}");
+        assert!(out.contains("s500"), "{out}");
+        // 两条数据行里 AGENT(codex)与项目列(Code/)的起点分别一致:
+        // ID 右对齐 + CJK 列宽按显示宽度算,列竖线没歪。
+        let data: Vec<&str> = out.lines().filter(|l| l.contains("codex")).collect();
+        assert_eq!(data.len(), 2, "该有两条数据行:{out}");
+        let codex_at: Vec<usize> = data.iter().map(|l| l.find("codex").unwrap()).collect();
+        assert_eq!(codex_at[0], codex_at[1], "ID 列右对齐被带歪:{out}");
+        let code_at: Vec<usize> = data.iter().map(|l| l.find("Code/").unwrap()).collect();
+        assert_eq!(code_at[0], code_at[1], "CJK 项目列把列起点带歪:{out}");
     }
 
     /// 截断必须明示,且要说清怎么看全部。
@@ -1061,6 +1240,7 @@ mod tests {
                 }
             )
             .unwrap()
+            .rows
             .len(),
             1
         );
@@ -1101,5 +1281,184 @@ mod tests {
             assert_eq!(code, crate::output::EXIT_USAGE);
         }
         assert_eq!(std::fs::read(&src).unwrap(), before);
+    }
+
+    /// id 只认 `s<number>` 与裸 `<number>`:`t42` 是轮次 id,粘错空间必须
+    /// 死在解析层,不能落到「查无此会话」那种误导性的错。
+    #[test]
+    fn migrate_id_解析只认会话空间() {
+        assert_eq!(parse_rid("42"), Ok(42));
+        assert_eq!(parse_rid("s42"), Ok(42));
+        assert_eq!(parse_rid(" s7 "), Ok(7));
+        for bad in ["t42", "S42", "s", "", "s-1", "-3", "4 2", "s4.2"] {
+            assert!(parse_rid(bad).is_err(), "{bad:?} 该被拒绝");
+        }
+    }
+
+    /// 回执措辞:种了几轮、种到哪、丢了几轮、有损明示。0 丢弃不印括号。
+    #[test]
+    fn migrate_回执措辞() {
+        let mut report = duster_core::session_migrate::MigrateReport {
+            rid: 7,
+            from: "codex".into(),
+            to: "omp".into(),
+            target: "/tmp/x.jsonl".into(),
+            turns_planted: 4,
+            tool_turns_dropped: 1,
+            dry_run: false,
+        };
+        let out = render_migrate(&report);
+        assert!(out.contains("planted 4 text turns into"), "{out}");
+        assert!(out.contains("/tmp/x.jsonl"), "{out}");
+        assert!(out.contains("(1 tool turn dropped)"), "{out}");
+        assert!(out.contains("tool calls are not carried over"), "{out}");
+        assert!(out.contains("duster scan"), "{out}");
+
+        report.dry_run = true;
+        report.tool_turns_dropped = 0;
+        let out = render_migrate(&report);
+        assert!(out.contains("would plant 4 text turns into"), "{out}");
+        assert!(!out.contains("dropped"), "0 丢弃不许暗示丢了东西:{out}");
+        assert!(out.contains("drop --dry-run"), "{out}");
+    }
+
+    /// 整条命令走通:codex 夹具 → 归档后源文件没了、列表不再列出;dry-run
+    /// 不动盘也不写导出目录。核心逻辑的逐字节断言在 duster-core 的
+    /// session::remove 测试里,这里只钉外壳的接线与退出码。
+    #[test]
+    fn rm_接线_归档删除_dry_run() {
+        let (_tmp, home, index, src) = fixture();
+        let rid = only_rid(&index);
+
+        // dry-run:退出 0,源文件与导出目录都不动。
+        let code = run_rm(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            &format!("s{rid}"),
+            false,
+            true,
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(src.is_file(), "预览不许动源文件");
+        assert!(
+            !home.join("agent-duster-exports").exists(),
+            "预览不许写导出目录"
+        );
+
+        // 真跑:源文件没了,归档包出现,列表不再列出。
+        let code = run_rm(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            &format!("s{rid}"),
+            false,
+            false,
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(!src.exists(), "源文件应已删除");
+        let exports = home.join("agent-duster-exports");
+        let archives: Vec<_> = std::fs::read_dir(&exports)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "zst"))
+            .collect();
+        assert_eq!(archives.len(), 1, "归档包应出现: {archives:?}");
+        assert!(archives[0].is_file(), "{}", archives[0].display());
+        let rows = session::list(Some(&index), &SessionFilter::default())
+            .unwrap()
+            .rows;
+        assert!(rows.is_empty(), "删完列表不能再列出: {rows:?}");
+    }
+
+    /// 回执措辞:真跑报 deleted + freed + 归档去处;干跑报 would delete 并
+    /// 预告归档。整块渲染逐字核对。
+    #[test]
+    fn rm_回执措辞() {
+        let mut report = duster_core::delete::DeleteReport {
+            archived: Some("/tmp/exports/session-rm-20260101-000000.tar.zst".into()),
+            removed: vec!["/Users/me/.codex/sessions/x.jsonl".into()],
+            freed_bytes: 2048,
+            warnings: vec![],
+        };
+        let out = render_rm(&report, false);
+        assert!(out.contains("deleted 1 conversation"), "{out}");
+        assert!(out.contains("2 KB freed"), "{out}");
+        assert!(out.contains("archived to"), "{out}");
+        assert!(out.contains("session-rm-20260101-000000.tar.zst"), "{out}");
+
+        report.archived = None;
+        let out = render_rm(&report, true);
+        assert!(out.contains("would delete 1 conversation"), "{out}");
+        assert!(out.contains("would archive"), "{out}");
+        assert!(!out.contains("freed"), "干跑不许说 freed:{out}");
+    }
+
+    /// 命令行词汇表里必须有 `rm`,且它只收会话 id 一种位置参数。
+    #[test]
+    fn 命令行词汇表里有_session_rm() {
+        use clap::CommandFactory;
+        let cli = crate::Cli::command();
+        let session = cli.find_subcommand("session").unwrap();
+        let names: Vec<&str> = session.get_subcommands().map(|c| c.get_name()).collect();
+        assert!(names.contains(&"rm"), "{names:?}");
+    }
+
+    /// 整条命令走通:codex 夹具 → omp 目标落盘;dry-run 不碰盘;
+    /// 名单外目标报错退出。核心逻辑的逐字节断言在 duster-core 的
+    /// session_migrate 测试里,这里只钉外壳的接线与退出码。
+    #[test]
+    fn migrate_接线_落盘_dry_run_与名单外() {
+        let (_tmp, home, index, _src) = fixture();
+        let rid = only_rid(&index);
+
+        // dry-run:报告成功但目标树一个目录都不长出来。
+        let code = run_migrate(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            &format!("s{rid}"),
+            "omp",
+            true,
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(!home.join(".omp").exists(), "dry-run 不许碰盘");
+
+        // 真跑:落进 cwd 编码的 omp 会话目录,恰好一个文件。
+        let code = run_migrate(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            &format!("s{rid}"),
+            "omp",
+            false,
+        );
+        assert_eq!(code, EXIT_OK);
+        let dir = home.join(".omp/agent/sessions/-Users-me-Code-agent-duster");
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(files.len(), 1, "目标目录该恰好一份移植文件");
+
+        // 名单外目标:非零退出,不落盘。
+        let code = run_migrate(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            &format!("{rid}"),
+            "gemini-cli",
+            false,
+        );
+        assert_ne!(code, EXIT_OK);
+        assert!(!home.join(".gemini").exists());
+
+        // id 写错空间(t 前缀):死在解析层,同样非零退出。
+        let code = run_migrate(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            "t1",
+            "omp",
+            false,
+        );
+        assert_ne!(code, EXIT_OK);
     }
 }

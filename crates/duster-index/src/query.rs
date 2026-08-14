@@ -32,6 +32,9 @@ pub struct ResourceRecord {
     /// 清单声明的「保留最新 N 份代际」；只有带 glob 的 stats-only 行有值。
     /// 恒为 ≥ 1（清单校验拒绝 0——那等于连最后一份兜底一起删）。
     pub keep_generations: Option<u32>,
+    /// 清单声明的 mapper 名。NULL = 未知（历史行/手写行），读方按
+    /// 「不是 stats-only」处理——只有显式声明的 stats-only 才被过滤。
+    pub mapper: Option<String>,
     pub hash_content: Option<[u8; 32]>,
 }
 
@@ -56,7 +59,7 @@ pub struct ResourceFilter {
 /// `resource` 表的全列投影，顺序与 [`row_to_record`] 的下标一一对应。
 /// 集中一处，避免每个查询各写一遍列名导致下标漂移。
 const RESOURCE_COLS: &str = "rid, agent_id, kind, scope, key, path, size, mtime_ns, \
-                             clean_level, reclaimable, install_bytes, keep_generations, hash_content";
+                             clean_level, reclaimable, install_bytes, keep_generations, mapper, hash_content";
 
 /// 把一行 [`RESOURCE_COLS`] 投影解成 [`ResourceRecord`]。
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceRecord> {
@@ -85,6 +88,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceRecord> {
             .get::<_, Option<i64>>("keep_generations")?
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n >= 1),
+        mapper: row.get("mapper")?,
         hash_content,
     })
 }
@@ -508,6 +512,7 @@ mod tests {
                 clean_level: level.map(str::to_string),
                 reclaimable: level.map(|_| size),
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap()
@@ -530,6 +535,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: Some(install),
+                mapper: None,
             },
         )
         .unwrap()

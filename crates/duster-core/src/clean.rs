@@ -504,6 +504,7 @@ mod tests {
                 clean_level: Some("l1".into()),
                 reclaimable: Some(bytes),
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();
@@ -710,6 +711,7 @@ mod tests {
                 clean_level: Some("l1".into()),
                 reclaimable: Some(n as u64),
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();

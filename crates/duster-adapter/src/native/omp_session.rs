@@ -52,16 +52,18 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use duster_model::{Role, SessionMeta, TurnRecord};
+use rusqlite::{Connection, OpenFlags};
 
 // 只读打开策略与表/列探测由 opencode 适配器持有,两个 SQLite 适配器共用同一份。
 // 它**不是**从 duster-index 引进来的:duster-index 在本 crate 上面,适配层
 // 不能依赖索引层,所以 `duster_index::foreign` 的那套规则在 crate 内重写了一遍
 // (见 `opencode_session::open_readonly` 的文档)。crate 内共用一份而不是再抄
 // 第三遍——重复只该跨 crate 边界发生一次。
-use super::opencode_session::{columns, has_table, open_readonly};
+use super::opencode_session::{BUSY_TIMEOUT_MS, columns, has_table, open_readonly};
 
 /// 库里的一个会话。
 #[derive(Debug, Clone)]
@@ -242,6 +244,62 @@ pub fn read_turn(db: &Path, rowid: i64) -> Result<String> {
         .with_context(|| format!("no omp history row {rowid} in {}", db.display()))?;
     drop(conn);
     Ok(text)
+}
+
+/// 从库里删除一个会话（`history` 表里 `session_id` 相同的全部行），
+/// 返回删掉的行数（0 = 库里已经没有这个会话）。
+///
+/// 这是本适配器**唯一的写入口**（读侧全是只读）：`duster session rm` 删
+/// 库型会话时调用，`session_id` 就是索引里那条资源的 `key`。
+///
+/// # schema_guard（库形态）
+///
+/// 写之前先确认要碰的表/列都还在（见 opencode 适配器的 [`super::opencode_session::delete_session`]
+/// 同一段话）：对一个自己不了解形状的库下 DELETE，是把别人的数据当试验田。
+/// 表缺了或列改名了 → Err，调用方把这一条记进 warnings，不中断批量。
+///
+/// # 原子与锁
+///
+/// 删除包在一个事务里。`history_fts` 是外部内容表、由上游自己的触发器
+/// （`history_ai` 等）同步——这里只删主表，触发器负责收拾倒排索引；
+/// 上游把触发器删了时，fts 里残留几条旧行无害（omp 自己会重建），
+/// 不值得为此绕过上游的维护设施。
+pub fn delete_session(db: &Path, session_id: &str) -> Result<u64> {
+    let mut conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open omp session database: {}", db.display()))?;
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+
+    if !has_table(&conn, "history")? {
+        bail!(
+            "omp session database has no `history` table: {}",
+            db.display()
+        );
+    }
+    if !columns(&conn, "history")?
+        .iter()
+        .any(|c| c == "session_id")
+    {
+        bail!(
+            "omp session database table `history` lost column `session_id`: {}",
+            db.display()
+        );
+    }
+
+    let tx = conn
+        .transaction()
+        .with_context(|| format!("failed to begin session delete in {}", db.display()))?;
+    let n = tx
+        .execute(
+            "DELETE FROM \"history\" WHERE \"session_id\" = ?1",
+            [session_id],
+        )
+        .with_context(|| format!("failed to delete history rows of session {session_id}"))?;
+    tx.commit()
+        .with_context(|| format!("failed to commit session delete in {}", db.display()))?;
+    Ok(n as u64)
 }
 
 /// 整条 prompt 就是一个光杆斜杠命令吗？

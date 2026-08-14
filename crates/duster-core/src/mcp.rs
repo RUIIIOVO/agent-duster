@@ -9,9 +9,11 @@
 //! 不是「我在几个文件里写过 MCP」。
 //!
 //! 所以 `list` 按 **content hash** 合并：命令、参数、env 归一化之后哈希，
-//! 相同即同一个 server，一行展示、右侧列出它出现在哪些 agent 里。
-//! 声明得不完全一样的（多一个 `--verbose`、env 少一个键）**不会**被合并——
-//! 那正是用户要看见的差异，用 `duster mcp diff` 展开。
+//! 相同即同一个 server。视图**铺平**成每条声明一行（与 `skill list` 同构），
+//! 组名只印在首行，STATE 列说清这组声明的合并结论：单家声明是
+//! `only copy`，多家且归一化后等价是 `identical`，不等价是 `drifted`——
+//! 声明得不完全一样的（多一个 `--verbose`、env 少一个键）各占一行，
+//! 差异直接摆在表里，不再需要第二条命令去展开。
 //!
 //! # ping 的边界
 //!
@@ -28,12 +30,11 @@
 //!   哈希是 scan 时由 mapper 算好的，`list` 重算一遍既慢又可能与索引打架。
 //! - **清单**（`adapters/*.toml`）：那份文件是什么方言、段在哪。索引行不存方言，
 //!   只能从清单反查；查不到就如实标成 [`UNKNOWN_DIALECT`]，不编。
-//! - **配置文件本身**：只在需要**完整规格**时才读（`show` 的详情、`diff` 的两侧、
-//!   `sync` 的源）。索引里没有存规格，这一步无可替代；读出来的规格与索引哈希
+//! - **配置文件本身**：只在需要**完整规格**时才读（`show` 的详情、`sync` 的源）。
+//!   索引里没有存规格，这一步无可替代；读出来的规格与索引哈希
 //!   对不上就说一句「索引陈旧」，而不是偷偷改口径。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -53,7 +54,15 @@ use duster_index::meta;
 use duster_index::query::{self, ResourceFilter, ResourceRecord};
 use duster_model::{McpServerSpec, McpTransport, ResourceKind};
 
+use crate::freshness;
+use crate::skill_ops::DupState;
+
 /// 一条声明的出处。
+///
+/// `state` 是**组级**结论（按 server 名算，与 skill 的 `DupState` 同义）：
+/// 单家声明 = `Single`，多家且归一化后等价 = `Identical`，不等价 = `Drifted`。
+/// 同一组里的每条声明必然同值——它回答的是「这个名字意味着什么」，
+/// 不是「这条声明怎么了」，所以是组的状态不是行的状态。
 #[derive(Debug, Clone, Serialize)]
 pub struct Declaration {
     pub agent_id: String,
@@ -62,6 +71,8 @@ pub struct Declaration {
     /// 该 agent 用的方言（`mcp/standard-json` / `mcp/codex-toml` /
     /// `mcp/opencode-json` / `mcp/gemini-json`）。
     pub dialect: String,
+    /// 这组声明的合并结论（见 [`Declaration`] 头的说明）。
+    pub state: DupState,
 }
 
 /// 合并后的一个 MCP server。
@@ -125,7 +136,7 @@ pub fn show(index_path: Option<&std::path::Path>, name: &str) -> Result<MergedSe
         let hashes: Vec<&str> = hits.iter().map(|s| s.content_hash.as_str()).collect();
         bail!(
             "MCP server `{name}` is declared with {} different contents ({}); \
-             inspect them with `duster mcp list` or `duster mcp diff {name} <a> <b>`",
+             inspect the declarations with `duster mcp list`",
             hits.len(),
             hashes.join(", ")
         );
@@ -144,38 +155,12 @@ pub fn show(index_path: Option<&std::path::Path>, name: &str) -> Result<MergedSe
         );
     }
     if known.is_empty() {
-        bail!("no MCP server is indexed. Run `duster scan` first to build the index.");
+        bail!("no MCP server is indexed: no agent on this machine declares one");
     }
     bail!(
         "unknown MCP server `{name}`. Known servers: {}",
         known.into_iter().collect::<Vec<_>>().join(", ")
     );
-}
-
-/// 两个 agent 里同名 server 的差异。复用 [`crate::diff::diff_values`]，
-/// **不写第二套比较逻辑**：字段路径的读法必须和 `duster diff` 一致。
-pub fn diff(
-    index_path: Option<&std::path::Path>,
-    name: &str,
-    left_agent: &str,
-    right_agent: &str,
-) -> Result<crate::diff::Diff> {
-    let (rows, mut cat) = open_view(index_path)?;
-    let left = spec_of(&rows, &mut cat, name, left_agent)?;
-    let right = spec_of(&rows, &mut cat, name, right_agent)?;
-
-    // 两侧都转成 JSON 再交给通用引擎：McpServerSpec 是归一化模型，
-    // 转出来的字段路径（`command` / `args.0` / `env.API_KEY`）与 `duster diff`
-    // 看任何结构化配置时的读法完全一致。
-    let lv = serde_json::to_value(&left).context("failed to serialize the left-hand spec")?;
-    let rv = serde_json::to_value(&right).context("failed to serialize the right-hand spec")?;
-    Ok(crate::diff::diff_values(
-        &lv,
-        &rv,
-        left_agent,
-        right_agent,
-        &crate::diff::DiffOptions::default(),
-    ))
 }
 
 /// ping 的结论。
@@ -491,16 +476,11 @@ fn prepare_sync(
     }
 
     let home = resolve_home(opts.home.as_deref())?;
-    let index_path = opts
+    let declared = opts
         .index_path
         .clone()
         .unwrap_or_else(|| home.join(".agent-duster").join("index.db"));
-    if !index_path.is_file() {
-        bail!(
-            "index database not found: {}. Run `duster scan` first to build it.",
-            index_path.display()
-        );
-    }
+    let index_path = freshness::ensure_exists(Some(&declared))?;
 
     let idx = if readonly {
         Index::open_readonly(&index_path)
@@ -517,7 +497,8 @@ fn prepare_sync(
     let decls: Vec<&ResourceRecord> = rows.iter().filter(|r| r.key == opts.name).collect();
     if decls.is_empty() {
         bail!(
-            "no agent declares MCP server `{}` in the index. Run `duster scan` if it was added recently.",
+            "no agent declares MCP server `{}`; run `duster mcp list` to see the names \
+             that do exist",
             opts.name
         );
     }
@@ -620,16 +601,7 @@ fn run_plan(mut ctx: SyncCtx<'_>, targets: &[&str]) -> Vec<SyncOutcome> {
 
 /// 打开只读索引，取出全部 mcp 行，并按索引所在的 home 载入清单。
 fn open_view(index_path: Option<&Path>) -> Result<(Vec<ResourceRecord>, Catalog)> {
-    let path = match index_path {
-        Some(p) => p.to_path_buf(),
-        None => duster_fs::path::expand_tilde("~/.agent-duster/index.db"),
-    };
-    if !path.is_file() {
-        bail!(
-            "index database not found: {}. Run `duster scan` first to build it.",
-            path.display()
-        );
-    }
+    let path = freshness::ensure_exists(index_path)?;
     let idx = Index::open_readonly(&path)
         .with_context(|| format!("failed to open index read-only: {}", path.display()))?;
     let rows = mcp_rows(&idx)?;
@@ -653,13 +625,7 @@ fn mcp_rows(idx: &Index) -> Result<Vec<ResourceRecord>> {
 /// 另一台机器拷回来的库）时会去读**本机真实 home** 的用户清单，
 /// 反查出来的方言张冠李戴。形状对不上就退回真实 home。
 fn home_of_index(index_path: &Path) -> PathBuf {
-    if let Some(dir) = index_path.parent()
-        && dir.file_name() == Some(OsStr::new(".agent-duster"))
-        && let Some(home) = dir.parent()
-    {
-        return home.to_path_buf();
-    }
-    duster_fs::path::expand_tilde("~")
+    freshness::home_of_index(index_path).unwrap_or_else(|| duster_fs::path::expand_tilde("~"))
 }
 
 fn resolve_home(injected: Option<&Path>) -> Result<PathBuf> {
@@ -874,14 +840,16 @@ fn resolve<'a>(row: &'a ResourceRecord, cat: &mut Catalog) -> Decl<'a> {
     });
 
     let from_file = spec.as_ref().map(|s| *s.content_hash().as_bytes());
-    // 索引与文件对不上 = 索引陈旧。合并仍按索引口径走（那是 list 的定义），
-    // 但必须说出来，否则用户读到的是一份过期的「现状」。
+    // 索引与文件对不上：合并仍按索引口径走（那是 list 的定义），但必须说出来，
+    // 否则用户读到的是一份和磁盘不符的「现状」。重扫不是答案——刚扫完还是
+    // 对不上，只说明有人在 duster 之外动过这个文件。
     if let (Some(a), Some(b)) = (row.hash_content, from_file)
         && a != b
     {
         cat.warnings.push(format!(
             "the indexed content hash of `{}` in agent `{}` no longer matches {}; \
-             run `duster scan` to refresh the index",
+             the file changed outside duster after it was indexed — open it and see \
+             what changed",
             row.key, row.agent_id, row.path
         ));
     }
@@ -938,8 +906,29 @@ fn merge(rows: &[ResourceRecord], cat: &mut Catalog) -> McpList {
         groups.entry((d.row.key.as_str(), h)).or_default().push(d);
     }
 
+    // 组级状态按 server 名定，与 skill 的 DupState 同义（见 `Declaration` 头）。
+    // 判据只看索引哈希：归一化等价性本来就是 scan 时由 mapper 算好的
+    // （模块头「三种数据来源」），列表不重读文件、不现场比较——
+    // 这正是原 `diff` 想回答的问题，现在由表里的 STATE 列直接给出。
+    // 顺序有讲究：drifted 压过一切——名字在冲突表里（哪怕有一组声明
+    // 读不回来、视图里只剩一行），说「only copy」会骗到人。
+    let decls_by_name: BTreeMap<&str, usize> = groups
+        .iter()
+        .map(|((name, _), ds)| (*name, ds.len()))
+        .collect();
+    let state_of = |name: &str| -> DupState {
+        if conflicts.contains_key(name) {
+            DupState::Drifted
+        } else if decls_by_name.get(name).copied().unwrap_or(0) > 1 {
+            DupState::Identical
+        } else {
+            DupState::Single
+        }
+    };
+
     let mut servers = Vec::with_capacity(groups.len());
     for ((name, hash), ds) in groups {
+        let state = state_of(name);
         let Some(spec) = ds.iter().find_map(|d| d.spec.clone()) else {
             cat.warnings.push(format!(
                 "MCP server `{name}` ({hash}) is indexed for {} but none of its declarations \
@@ -960,6 +949,7 @@ fn merge(rows: &[ResourceRecord], cat: &mut Catalog) -> McpList {
                     .dialect
                     .clone()
                     .unwrap_or_else(|| UNKNOWN_DIALECT.to_string()),
+                state,
             })
             .collect();
         declared_in.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -978,32 +968,6 @@ fn merge(rows: &[ResourceRecord], cat: &mut Catalog) -> McpList {
     }
 }
 
-/// 取某个 agent 声明的某个 server 的完整规格。
-fn spec_of(
-    rows: &[ResourceRecord],
-    cat: &mut Catalog,
-    name: &str,
-    agent: &str,
-) -> Result<McpServerSpec> {
-    match rows.iter().find(|r| r.key == name && r.agent_id == agent) {
-        Some(row) => spec_of_row(row, cat),
-        None => {
-            let others: Vec<&str> = rows
-                .iter()
-                .filter(|r| r.key == name)
-                .map(|r| r.agent_id.as_str())
-                .collect();
-            if others.is_empty() {
-                bail!("no agent declares MCP server `{name}`");
-            }
-            bail!(
-                "agent `{agent}` does not declare MCP server `{name}`; it is declared by: {}",
-                others.join(", ")
-            )
-        }
-    }
-}
-
 fn spec_of_row(row: &ResourceRecord, cat: &mut Catalog) -> Result<McpServerSpec> {
     let Some(i) = cat.site_at(&row.agent_id, Path::new(&row.path)) else {
         bail!(
@@ -1019,7 +983,7 @@ fn spec_of_row(row: &ResourceRecord, cat: &mut Catalog) -> Result<McpServerSpec>
         Some(s) => Ok(s.clone()),
         None => bail!(
             "agent `{}` no longer declares MCP server `{}` in {}; \
-             the index is stale, run `duster scan`",
+             the file was edited outside duster after it was indexed — check it",
             row.agent_id,
             row.key,
             path.display()
@@ -1373,8 +1337,8 @@ fn sync_one(ctx: &mut SyncCtx<'_>, agent: &str) -> SyncOutcome {
                 None,
             );
         }
-        // 用户手写的声明只报差异，绝不覆盖。差异走同一套 diff 引擎，
-        // 字段路径的读法与 `duster mcp diff` 一字不差。
+        // 用户手写的声明只报差异，绝不覆盖。差异走通用 diff 引擎，
+        // 字段路径的读法与顶层 `duster diff` 一致。
         let fields = match (serde_json::to_value(old), serde_json::to_value(ctx.src)) {
             (Ok(l), Ok(r)) => crate::diff::diff_values(
                 &l,
@@ -1470,7 +1434,7 @@ fn sync_one(ctx: &mut SyncCtx<'_>, agent: &str) -> SyncOutcome {
 
     match duster_fs::atomic::write_atomic(&path, new_text.as_bytes()) {
         Ok(()) => {
-            relearn_guard(ctx, &path, &slot);
+            relearn_guard(ctx.idx, &path, &slot);
             mk(shown, "create", None, snap)
         }
         // 快照路径照样带上：写坏了的话，用户第一句话就是「原来那份在哪」。
@@ -1487,9 +1451,9 @@ fn sync_one(ctx: &mut SyncCtx<'_>, agent: &str) -> SyncOutcome {
 ///
 /// 刷新失败不回滚也不报错：后果只是下一次 sync 因指纹对不上而拒写，
 /// 那是安全的一侧——宁可多问一次，不可少拦一次。
-fn relearn_guard(ctx: &SyncCtx<'_>, path: &Path, slot: &str) {
+fn relearn_guard(idx: &Index, path: &Path, slot: &str) {
     if let Ok(doc) = codec::read_file(path) {
-        let _ = meta::set(ctx.idx.conn(), slot, &guard::fingerprint(&doc));
+        let _ = meta::set(idx.conn(), slot, &guard::fingerprint(&doc));
     }
 }
 
@@ -1671,6 +1635,408 @@ fn str_map(m: &BTreeMap<String, String>) -> serde_json::Value {
     )
 }
 
+// ---------------------------------------------------------------------------
+// remove
+// ---------------------------------------------------------------------------
+
+/// `duster mcp rm` 的输入。
+#[derive(Debug, Clone)]
+pub struct RemoveOptions {
+    pub index_path: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+    /// true = 删前把整份配置文件打包进 `~/agent-duster-exports`。默认开——
+    /// 摘错了一条声明，用户要能把整份配置捣回来；脚本用 `--no-archive` 关。
+    pub archive: bool,
+    /// true = 只报「将变成什么样」，一个字节不写、一个归档不打。
+    pub dry_run: bool,
+    /// 要摘掉的 server 名。
+    pub name: String,
+    /// 显式点名的 agent。`None` 且不止一处声明时报错列出候选——
+    /// 「删哪一家」是删除的目标本身，不许默认替用户挑。
+    pub agent: Option<String>,
+    /// 每个声明了它的 agent 各摘一条。
+    pub all_agents: bool,
+}
+
+/// 一个目标（某个 agent 的某条声明）的删除结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoveOutcome {
+    pub agent_id: String,
+    /// 声明所在的配置文件（将被改写 / 已改写）。
+    pub path: String,
+    /// 文件里那一个键（JSON Pointer 或 TOML 点路径）。dry-run 报「哪个文件的
+    /// 哪个键会没」就靠它；拿不到时为空串。
+    pub key: String,
+    /// `removed`（键已摘掉；dry-run 下为「将会摘掉」）/ `absent`（文件里本来
+    /// 就没有这条声明，索引行随之清理）/ `refused`（guard 或解析失败，一字节没动）。
+    pub action: String,
+    pub error: Option<String>,
+    /// 这一处摘键释放的字节（dry-run 为预估）。
+    pub freed: u64,
+}
+
+/// `duster mcp rm` 的结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoveReport {
+    pub outcomes: Vec<RemoveOutcome>,
+    /// 删前整份配置文件打成的归档包。`--no-archive` 或 dry-run 时为 None。
+    pub archive: Option<PathBuf>,
+    /// 各文件摘键后释放的字节合计（dry-run 为预估）。
+    pub freed_bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+/// 执行 `duster mcp rm`。
+///
+/// # 这是本轮最危险的写入
+///
+/// 它改的是 `~/.claude.json`、`~/.codex/config.toml`、`~/.gemini/settings.json`
+/// 这种**别人的主配置**——同文件里全是用户其他设置。所以 [`sync_one`] 那套
+/// 规矩一步都不能省，这里绝不另起一套配置文件写入器：
+///
+/// 1. **写前过 schema_guard**（[`duster_adapter::guard::check`]）。指纹对不上
+///    就把这个目标**自动降为只读**并如实说出期望与实际的指纹，不强写——
+///    上游升级了格式，我们的保守摘键会改到语义已经不同的位置。
+/// 2. **写前留整文件快照**（[`duster_fs::snapshot::snapshot_file`]）。改的是还
+///    装着二十条别的声明的文件，用户同意的是「摘一条」，写坏了丢的是整个文件。
+/// 3. **只删那一个键**（codec 的 `remove_json_pointer` / `remove_toml_path`）：
+///    同文件内其他键、注释、键序、缩进逐字节不变。
+/// 4. **删前归档**（[`crate::delete::archive_before_delete`]）：把将改写的每份
+///    配置文件**整份**原样打进 `~/agent-duster-exports/`。归档失败即整体中止，
+///    一个键都不许摘。
+///
+/// # 目标怎么定
+///
+/// - `--agent a`：只摘 a 的声明；a 没有声明它 → 报错并列出谁声明了它。
+/// - `--all-agents`：每个声明了它的 agent 各摘一条。
+/// - 都没给：只有一处声明时就用它；多处时报错列出候选——删哪一家是删除的
+///   目标本身，不许默认替用户挑（与 `skill rm` 同一口径）。
+///
+/// # 索引同步
+///
+/// 摘键成功后（以及发现文件里本来就没有这条声明时）同步删掉对应的
+/// `resource` 行——下一次 `duster mcp list` 不许再列着已删的东西。
+///
+/// 执行是两遍的：先整轮只算一遍（guard 不落基准、一字节不写），归档只包
+/// 「真会写」的文件；归档落定后才逐目标重读重算并写盘。归档与写盘之间文件
+/// 可能又被改过——每个目标在快照之前重过 guard 与「声明还在不在」，万一漂了
+/// 当场降为 `refused`，归档里多一份没改过的原件，那是安全的一侧。
+pub fn remove(opts: &RemoveOptions) -> Result<RemoveReport> {
+    if opts.name.trim().is_empty() {
+        bail!("no MCP server name given");
+    }
+
+    let home = resolve_home(opts.home.as_deref())?;
+    let declared = opts
+        .index_path
+        .clone()
+        .unwrap_or_else(|| home.join(".agent-duster").join("index.db"));
+    let index_path = freshness::ensure_exists(Some(&declared))?;
+
+    // dry-run 一个字节都不写，连索引都只读打开——预览不该抢单实例写锁。
+    let idx = if opts.dry_run {
+        Index::open_readonly(&index_path)
+            .with_context(|| format!("failed to open index read-only: {}", index_path.display()))?
+    } else {
+        Index::open(&index_path)
+            .with_context(|| format!("failed to open index: {}", index_path.display()))?
+    };
+    let rows = mcp_rows(&idx)?;
+    // 写路径上清单读不动就是硬错误：目标文件是什么方言全靠它说了算。
+    let cat = Catalog::load_strict(&home)?;
+
+    let decls: Vec<&ResourceRecord> = rows.iter().filter(|r| r.key == opts.name).collect();
+    if decls.is_empty() {
+        bail!(
+            "no agent declares MCP server `{}`; run `duster mcp list` to see the names \
+             that do exist",
+            opts.name
+        );
+    }
+    let targets: Vec<&ResourceRecord> = if opts.all_agents {
+        decls
+    } else if let Some(a) = &opts.agent {
+        match decls.iter().find(|r| &r.agent_id == a) {
+            Some(r) => vec![*r],
+            None => bail!(
+                "agent `{a}` does not declare MCP server `{}`; it is declared by: {}",
+                opts.name,
+                agent_list(&decls)
+            ),
+        }
+    } else if decls.len() == 1 {
+        decls
+    } else {
+        bail!(
+            "MCP server `{}` is declared by {} agents ({}); name the one to remove with \
+             --agent, or pass --all-agents to remove every declaration",
+            opts.name,
+            decls.len(),
+            agent_list(&decls)
+        );
+    };
+
+    let op_id = duster_fs::snapshot::new_op_id(std::time::SystemTime::now());
+    let mut ctx = RemoveCtx {
+        idx: &idx,
+        cat: &cat,
+        home: &home,
+        op_id: &op_id,
+        name: &opts.name,
+    };
+
+    // 第一遍：只算不写（guard 基准不落库），定出哪些目标真会写。
+    let planned: Vec<RemoveOutcome> = targets
+        .iter()
+        .map(|row| remove_row(&mut ctx, row, true))
+        .collect();
+
+    // dry-run 到此为止：一个字节不写、一个归档不打。
+    if opts.dry_run {
+        let freed_bytes = planned.iter().map(|o| o.freed).sum();
+        return Ok(RemoveReport {
+            outcomes: planned,
+            freed_bytes,
+            archive: None,
+            warnings: Vec::new(),
+        });
+    }
+
+    let to_archive: Vec<PathBuf> = planned
+        .iter()
+        .filter(|o| o.action == "removed")
+        .map(|o| PathBuf::from(&o.path))
+        .collect();
+
+    // 归档是删之前的唯一退路：打包失败就整体中止，一个键都不许摘。
+    // 标签带上 server 与 agent：同一秒里删两家（批量动作逐条删）不会撞包名
+    // ——归档包命名只有秒级分辨率，撞名即报错（宁可报错也不覆盖用户的东西）。
+    let label = match (&opts.agent, opts.all_agents) {
+        (Some(a), _) => format!("mcp-rm-{}-{}", opts.name, a),
+        (None, true) => format!("mcp-rm-{}-all", opts.name),
+        (None, false) => format!("mcp-rm-{}", opts.name),
+    };
+    let archive = if opts.archive && !to_archive.is_empty() {
+        Some(
+            crate::delete::archive_before_delete(&to_archive, &label, &home).with_context(
+                || {
+                    format!(
+                        "failed to pack the original config files before removing `{}`; \
+                         nothing was removed",
+                        opts.name
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+
+    // 第二遍：真写盘。每个目标在快照之前重读重算，guard 与「声明还在不在」
+    // 都按那一刻的现实判定（见 `remove` 的文档）。
+    let executed: Vec<RemoveOutcome> = targets
+        .iter()
+        .map(|row| remove_row(&mut ctx, row, false))
+        .collect();
+    let freed_bytes = executed.iter().map(|o| o.freed).sum();
+
+    Ok(RemoveReport {
+        outcomes: executed,
+        freed_bytes,
+        archive,
+        warnings: Vec::new(),
+    })
+}
+
+/// [`remove`] 的共享上下文。攒成一个结构体而不是七八个参数。
+struct RemoveCtx<'a> {
+    idx: &'a Index,
+    cat: &'a Catalog,
+    home: &'a Path,
+    op_id: &'a str,
+    name: &'a str,
+}
+
+/// 对单个目标（某 agent 的某条索引行）执行一次删除推导，视 `dry_run` 落不落盘。
+///
+/// 次序与 [`sync_one`] 一字不差：guard 在最前面（形状变了就连「键还在不在」
+/// 都不该再下结论）→ 解析 → 验声明还在 → 算出要摘的键 → （写盘前）快照 →
+/// 原子写 → 刷新 guard 基准。任何一步失败，这个目标单独降级，不连累其余目标。
+fn remove_row(ctx: &mut RemoveCtx<'_>, row: &ResourceRecord, dry_run: bool) -> RemoveOutcome {
+    let mk_refused = |agent: &str, path: String, msg: String| RemoveOutcome {
+        agent_id: agent.to_string(),
+        path,
+        key: String::new(),
+        action: "refused".to_string(),
+        error: Some(msg),
+        freed: 0,
+    };
+
+    let Some(i) = ctx.cat.site_at(&row.agent_id, Path::new(&row.path)) else {
+        return mk_refused(
+            &row.agent_id,
+            row.path.clone(),
+            format!(
+                "no adapter manifest declares {} as an MCP file for agent `{}`; \
+                 duster cannot tell which dialect it is written in",
+                row.path, row.agent_id
+            ),
+        );
+    };
+    let site = &ctx.cat.sites[i];
+    let path = site.path.clone();
+    let shown = path.display().to_string();
+    if !path.is_file() {
+        return mk_refused(
+            &row.agent_id,
+            shown.clone(),
+            format!("{shown} does not exist; nothing was removed"),
+        );
+    }
+
+    let doc = match codec::read_file(&path) {
+        Ok(d) => d,
+        Err(e) => return mk_refused(&row.agent_id, shown.clone(), format!("{e:#}")),
+    };
+
+    // 闸门在最前面：形状变了就连「声明还在不在」都不该再下结论，
+    // 因为我们对这份文件的理解已经过期了。
+    let slot = format!("guard:{}:mcp:{}", row.agent_id, shown);
+    let conn = ctx.idx.conn();
+    let verdict = guard::check(
+        &doc,
+        || meta::get(conn, &slot),
+        |fp| {
+            if dry_run {
+                // 预览一个字节都不写，连基准都不落——否则一次 dry-run
+                // 就把「第一次见到的形状」定死了。
+                Ok(())
+            } else {
+                meta::set(conn, &slot, fp)
+            }
+        },
+    );
+    match verdict {
+        Ok(guard::Verdict::Drifted {
+            expected,
+            actual,
+            reason,
+        }) => {
+            return mk_refused(
+                &row.agent_id,
+                shown.clone(),
+                format!("{reason} (fingerprint {expected} -> {actual})"),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return mk_refused(&row.agent_id, shown.clone(), format!("schema guard: {e:#}"))
+        }
+    }
+
+    let servers = match servers_in_doc(&doc, &site.section) {
+        Ok(v) => v,
+        Err(e) => return mk_refused(&row.agent_id, shown.clone(), format!("{e:#}")),
+    };
+    if !servers.iter().any(|s| s.name == ctx.name) {
+        // 索引里说它在，文件里没有——duster 之外动过这个文件。摘无可摘，
+        // 但索引行必须清掉，否则 `mcp list` 还会列着一条幽灵声明。
+        if !dry_run {
+            let _ = query::delete_resource(conn, row.rid);
+        }
+        return RemoveOutcome {
+            agent_id: row.agent_id.clone(),
+            path: shown.clone(),
+            key: String::new(),
+            action: "absent".to_string(),
+            error: None,
+            freed: 0,
+        };
+    }
+
+    let plan = match write_plan(&site.section, ctx.name) {
+        Ok(p) => p,
+        Err(e) => return mk_refused(&row.agent_id, shown.clone(), format!("{e:#}")),
+    };
+    // 原文文本要另读一遍：codec 的写入口是**文本进文本出**（不碰文件系统），
+    // 上面那份 Doc 是解析后的树，回不到原文的注释与键序。
+    let src_text = match codec::read_to_string_capped(&path, MAX_CONFIG_BYTES) {
+        Ok(t) => t,
+        Err(e) => return mk_refused(&row.agent_id, shown.clone(), format!("{e:#}")),
+    };
+    let (key, rewritten) = match plan {
+        WritePlan::Json { pointer } => {
+            let p = pointer.clone();
+            (p.clone(), codec::remove_json_pointer(&src_text, &p))
+        }
+        WritePlan::Toml { dotted } => {
+            let d = dotted.clone();
+            (d.clone(), codec::remove_toml_path(&src_text, &d))
+        }
+    };
+    let new_text = match rewritten {
+        Ok(t) => t,
+        Err(e) => return mk_refused(&row.agent_id, shown.clone(), format!("{e:#}")),
+    };
+    let freed = src_text.len().saturating_sub(new_text.len()) as u64;
+
+    if dry_run {
+        return RemoveOutcome {
+            agent_id: row.agent_id.clone(),
+            path: shown,
+            key,
+            action: "removed".to_string(),
+            error: None,
+            freed,
+        };
+    }
+    if new_text == src_text {
+        // 写入口一个字节都没改：解析说声明还在，摘它却没有落点——扫描树与
+        // serde 的解析结果打架（比如 JSON 里重复键）。不动，如实说，索引行照清。
+        let _ = query::delete_resource(conn, row.rid);
+        return RemoveOutcome {
+            agent_id: row.agent_id.clone(),
+            path: shown,
+            key,
+            action: "absent".to_string(),
+            error: Some(
+                "the file no longer contains this declaration; nothing was removed"
+                    .to_string(),
+            ),
+            freed: 0,
+        };
+    }
+
+    // 快照失败即放弃改写：写不出退路就不动手。
+    let root = ctx.home.join(".agent-duster").join("snapshots");
+    if let Err(e) = duster_fs::snapshot::snapshot_file(&root, ctx.op_id, &path, ctx.home) {
+        return mk_refused(
+            &row.agent_id,
+            shown.clone(),
+            format!("refusing to rewrite {shown}: {e:#}"),
+        );
+    }
+    // GC 放在留完快照之后：先保住新的，再回收旧的。
+    let _ = duster_fs::snapshot::prune_old(&root, duster_fs::snapshot::KEEP);
+
+    match duster_fs::atomic::write_atomic(&path, new_text.as_bytes()) {
+        Ok(()) => {
+            relearn_guard(ctx.idx, &path, &slot);
+            // 摘键成功，索引行跟着清——下一次 list 不许再列着已删的东西。
+            let _ = query::delete_resource(conn, row.rid);
+            RemoveOutcome {
+                agent_id: row.agent_id.clone(),
+                path: shown,
+                key,
+                action: "removed".to_string(),
+                error: None,
+                freed,
+            }
+        }
+        Err(e) => mk_refused(&row.agent_id, shown.clone(), format!("{e:#}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1757,6 +2123,7 @@ mapper = "{mapper}"
                     clean_level: None,
                     reclaimable: None,
                     install_bytes: None,
+                    mapper: None,
                 };
                 duster_index::upsert::upsert_resource(idx.conn(), &row).unwrap();
             }
@@ -1780,7 +2147,7 @@ mapper = "{mapper}"
         format!(r#"{{"mcpServers":{{"echo":{{"command":"echo","args":[{args}]}}}}}}"#)
     }
 
-    // ---------------------- list / show / diff ----------------------
+    // ---------------------- list / show ----------------------
 
     /// 三个 agent 声明得一模一样 → 合成一行、三处出处、零冲突。
     #[test]
@@ -1809,6 +2176,102 @@ mapper = "{mapper}"
                 .all(|d| d.dialect == "mcp/standard-json"),
             "方言应当从清单反查得到"
         );
+        // 多家声明且归一化后等价 → 每组每行都是 identical。
+        assert!(
+            s.declared_in
+                .iter()
+                .all(|d| d.state == DupState::Identical),
+            "三家等价声明应当全部标 identical: {:?}",
+            s.declared_in
+                .iter()
+                .map(|d| d.state)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 单家声明 → only copy；同名不同内容 → 每组每行 drifted。
+    #[test]
+    fn list_状态按组_单家_only_copy_多家走散_drifted() {
+        let f = Fake::new();
+        f.seed(&[(
+            "a1",
+            f.agent("a1", &body(r#""hi""#)),
+            stdio("echo", "echo", &["hi"]),
+        )]);
+
+        let out = list(Some(&f.index())).unwrap();
+        assert_eq!(out.servers.len(), 1);
+        assert!(
+            out.servers[0]
+                .declared_in
+                .iter()
+                .all(|d| d.state == DupState::Single),
+            "单家声明应当标 only copy"
+        );
+
+        let f = Fake::new();
+        f.seed(&[
+            (
+                "a1",
+                f.agent("a1", &body(r#""hi""#)),
+                stdio("echo", "echo", &["hi"]),
+            ),
+            (
+                "a2",
+                f.agent("a2", &body(r#""bye""#)),
+                stdio("echo", "echo", &["bye"]),
+            ),
+        ]);
+        let out = list(Some(&f.index())).unwrap();
+        assert_eq!(out.servers.len(), 2, "内容不同不许合并");
+        for s in &out.servers {
+            assert!(
+                s.declared_in
+                    .iter()
+                    .all(|d| d.state == DupState::Drifted),
+                "同名不同内容的每组都应当标 drifted: {:?}",
+                s.declared_in
+                    .iter()
+                    .map(|d| d.state)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// 改一家的 url → 该组 drifted：等价判据正是归一化哈希，
+    /// 只要有一处声明与其余不同，整组状态就该走散。
+    #[test]
+    fn list_改一家的_url_整组_drifted() {
+        let f = Fake::new();
+        let mut http = stdio("remote", "", &[]);
+        http.transport = McpTransport::Http;
+        http.command = None;
+        http.url = Some("https://x.example.com/mcp".to_string());
+
+        let mut other = http.clone();
+        other.url = Some("https://y.example.com/mcp".to_string());
+
+        let file_a = f.agent(
+            "a1",
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://x.example.com/mcp"}}}"#,
+        );
+        let file_b = f.agent(
+            "a2",
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://y.example.com/mcp"}}}"#,
+        );
+        f.seed(&[("a1", file_a, http), ("a2", file_b, other)]);
+
+        let out = list(Some(&f.index())).unwrap();
+        assert_eq!(out.servers.len(), 2, "url 不同不许合并");
+        assert!(out.conflicts.contains_key("remote"));
+        for s in &out.servers {
+            assert!(
+                s.declared_in
+                    .iter()
+                    .all(|d| d.state == DupState::Drifted),
+                "改了 url 的一组应当标 drifted"
+            );
+        }
     }
 
     /// 同名不同参 → 两行，并且 conflicts 点名这个名字下有两个哈希。
@@ -1835,37 +2298,6 @@ mapper = "{mapper}"
         let err = show(Some(&f.index()), "nope").unwrap_err().to_string();
         assert!(err.contains("unknown MCP server"), "{err}");
         assert!(err.contains("echo"), "未知名字要列出已知名字: {err}");
-    }
-
-    /// diff 走通用引擎，报的是「哪个字段不一样」。
-    #[test]
-    fn diff_点名差异字段() {
-        let f = Fake::new();
-        f.seed(&[
-            (
-                "a1",
-                f.agent("a1", &body(r#""hi""#)),
-                stdio("echo", "echo", &["hi"]),
-            ),
-            (
-                "a2",
-                f.agent("a2", &body(r#""bye""#)),
-                stdio("echo", "echo", &["bye"]),
-            ),
-        ]);
-
-        let d = diff(Some(&f.index()), "echo", "a1", "a2").unwrap();
-        assert!(!d.identical);
-        assert_eq!(d.left_label, "a1");
-        let keys: Vec<&str> = d.entries.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, ["args.0"], "只有第一个参数不同");
-        assert_eq!(d.entries[0].left.as_deref(), Some("hi"));
-        assert_eq!(d.entries[0].right.as_deref(), Some("bye"));
-
-        let err = diff(Some(&f.index()), "echo", "a1", "ghost")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("`ghost` does not declare"), "{err}");
     }
 
     // ---------------------- ping ----------------------
@@ -2581,6 +3013,499 @@ exec sleep 300
         assert!(
             write_plan(&toml_section, "a.b").is_err(),
             "带点的名字在点路径里无法表达"
+        );
+    }
+
+    // ---------------------- remove ----------------------
+
+    /// 三种真实形状的配置：claude 的 `~/.claude.json`、codex 的
+    /// `~/.codex/config.toml`、gemini 的 `~/.gemini/settings.json`。
+    /// 清单段照抄内置 `adapters/*.toml` 的 mcp 声明，用 `scan` 建索引——
+    /// 测试与真实机器的差异只剩一个假 home。
+    struct RealFake {
+        home: TempDir,
+    }
+
+    /// claude 的主配置：注释 + 无关键 + 两条 server。形状照 `~/.claude.json`。
+    const CLAUDE_JSON: &str = r#"{
+  // 用户手写的注释，必须逐字节还在
+  "theme": "dark",
+  "mcpServers": {
+    "stitch": { "command": "npx", "args": ["-y", "@stitch/mcp"] },
+    "context7": { "command": "uvx", "args": ["context7-mcp"] }
+  },
+  "telemetry": false
+}
+"#;
+
+    /// codex 的主配置：头部注释、无关键、带表头注释的 server 表。
+    /// 形状照 `~/.codex/config.toml`（`toml_edit` 的保守改写对象）。
+    const CODEX_TOML: &str = r#"# codex 配置头，这段手写注释必须活下来
+model = "gpt-5"
+
+[mcp_servers]
+
+# 这条注释属于 stitch，删它的时候要跟着走
+[mcp_servers.stitch]
+command = "npx"
+args = ["-y", "@stitch/mcp"]
+
+[mcp_servers.context7]
+command = "uvx"
+
+[projects."/Users/laibu/Downloads"]
+something = 1
+"#;
+
+    /// gemini 的主配置：两条 server + 无关键。形状照 `~/.gemini/settings.json`
+    /// （gemini-json 方言，传输判定规则与 standard-json 不同）。
+    const GEMINI_JSON: &str = r#"{
+  "mcpServers": {
+    "stitch": { "command": "npx", "args": ["-y", "@stitch/mcp"] },
+    "context7": { "command": "uvx" }
+  },
+  "metricsDisabled": true
+}
+"#;
+
+    /// 摘掉 stitch 之后的 claude 配置——逐字节断言用的期望值。
+    const CLAUDE_AFTER: &str = r#"{
+  // 用户手写的注释，必须逐字节还在
+  "theme": "dark",
+  "mcpServers": {
+    "context7": { "command": "uvx", "args": ["context7-mcp"] }
+  },
+  "telemetry": false
+}
+"#;
+
+    /// 摘掉 stitch（连同属于它的表头注释）之后的 codex 配置。
+    const CODEX_AFTER: &str = r#"# codex 配置头，这段手写注释必须活下来
+model = "gpt-5"
+
+[mcp_servers]
+
+[mcp_servers.context7]
+command = "uvx"
+
+[projects."/Users/laibu/Downloads"]
+something = 1
+"#;
+
+    /// 摘掉 stitch 之后的 gemini 配置。
+    const GEMINI_AFTER: &str = r#"{
+  "mcpServers": {
+    "context7": { "command": "uvx" }
+  },
+  "metricsDisabled": true
+}
+"#;
+
+    impl RealFake {
+        fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            fs::create_dir_all(home.path().join(".agent-duster/adapters")).unwrap();
+            let f = Self { home };
+            f.add_agent(
+                "claude-code",
+                "mcp/standard-json",
+                "~/.claude.json",
+                Some("/mcpServers"),
+                None,
+                CLAUDE_JSON,
+            );
+            f.add_agent(
+                "codex",
+                "mcp/codex-toml",
+                "~/.codex/config.toml",
+                None,
+                Some("mcp_servers"),
+                CODEX_TOML,
+            );
+            f.add_agent(
+                "gemini-cli",
+                "mcp/gemini-json",
+                "~/.gemini/settings.json",
+                Some("/mcpServers"),
+                None,
+                GEMINI_JSON,
+            );
+            f
+        }
+
+        /// 落一份「真实形状」的清单（路径与 mcp 段照抄内置清单）+ 配置文件。
+        fn add_agent(
+            &self,
+            id: &str,
+            mapper: &str,
+            path: &str,
+            json_ptr: Option<&str>,
+            toml_key: Option<&str>,
+            body: &str,
+        ) -> PathBuf {
+            let locator = match (json_ptr, toml_key) {
+                (Some(p), _) => format!("json_pointer = \"{p}\""),
+                (_, Some(k)) => format!("toml_key = \"{k}\""),
+                _ => unreachable!("fixture 必须给定位"),
+            };
+            fs::write(
+                self.home
+                    .path()
+                    .join(".agent-duster/adapters")
+                    .join(format!("{id}.toml")),
+                format!(
+                    r#"
+[agent]
+id = "{id}"
+display_name = "{id}"
+
+[probe]
+any_of = ["{path}"]
+
+[[resource]]
+kind = "mcp"
+scope = "global"
+path = "{path}"
+{locator}
+mapper = "{mapper}"
+"#
+                ),
+            )
+            .unwrap();
+            let file = if let Some(rest) = path.strip_prefix("~/") {
+                self.home.path().join(rest)
+            } else {
+                PathBuf::from(path)
+            };
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, body).unwrap();
+            file
+        }
+
+        fn home(&self) -> &Path {
+            self.home.path()
+        }
+
+        fn index(&self) -> PathBuf {
+            self.home.path().join(".agent-duster/index.db")
+        }
+
+        fn scan(&self) {
+            crate::scan::scan(&crate::scan::ScanOptions {
+                home: Some(self.home().to_path_buf()),
+                index_path: Some(self.index()),
+                full: true,
+            })
+            .unwrap();
+        }
+
+        /// 那份配置文件在删除前的内容（断言「归档里有整份原配置」用）。
+        fn file_body(&self, rel: &str) -> Vec<u8> {
+            fs::read(self.home().join(rel)).unwrap()
+        }
+    }
+
+    fn rm_opts(f: &RealFake, name: &str, agent: Option<&str>) -> RemoveOptions {
+        RemoveOptions {
+            index_path: Some(f.index()),
+            home: Some(f.home().to_path_buf()),
+            archive: true,
+            dry_run: false,
+            name: name.to_string(),
+            agent: agent.map(|s| s.to_string()),
+            all_agents: false,
+        }
+    }
+
+    /// 摘掉 claude 的 stitch：键没了、同文件其他内容**逐字节**不变、
+    /// 索引不再列它、快照留在 home 下。
+    #[test]
+    fn rm_摘掉一个声明_同文件其余内容逐字不变() {
+        let f = RealFake::new();
+        f.scan();
+        let file = f.home().join(".claude.json");
+        let before = fs::read(&file).unwrap();
+
+        let r = remove(&rm_opts(&f, "stitch", Some("claude-code"))).unwrap();
+        assert_eq!(r.outcomes.len(), 1);
+        assert_eq!(r.outcomes[0].action, "removed", "{:?}", r.outcomes[0].error);
+        assert_eq!(r.outcomes[0].key, "/mcpServers/stitch");
+        assert!(!r.outcomes[0].path.is_empty());
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            CLAUDE_AFTER,
+            "只删那一个键：其余内容必须逐字节不变"
+        );
+        assert_ne!(
+            fs::read(&file).unwrap(),
+            before,
+            "被摘的键当然要真的消失"
+        );
+
+        // 索引同步：下一次 list 不许再列着已删的声明。
+        let list = list(Some(&f.index())).unwrap();
+        assert!(
+            !list
+                .servers
+                .iter()
+                .any(|s| s.name == "stitch" && s.declared_in.iter().any(|d| d.agent_id == "claude-code")),
+            "索引里不许留幽灵声明"
+        );
+
+        // 内部安全网：改写前留了整文件快照。
+        assert!(
+            f.home()
+                .join(".agent-duster/snapshots")
+                .read_dir()
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false),
+            "写别人的主配置前必须留快照"
+        );
+    }
+
+    /// codex 与 gemini 两种方言同一条契约：TOML 摘整张表（连同属于它的
+    /// 表头注释），JSON（gemini-json）摘成员，其余内容逐字节不变。
+    #[test]
+    fn rm_三种真实形状_同一套保守改写() {
+        let f = RealFake::new();
+        f.scan();
+
+        let toml = f.home().join(".codex/config.toml");
+        let r = remove(&rm_opts(&f, "stitch", Some("codex"))).unwrap();
+        assert_eq!(r.outcomes[0].action, "removed", "{:?}", r.outcomes[0].error);
+        assert_eq!(r.outcomes[0].key, "mcp_servers.stitch");
+        assert_eq!(
+            fs::read_to_string(&toml).unwrap(),
+            CODEX_AFTER,
+            "兄弟表、头部注释、无关键逐字节不变"
+        );
+
+        let gem = f.home().join(".gemini/settings.json");
+        let r = remove(&rm_opts(&f, "stitch", Some("gemini-cli"))).unwrap();
+        assert_eq!(r.outcomes[0].action, "removed", "{:?}", r.outcomes[0].error);
+        assert_eq!(r.outcomes[0].key, "/mcpServers/stitch");
+        assert_eq!(
+            fs::read_to_string(&gem).unwrap(),
+            GEMINI_AFTER,
+            "gemini-json 与 standard-json 走同一条保守摘键"
+        );
+    }
+
+    /// 多家声明时不许默认删全部：`--agent` 缺了要报错并列出候选；
+    /// 点名的 agent 没有声明它同样报错列候选。想删全部必须显式
+    /// `--all-agents`。
+    #[test]
+    fn rm_多家声明时_缺agent报错列候选_all_agents才删全部() {
+        let f = RealFake::new(); // claude + codex + gemini 三家都声明 stitch
+        f.scan();
+
+        let err = remove(&RemoveOptions {
+            agent: None,
+            all_agents: false,
+            ..rm_opts(&f, "stitch", None)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("claude-code"), "候选要列全: {err}");
+        assert!(err.contains("codex"), "候选要列全: {err}");
+        assert!(err.contains("gemini-cli"), "候选要列全: {err}");
+        assert!(err.contains("--agent"), "报错要点名 --agent: {err}");
+        assert!(err.contains("--all-agents"), "报错要点名 --all-agents: {err}");
+
+        // 点名的 agent 没有声明它：同样列候选。
+        let err = remove(&rm_opts(&f, "stitch", Some("ghost")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`ghost` does not declare"), "{err}");
+        assert!(err.contains("claude-code"), "{err}");
+        assert!(err.contains("codex"), "{err}");
+
+        // 三家的文件一个字节都没被动过。
+        assert_eq!(
+            fs::read_to_string(f.home().join(".claude.json")).unwrap(),
+            CLAUDE_JSON
+        );
+        assert_eq!(
+            fs::read_to_string(f.home().join(".codex/config.toml")).unwrap(),
+            CODEX_TOML
+        );
+
+        // --all-agents：每家各摘一条。
+        let r = remove(&RemoveOptions {
+            agent: None,
+            all_agents: true,
+            ..rm_opts(&f, "stitch", None)
+        })
+        .unwrap();
+        assert_eq!(r.outcomes.len(), 3, "三家都声明了它");
+        assert!(r.outcomes.iter().all(|o| o.action == "removed"));
+        assert!(!fs::read_to_string(f.home().join(".claude.json"))
+            .unwrap()
+            .contains("stitch"));
+        assert!(!fs::read_to_string(f.home().join(".codex/config.toml"))
+            .unwrap()
+            .contains("stitch"));
+    }
+
+    /// 归档里必须有**整份**原配置：删前打包，`tar -xf` 在 home 下解开即
+    /// 原位还原——摘错了一条声明，用户要能把整份配置捣回来。
+    #[test]
+    fn rm_归档里是删前的整份原配置() {
+        let f = RealFake::new();
+        f.scan();
+        let claude = f.file_body(".claude.json");
+        let codex = f.file_body(".codex/config.toml");
+
+        let r = remove(&RemoveOptions {
+            agent: None,
+            all_agents: true,
+            ..rm_opts(&f, "stitch", None)
+        })
+        .unwrap();
+        let pack = r.archive.expect("默认必须归档");
+        assert!(pack.is_file(), "归档包要真的落在盘上: {}", pack.display());
+        assert!(
+            pack.starts_with(f.home().join("agent-duster-exports")),
+            "归档要落进 home 的导出目录: {}",
+            pack.display()
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        duster_fs::archive::extract_to(&pack, out.path()).unwrap();
+        assert_eq!(
+            fs::read(out.path().join(".claude.json")).unwrap(),
+            claude,
+            "归档里是删前的整份 claude 配置"
+        );
+        assert_eq!(
+            fs::read(out.path().join(".codex/config.toml")).unwrap(),
+            codex,
+            "归档里是删前的整份 codex 配置"
+        );
+
+        // 摘完的盘上文件与归档里的原件必须不同——归档存的是「删之前」。
+        assert_ne!(
+            fs::read(f.home().join(".claude.json")).unwrap(),
+            claude
+        );
+    }
+
+    /// schema_guard 指纹对不上 → 这个目标自动降为只读并说出来，一字节不写、
+    /// 索引行保留。别的目标不受连累（分号后那家照删）。
+    #[test]
+    fn rm_guard指纹漂移_降只读不写盘() {
+        let f = RealFake::new();
+        f.scan();
+        let toml = f.home().join(".codex/config.toml");
+        let before = fs::read(&toml).unwrap();
+        {
+            let idx = Index::open(&f.index()).unwrap();
+            let slot = format!("guard:codex:mcp:{}", toml.display());
+            meta::set(idx.conn(), &slot, "0123456789abcdef").unwrap();
+        }
+
+        let r = remove(&rm_opts(&f, "stitch", Some("codex"))).unwrap();
+        assert_eq!(r.outcomes.len(), 1);
+        assert_eq!(r.outcomes[0].action, "refused");
+        let err = r.outcomes[0].error.clone().unwrap();
+        assert!(err.contains("structure changed"), "{err}");
+        assert!(err.contains("0123456789abcdef"), "要说出期望指纹: {err}");
+        assert_eq!(fs::read(&toml).unwrap(), before, "被拒的目标一字节不许动");
+
+        // 索引行保留：声明还在（list 仍能列出它）。
+        let list = list(Some(&f.index())).unwrap();
+        assert!(
+            list.servers
+                .iter()
+                .any(|s| s.name == "stitch" && s.declared_in.iter().any(|d| d.agent_id == "codex")),
+            "被拒的目标索引行不许删"
+        );
+        // 没写盘 → 也不该有快照垃圾与归档包。
+        assert!(!r.archive.is_some(), "refused 不许归档");
+        assert!(
+            !f.home().join(".agent-duster/snapshots").exists(),
+            "refused 不许留快照"
+        );
+    }
+
+    /// `--dry-run` 只报将变成什么样：连键的落点（哪个文件的哪个键）都要说清，
+    /// 但一个字节不写、一个归档不打、一份快照不留、guard 基准不落库。
+    #[test]
+    fn rm_dry_run_不动盘() {
+        let f = RealFake::new();
+        f.scan();
+        let claude = fs::read(f.home().join(".claude.json")).unwrap();
+        let toml = fs::read(f.home().join(".codex/config.toml")).unwrap();
+
+        let r = remove(&RemoveOptions {
+            archive: true,
+            dry_run: true,
+            ..rm_opts(&f, "stitch", Some("claude-code"))
+        })
+        .unwrap();
+        assert_eq!(r.outcomes.len(), 1, "只删 claude-code 那一条");
+        assert_eq!(r.outcomes[0].action, "removed", "{:?}", r.outcomes[0].error);
+        assert_eq!(r.outcomes[0].key, "/mcpServers/stitch");
+        assert!(r.outcomes[0].freed > 0, "预估要给出释放字节");
+        assert!(r.freed_bytes > 0);
+        assert!(r.archive.is_none(), "dry-run 不许打归档包");
+
+        assert_eq!(fs::read(f.home().join(".claude.json")).unwrap(), claude);
+        assert_eq!(fs::read(f.home().join(".codex/config.toml")).unwrap(), toml);
+        assert!(
+            !f.home().join("agent-duster-exports").exists(),
+            "dry-run 不许建导出目录"
+        );
+        assert!(
+            !f.home().join(".agent-duster/snapshots").exists(),
+            "dry-run 不许留快照"
+        );
+    }
+
+    /// `--no-archive` 显式关掉归档：键照删，但导出目录里什么都不留。
+    /// 摘键依旧走 guard + 快照 + 原子写那套。
+    #[test]
+    fn rm_no_archive_键照删但不打归档包() {
+        let f = RealFake::new();
+        f.scan();
+        let r = remove(&RemoveOptions {
+            archive: false,
+            ..rm_opts(&f, "stitch", Some("claude-code"))
+        })
+        .unwrap();
+        assert_eq!(r.outcomes[0].action, "removed");
+        assert!(r.archive.is_none());
+        assert_eq!(
+            fs::read_to_string(f.home().join(".claude.json")).unwrap(),
+            CLAUDE_AFTER
+        );
+        assert!(!f.home().join("agent-duster-exports").exists());
+    }
+
+    /// 索引里说在、文件里已经没有这条声明（duster 之外动过文件）：
+    /// 摘无可摘 → absent，索引行照样清掉，一个字节不写。
+    #[test]
+    fn rm_文件里已无此声明_absent并清索引行() {
+        let f = RealFake::new();
+        f.scan();
+        // scan 之后手工把 stitch 从 claude 的配置里摘掉——索引此刻还列着它，
+        // 文件里已经没有了（模拟 duster 之外动过文件）。
+        fs::write(
+            f.home().join(".claude.json"),
+            CLAUDE_AFTER.replace("// 用户手写的注释，必须逐字节还在\n", ""),
+        )
+        .unwrap();
+
+        let r = remove(&rm_opts(&f, "stitch", Some("claude-code"))).unwrap();
+        assert_eq!(r.outcomes[0].action, "absent", "{:?}", r.outcomes[0].error);
+        let list = list(Some(&f.index())).unwrap();
+        assert!(
+            !list
+                .servers
+                .iter()
+                .any(|s| s.name == "stitch" && s.declared_in.iter().any(|d| d.agent_id == "claude-code")),
+            "absent 的索引行也要清掉"
         );
     }
 }

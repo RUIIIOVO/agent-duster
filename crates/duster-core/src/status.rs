@@ -1,15 +1,23 @@
 //! `duster status`:纯读索引,汇总各 agent 体积/资源计数。
 //!
 //! 只读打开(不建目录、不迁移、不抢写锁),扫描进行中也能看;
-//! 库不存在时给出人话提示,引导先跑 `duster scan`。
+//! 库还没建过就先建一次,见 [`crate::freshness::ensure_exists`]。
+//!
+//! 上一轮改造把「捎一轮他检」从 status 里整体撤下了：issues / deep / ping
+//! 三个旗标连同它们伺候的六项检查（明文凭据、skill 元数据、配置语法、
+//! 断链、agent 库完整性、MCP 可达性）一起删掉，status 的退出码回到
+//! 纯 0/失败。本模块只剩一个入口 [`status`]；agent 的 SQLite 库读不读得动
+//! 移去了 `duster doctor` 的自检（见 `crate::doctor::check_sqlite`）。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use duster_index::db::Index;
+
+use crate::freshness;
 
 /// 单个 agent 的索引统计。
 #[derive(Debug, Serialize)]
@@ -41,16 +49,7 @@ pub struct StatusReport {
 
 /// 读取索引并按 agent 聚合。`index_path` 缺省 `~/.agent-duster/index.db`。
 pub fn status(index_path: Option<&Path>) -> Result<StatusReport> {
-    let path: PathBuf = match index_path {
-        Some(p) => p.to_path_buf(),
-        None => duster_fs::path::expand_tilde("~/.agent-duster/index.db"),
-    };
-    if !path.is_file() {
-        bail!(
-            "index database not found: {}. Run `duster scan` first to build it.",
-            path.display()
-        );
-    }
+    let path = freshness::ensure_exists(index_path)?;
     let idx = Index::open_readonly(&path)
         .with_context(|| format!("failed to open index read-only: {}", path.display()))?;
     let conn = idx.conn();
@@ -142,13 +141,15 @@ pub fn status(index_path: Option<&Path>) -> Result<StatusReport> {
 mod tests {
     use super::*;
 
+    /// 库不存在不再是错误:自己建一个,给一份空报告。用户从没听说过
+    /// 「索引」这个东西,不该在这里被拦下来先学一个概念再回来。
     #[test]
-    fn 库不存在时提示先跑_scan() {
-        let missing = std::env::temp_dir().join(format!(
-            "duster-core-status-miss-{}/nope.db",
-            std::process::id()
-        ));
-        let err = status(Some(&missing)).unwrap_err();
-        assert!(err.to_string().contains("duster scan"), "{err:#}");
+    fn 库不存在时自动建库而不报错() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index = tmp.path().join(".agent-duster").join("index.db");
+
+        let rep = status(Some(&index)).unwrap();
+        assert!(index.is_file(), "库该被建出来");
+        assert_eq!(rep.total_bytes, 0, "空 home 里扫不出任何东西");
     }
 }

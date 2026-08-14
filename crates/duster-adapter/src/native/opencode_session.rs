@@ -352,6 +352,79 @@ pub fn read_turn(db: &Path, message_rowid: i64) -> Result<String> {
     Ok(render_parts(&datas).0)
 }
 
+/// 从库里删除一个会话（连同它的 `message` 与 `part` 行），整个删除包在
+/// 一个事务里。返回删掉的 `session` 行数（0 = 库里已经没有这个会话）。
+///
+/// 这是本适配器**唯一的写入口**（读侧全是只读）：`duster session rm` 删
+/// 库型会话时调用，`session_id` 就是索引里那条资源的 `key`。
+///
+/// # schema_guard（库形态）
+///
+/// 写之前先确认要碰的表/列都还在：上游 schema 在动（`migration` 表已有
+/// 38 条），对一个自己不了解形状的库下 DELETE，是把别人的数据当试验田。
+/// 表缺了或列改名了 → Err，调用方把这一条记进 warnings，不中断批量——
+/// 与读侧「先问这张表还在吗再查」是同一个原则，只是这次问完要动手写。
+///
+/// # 原子与锁
+///
+/// 三条 DELETE 包在一个事务里：要么全删要么一个不删。`busy_timeout` 与
+/// 读侧同一个短值——agent 正在写库时等一下是合理的，等不到就 Err
+/// （调用方记进 warnings，别的会话照删）。
+pub fn delete_session(db: &Path, session_id: &str) -> Result<u64> {
+    let mut conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open opencode session database: {}", db.display()))?;
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+
+    // schema_guard：先验形状再动刀。列名单是模块文档里实测词汇表的子集——
+    // 只验这三条 DELETE 真正要碰的列。
+    for (table, need) in [
+        ("session", &["id"][..]),
+        ("message", &["session_id"][..]),
+        ("part", &["session_id"][..]),
+    ] {
+        if !has_table(&conn, table)? {
+            bail!(
+                "opencode session database has no `{table}` table: {}",
+                db.display()
+            );
+        }
+        let actual = columns(&conn, table)?;
+        for col in need {
+            if !actual.iter().any(|c| c == col) {
+                bail!(
+                    "opencode session database table `{table}` lost column `{col}`: {}",
+                    db.display()
+                );
+            }
+        }
+    }
+
+    let tx = conn
+        .transaction()
+        .with_context(|| format!("failed to begin session delete in {}", db.display()))?;
+    // 先子后父：part → message → session。不依赖外键级联——上游建表时
+    // 没声明外键（fixture 与实测 schema 都没有），显式删干净才是唯一保证。
+    tx.execute(
+        "DELETE FROM \"part\" WHERE \"session_id\" = ?1",
+        [session_id],
+    )
+    .with_context(|| format!("failed to delete parts of session {session_id}"))?;
+    tx.execute(
+        "DELETE FROM \"message\" WHERE \"session_id\" = ?1",
+        [session_id],
+    )
+    .with_context(|| format!("failed to delete messages of session {session_id}"))?;
+    let n = tx
+        .execute("DELETE FROM \"session\" WHERE \"id\" = ?1", [session_id])
+        .with_context(|| format!("failed to delete session row {session_id}"))?;
+    tx.commit()
+        .with_context(|| format!("failed to commit session delete in {}", db.display()))?;
+    Ok(n as u64)
+}
+
 /// 把一条 message 名下的 part JSON 列表渲染成轮次正文。
 ///
 /// 返回 `(正文, 是否只有辅助内容)`。第二个值为 true 表示这条 message 没有

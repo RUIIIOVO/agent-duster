@@ -52,6 +52,8 @@ use duster_index::db::Index;
 use duster_index::query::{self, ResourceFilter, ResourceRecord};
 use duster_model::CleanLevel;
 
+use crate::freshness;
+
 /// 三个动词。决定计划的取材范围与同意模型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -350,19 +352,15 @@ fn expand(raw: &str, home: &Path) -> PathBuf {
 
 /// 只读打开索引。缺省 `<home>/.agent-duster/index.db`。
 ///
-/// 缺库提示与 [`crate::status`] 逐字一致：用户下一步该干什么，
-/// 整个程序里只能有一种说法。
+/// 库还没建过就先建一次（[`crate::freshness::ensure_exists`]），与
+/// [`crate::status`] 同一条路：「库在不在、谁负责让它在」整个程序里
+/// 只能有一种说法。
 fn open_index(opts: &PlanOptions, home: &Path) -> Result<Index> {
-    let path = opts
+    let declared = opts
         .index_path
         .clone()
         .unwrap_or_else(|| home.join(".agent-duster").join("index.db"));
-    if !path.is_file() {
-        bail!(
-            "index database not found: {}. Run `duster scan` first to build it.",
-            path.display()
-        );
-    }
+    let path = freshness::ensure_exists(Some(&declared))?;
     Index::open_readonly(&path)
         .with_context(|| format!("failed to open index read-only: {}", path.display()))
 }
@@ -919,8 +917,9 @@ fn drop_vanished(items: &mut Vec<PlanItem>, warnings: &mut Vec<String>) {
     let gone = before - items.len();
     if gone > 0 {
         warnings.push(format!(
-            "{gone} indexed path(s) no longer exist on disk and were left out of this plan. \
-             Run `duster scan` to refresh the index"
+            "{gone} indexed path(s) no longer exist on disk and were left out of this plan \
+             (they were removed outside duster after being indexed; the plan already \
+             accounts for that)"
         ));
     }
 }
@@ -1686,6 +1685,7 @@ mod tests {
             clean_level: None,
             reclaimable: None,
             install_bytes: None,
+            mapper: None,
         }
     }
 
@@ -2365,8 +2365,15 @@ mod tests {
         assert_eq!(plan.items[0].action, Action::RemoveDir);
         assert_eq!(plan.reclaim_bytes, 500, "消失的那条不许计进可回收量");
         assert!(
-            plan.warnings.iter().any(|w| w.contains("duster scan")),
-            "必须告诉用户索引过期了: {:?}",
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("no longer exist on disk")),
+            "必须说明有索引行对不上磁盘: {:?}",
+            plan.warnings
+        );
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("duster scan")),
+            "重扫救不了「盘上已经没有」,不许再叫用户去跑一遍: {:?}",
             plan.warnings
         );
     }

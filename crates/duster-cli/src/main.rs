@@ -12,17 +12,20 @@ use clap::{Parser, Subcommand};
 use console::{Style, style};
 
 use duster_core::clean::{Buckets, CleanOptions, CleanOutcome, clean, clean_filtered};
-use duster_core::doctor::{ALL_CHECKS, DoctorOptions, DoctorReport, Finding, Severity, doctor};
+use duster_core::delete::{DeleteOptions, DeleteReport};
+use duster_core::doctor::{Finding, SELF_CHECKS, SelfReport, Severity, self_check};
+use duster_core::freshness::{Freshness, ensure_fresh};
 use duster_core::plan::{Action, Plan, PlanFilter, PlanItem, Verb, parse_older_than};
 use duster_core::prune::{PruneOptions, PruneOutcome, prune, prune_filtered};
 use duster_core::scan::{ScanOptions, ScanReport, scan};
 use duster_core::search::{SearchFilter, SearchHit, TurnDetail, open_turn, search};
 use duster_core::session::SessionDetail;
-use duster_core::skill_ops::{DupState, LinkMode, LinkReport, SkillGroup, copies, link};
+use duster_core::skill_ops::{self, DupState, LinkMode, LinkReport, SkillGroup, link};
 use duster_core::status::{StatusReport, status};
 use duster_core::uninstall::{
     PackageOutcome, PreflightCheck, SharedAction, SharedEditOutcome, UninstallOptions, uninstall,
 };
+use duster_fs::path::display_tilde;
 use duster_model::CleanLevel;
 
 mod browse;
@@ -76,12 +79,15 @@ fn examples() -> String {
     let rows = [
         ("duster", "Open the menu and pick a command"),
         ("duster scan", "Find your agents and index what they store"),
-        ("duster status", "See which agent uses how much disk"),
+        (
+            "duster status",
+            "See disk use per agent, and what it keeps",
+        ),
         (
             "duster search \"docker\"",
             "Find a past conversation by its words",
         ),
-        ("duster open 42", "Read the whole turn that search found"),
+        ("duster open t42", "Read the whole turn that search found"),
         (
             "duster session list",
             "Browse your conversations by project and age",
@@ -96,16 +102,13 @@ fn examples() -> String {
             "Remove everything one agent keeps on disk",
         ),
         (
-            "duster skill copies",
-            "See which skills exist in more than one place",
+            "duster skill list",
+            "See every skill, and which ones live in more than one place",
         ),
-        (
-            "duster doctor --secrets",
-            "Find API keys sitting in plain text",
-        ),
+        ("duster doctor", "Check that duster itself is set up right"),
         (
             "duster mcp list",
-            "See every MCP server, merged across agents",
+            "See every MCP server declaration, agent by agent",
         ),
         (
             "duster memory list",
@@ -150,9 +153,13 @@ enum Command {
     },
     /// Print one whole conversation turn, or a whole conversation
     Open {
-        /// Turn id shown as `#42` in search results; a conversation id from
-        /// `duster session list` works too
-        tid: i64,
+        /// Which turn or conversation to read. Three forms: `t<turn-id>`
+        /// (from `duster search`), `s<conversation-id>` (from `duster
+        /// session list`), or a bare `<number>` that matches either —
+        /// e.g. t42 / s500 / 42. Bare numbers that match both are rejected
+        /// with two pasteable commands, so nothing gets silently picked
+        #[arg(value_name = "ID")]
+        id: String,
         /// Lift the turn-collapse and line cap: show tool bodies and every
         /// line (the same --full as `duster session show`)
         #[arg(long)]
@@ -239,7 +246,7 @@ enum Command {
         #[command(subcommand)]
         action: cmd::memory::MemoryCmd,
     },
-    /// See every MCP server you have, merged across the agents that declare it
+    /// See every MCP server you have, one row per agent that declares it
     Mcp {
         #[command(subcommand)]
         action: cmd::mcp::McpCmd,
@@ -251,34 +258,30 @@ enum Command {
     },
     /// Compare two files or two folders, line by line
     Diff(cmd::diff::DiffArgs),
-    /// Check what your agents left behind: secrets, broken links, bad configs
-    Doctor {
-        /// Look for API keys and tokens stored in plain text
-        #[arg(long)]
-        secrets: bool,
-        /// Start each MCP server once to see whether it still works
-        #[arg(long)]
-        ping: bool,
-        /// Only these agents, comma separated, e.g. --agent codex,omp
-        #[arg(long = "agent", value_delimiter = ',', value_name = "AGENT")]
-        agents: Vec<String>,
-        /// Run only this check. Repeat for more than one
-        #[arg(
-            long = "check",
-            value_name = "NAME",
-            value_parser = clap::builder::PossibleValuesParser::new(ALL_CHECKS),
-        )]
-        checks: Vec<String>,
-    },
+    /// Check that duster itself is set up right: index database, adapters,
+    /// folder permissions, the SQLite databases your agents keep, version
+    ///
+    /// This one is about duster and this machine, not about your agents'
+    /// leftover configs — the checks that looked at those (plaintext keys,
+    /// broken links, bad configs) were removed in an earlier round, together
+    /// with every status flag that switched them.
+    // 旗标全清是这两轮改名的另一半:`--no-secrets` / `--ping` / `--agent` /
+    // `--check` 连同它们伺候的六项检查整体撤掉,status 的三个旗标(issues /
+    // deep / ping)这一轮也删了。`brew doctor` 查 brew、`flutter doctor` 查
+    // flutter,从来没有一个 doctor 是查别人家的;这条命令从前查遍了除 duster
+    // 以外的一切,名字在撒谎——所以换的是名字底下的东西,不是名字。如今
+    // doctor 只查「duster 自己装好没有」,外加 agent 的 SQLite 库读不读得动
+    // (那是环境事实,见 duster_core::doctor::check_sqlite 的归属理由)。
+    Doctor,
 }
 
 #[derive(Subcommand)]
 enum SkillCmd {
-    /// List skills that exist in more than one place, and which copies drifted
-    Copies,
+    /// List every skill, marking the ones in more than one place and the copies that drifted
+    List,
     /// Give another agent the same skill, sharing one copy on disk
     Link {
-        /// Skill name as `duster skill copies` prints it
+        /// Skill name as `duster skill list` prints it
         name: String,
         /// Agent that has it now
         #[arg(long)]
@@ -290,12 +293,36 @@ enum SkillCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete one copy of a skill, after packing it into ~/agent-duster-exports
+    Rm {
+        /// Skill name as `duster skill list` prints it
+        name: String,
+        /// Which agent's copy to delete. Required when several agents have
+        /// this skill — duster never deletes all copies on your behalf
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// Which copy, by the PATH column of `duster skill list`. Required
+        /// when one agent keeps this skill in several directories
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Delete without packing a copy first (for scripts)
+        #[arg(long)]
+        no_archive: bool,
+        /// Print what would be deleted and stop
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
     let mode = is_json_mode(cli.json);
     let index = cli.index.as_deref();
+    // 读索引的一次性命令先把库对齐磁盘。「索引」是实现细节,不该是用户
+    // 要先学会的概念(见 needs_fresh_index 里的三个例外)。
+    if needs_fresh_index(cli.command.as_ref()) {
+        refresh_index(mode, index);
+    }
     let code = match &cli.command {
         Some(Command::Scan { full }) => cmd_scan(mode, index, *full),
         Some(Command::Status) => cmd_status(mode, index),
@@ -304,7 +331,12 @@ fn main() {
             agents,
             limit,
         }) => cmd_search(mode, index, query, agents.clone(), *limit),
-        Some(Command::Open { tid, full }) => cmd_open(mode, index, *tid, *full),
+        // open 的 id 是自由文本,clap 不校验形状;解析失败是用法错误,
+        // 与 `prune` 的 `--older-than` 值不合法同落退出码 2。
+        Some(Command::Open { id, full }) => match parse_open_id(id) {
+            Ok(parsed) => cmd_open(mode, index, parsed, *full),
+            Err(msg) => usage(mode, "open", &msg),
+        },
         Some(Command::Clean {
             agents,
             yes,
@@ -349,7 +381,7 @@ fn main() {
                 archive: archive_choice(*archive, *no_archive),
                 run_package_manager: *run_package_manager,
             },
-            // uninstall 没有 `--yes`:授权凭据是逐字输入的 agent id。
+            // uninstall 没有 `--yes`:授权凭据是 `--confirm` 的确认串。
             // 相等性由 cmd_uninstall 校验,不相等就降级成预览。
             if *dry_run {
                 Consent::Preview
@@ -358,37 +390,111 @@ fn main() {
             },
         ),
         Some(Command::Skill { action }) => match action {
-            SkillCmd::Copies => cmd_skill_copies(mode, index),
+            SkillCmd::List => cmd_skill_list(mode, index),
             SkillCmd::Link {
                 name,
                 from,
                 to,
                 dry_run,
             } => cmd_skill_link(mode, index, name, from, to, *dry_run),
+            SkillCmd::Rm {
+                name,
+                agent,
+                path,
+                no_archive,
+                dry_run,
+            } => cmd_skill_rm(
+                mode,
+                index,
+                None,
+                name,
+                agent.as_deref(),
+                path.as_deref(),
+                !*no_archive,
+                *dry_run,
+            ),
         },
         Some(Command::Memory { action }) => cmd::memory::run(mode, index, action),
         Some(Command::Mcp { action }) => cmd::mcp::run(mode, index, action.clone()),
         Some(Command::Session { action }) => cmd::session::run(mode, index, action.clone()),
         Some(Command::Diff(args)) => cmd::diff::run(mode, args),
-        Some(Command::Doctor {
-            secrets,
-            ping,
-            agents,
-            checks,
-        }) => cmd_doctor(
-            mode,
-            index,
-            DoctorArgs {
-                secrets: *secrets,
-                ping: *ping,
-                agents: agents.clone(),
-                checks: checks.clone(),
-            },
-        ),
+        Some(Command::Doctor) => cmd_doctor(mode, index),
         // 裸 `duster`:交互式启动菜单(TTY),否则打印帮助。
         None => interactive::run(mode, index),
     };
     std::process::exit(code);
+}
+
+/// 一次性命令跑之前要不要先把索引对齐磁盘。
+///
+/// 「索引」是实现细节,不该是用户要先学会的概念——他敲 `duster search`,要的是
+/// 搜到东西,不是先被告知「请先运行 duster scan」。增量刷新实测 0.52 秒、冷启动
+/// 全量 4.14 秒(见 [`duster_core::freshness`]),一次性命令等得起这一下。
+///
+/// 三个例外,都不是为了省那半秒:
+/// - `scan`:它本身就是扫描,先扫一遍等于扫两遍。
+/// - `doctor`:它自检的是 duster 自己(索引库、adapter 清单、目录权限、版本),
+///   一个字节都不从 agent 索引里读——更何况「这台机器还没索引过」正是它要报的
+///   一项,顺手建一次库就把那条诊断本身抹掉了。core 的 `doctor.rs` 写着同一句,
+///   两头口径不许走散。
+/// - `diff`:比的是命令行给的那两个路径,一个字节都不从索引里读。
+///
+/// 裸 `duster`(`None`)也不在这里等:交互菜单把扫描扔进后台线程,菜单立刻就出来
+/// (见 [`interactive`] 里的 `BackgroundScan`),在这里同步等一遍正好把那件事作废。
+///
+/// 不留 `_ => true` 的兜底:下一条命令加进来时,编译器必须逼作者在这两档里选一边,
+/// 而不是替他默认一个。
+fn needs_fresh_index(command: Option<&Command>) -> bool {
+    match command {
+        Some(
+            Command::Status
+            | Command::Search { .. }
+            | Command::Open { .. }
+            | Command::Clean { .. }
+            | Command::Prune { .. }
+            | Command::Uninstall { .. }
+            | Command::Skill { .. }
+            | Command::Memory { .. }
+            | Command::Mcp { .. }
+            | Command::Session { .. },
+        ) => true,
+        Some(Command::Scan { .. } | Command::Doctor | Command::Diff(_)) | None => false,
+    }
+}
+
+/// 跑命令之前把索引对齐磁盘。**绝不阻断命令**:扫描失败降级成一行 stderr
+/// warning,该读的照读——库多半还在盘上(读到的只是旧一点的数据),而每个
+/// 只读入口自己还有 `ensure_exists` 兜底。
+///
+/// 只有 [`Freshness::Built`] 说一句。`Refreshed` / `UpToDate` / `SkippedLocked`
+/// 一律静默:半秒钟的事,报出来只是噪音;撞锁更不是错(另一个 duster 实例正在写,
+/// 读路径全是 `open_readonly`,照样看得见)。
+///
+/// 那一句印在扫描**之后**,因为「这是不是第一次」只有扫过才知道。要在动手之前
+/// 预告,CLI 就得自己再推一遍缺省库路径,而那是 duster-core 的口径,抄过来就成了
+/// 第二份真相。所以它是回执而不是预告:解释刚才那四秒去哪了,并且说清它不会再来
+/// 第二次。
+///
+/// `--json` 下不印这句回执——它是说给盯着终端等的人听的,而信封里没有它的位置。
+/// warning 照印:数据是不是旧了,机器也该知道。
+fn refresh_index(mode: OutputMode, index: Option<&Path>) {
+    match ensure_fresh(index) {
+        Ok(Freshness::Built) if mode == OutputMode::Human => eprintln!(
+            "  {} {}",
+            ok_mark(),
+            muted().apply_to(
+                "built the index for the first time; later runs only re-read what changed"
+            )
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "  {} {}",
+            warn_mark(),
+            muted().apply_to(format!(
+                "index refresh failed: {e:#}; using what the index already has"
+            ))
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -676,9 +782,14 @@ fn render_scan_human(report: &ScanReport, warnings: &[String]) {
         for w in warnings {
             eprintln!("  {} {w}", warn_mark());
         }
+        // 别说「skipped」:悬空软链那类行是**入库了**的(size 0),这正是
+        // 它们能在 `skill list` 里以 broken 露头的前提。这一行只该说
+        // 「这些项没量全」,不能宣布它们不存在。
         eprintln!(
             "  {}",
-            muted().apply_to("Those items were skipped; everything else was indexed.")
+            muted().apply_to(
+                "Those items were indexed with what could be read; everything else was indexed in full."
+            )
         );
     }
 }
@@ -762,7 +873,7 @@ fn render_footprint(clean: &BTreeMap<String, u64>, install_bytes: u64) {
             "  {} {} {}",
             muted().apply_to("↳"),
             style(human_bytes(install_bytes)).bold(),
-            muted().apply_to("installed software — clean and prune never touch it")
+            muted().apply_to("installed software (never touched by clean/prune)")
         );
     }
 }
@@ -771,6 +882,13 @@ fn render_footprint(clean: &BTreeMap<String, u64>, install_bytes: u64) {
 // status
 // ---------------------------------------------------------------------------
 
+/// `duster status`。
+///
+/// 上一轮把体检整个撤了:issues / deep / ping 三个旗标连同它们伺候的六项
+/// 检查一起删掉,屏尾也不再有那行问题摘要,退出码回到纯 0/失败——这一屏
+/// 现在就是一张 agent 表加足迹。agent 的 SQLite 库读不读得动改由
+/// `duster doctor` 的自检去查(见 `duster_core::doctor::check_sqlite` 的
+/// 归属理由)。
 fn cmd_status(mode: OutputMode, index: Option<&Path>) -> i32 {
     let report = match status(index) {
         Ok(r) => r,
@@ -824,17 +942,17 @@ fn render_status_human(report: &StatusReport) {
             muted().apply_to("Run"),
             Style::new().green().bold().apply_to("duster scan")
         );
-        return;
+    } else {
+        println!("{}", table.render());
+        println!();
+        println!(
+            "  {} {} {}",
+            muted().apply_to("Total"),
+            style(human_bytes(report.total_bytes)).bold(),
+            muted().apply_to(format!("across {} agents", report.agents.len()))
+        );
+        render_footprint(&clean, install_bytes);
     }
-    println!("{}", table.render());
-    println!();
-    println!(
-        "  {} {} {}",
-        muted().apply_to("Total"),
-        style(human_bytes(report.total_bytes)).bold(),
-        muted().apply_to(format!("across {} agents", report.agents.len()))
-    );
-    render_footprint(&clean, install_bytes);
 }
 
 /// [`count_cell`] 的 u64 版本(status 的计数是 u64)。
@@ -905,56 +1023,67 @@ fn cmd_search(
                 .collect();
             emit_json("search", &data, &[]);
         }
-        OutputMode::Human => render_search_human(&hits, query),
+        OutputMode::Human => {
+            // 「无命中」的提示走 stderr(过程),命中列表才是结果。
+            if hits.is_empty() {
+                eprintln!();
+                eprintln!("  {} No matches for {}", warn_mark(), style(query).bold());
+                eprintln!(
+                    "  {}",
+                    muted().apply_to(
+                        "Search needs 3 characters or more. If the index is stale, run `duster scan`."
+                    )
+                );
+            } else {
+                println!("{}", render_search_human(&hits, query));
+            }
+        }
     }
     EXIT_OK
 }
 
-fn render_search_human(hits: &[SearchHit], query: &str) {
-    if hits.is_empty() {
-        eprintln!();
-        eprintln!("  {} No matches for {}", warn_mark(), style(query).bold());
-        eprintln!(
-            "  {}",
-            muted().apply_to(
-                "Search needs 3 characters or more. If the index is stale, run `duster scan`."
-            )
-        );
-        return;
-    }
+/// 命中列表的整块渲染。返回而不是边算边印:这样它能被测试逐字核对
+/// (与 cmd/session.rs 的 `render_list` 同一个理由)。`hits` 非空——
+/// 「无命中」的提示走 stderr,由 [`cmd_search`] 直接印。
+fn render_search_human(hits: &[SearchHit], query: &str) -> String {
     let color = use_color();
     let dot = muted().apply_to("·").to_string();
-    println!();
-    println!(
-        "  {}",
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str(&format!(
+        "  {}\n",
         muted().apply_to(format!(
             "{} {} for \"{query}\"",
             hits.len(),
             if hits.len() == 1 { "match" } else { "matches" }
         ))
-    );
+    ));
     for h in hits {
         let file = Path::new(&h.resource_path).file_name().map_or_else(
             || h.resource_path.clone(),
             |f| f.to_string_lossy().into_owned(),
         );
-        println!(
-            "  {}  {} {dot} {} {dot} {} {dot} {}",
-            style(format!("#{}", h.tid)).yellow().bold(),
+        // 命中行的第一格是 `t<tid>`(不是裸 `#<tid>`):turn id 与会话 id
+        // 都是裸数字、长得一模一样,前缀让 search 的定位符可以直接粘进
+        // `duster open`,也不会和 session list 的 `s<rid>` 混为一谈。
+        out.push_str(&format!(
+            "  {}  {} {dot} {} {dot} {} {dot} {}\n",
+            style(format!("t{}", h.tid)).yellow().bold(),
             accent().apply_to(&h.agent_id),
             // 会话文件名可以长到七十列(codex 的 rollout-<时间>-<uuid>),
             // 截断保住一行一条;定位靠 tid,文件名只是上下文。
             muted().apply_to(truncate_width(&file, 32)),
             muted().apply_to(format!("turn {}", h.seq)),
             style(&h.role).magenta()
-        );
-        println!("      {}", highlight(&h.snippet, &h.highlights, color));
+        ));
+        out.push_str(&format!("      {}\n", highlight(&h.snippet, &h.highlights, color)));
     }
-    println!();
-    println!(
+    out.push('\n');
+    out.push_str(&format!(
         "  {}",
-        muted().apply_to("Read one in full: duster open <id>")
-    );
+        muted().apply_to("Read one in full: duster open t<id>")
+    ));
+    out
 }
 
 /// 是否给命中着色。console 已内建 tty + `NO_COLOR` / `CLICOLOR_FORCE` 判定,
@@ -998,26 +1127,128 @@ enum OpenTarget {
     Session(SessionDetail),
 }
 
-/// 把 id 解析成轮次或整场会话。先按 turn 查,查无再按会话查;
-/// 两个都落空才报错,而且报错必须同时点名两个命令,让用户知道
-/// 自己用的是哪一档数字、该去哪一档找。
-fn resolve_open(index: Option<&Path>, id: i64) -> anyhow::Result<OpenTarget> {
-    match open_turn(index, id) {
-        Ok(d) => Ok(OpenTarget::Turn(d)),
-        // 只有「查无此项」才值得试会话 id:turn 存在但源文件读不动是
-        // 另一回事,拿同一个 id 去 show 只会把错误再包一层。
-        // 判据只能匹配 Display 的稳定文案(open_turn 没有错误枚举,
-        // 与 REFUSAL_PHRASES 同一套跨层字符串契约,两侧各有测试守着)。
-        Err(e) if is_missing(&e) => match duster_core::session::show(index, id) {
-            Ok(d) => Ok(OpenTarget::Session(d)),
-            Err(se) if is_missing(&se) => anyhow::bail!(
-                "id {id} matches neither a turn id nor a conversation id. \
-                 `duster search` prints turn ids (#42); `duster session list` \
-                 prints conversation ids. Use one of those to find a valid id."
+/// open 的寻址:前缀一上来就锁定空间,裸数字两个都试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenId {
+    /// `t<n>`:只查轮次空间,查不到就报错,不退化去查会话。
+    Turn(i64),
+    /// `s<n>`:只查会话空间,同理。
+    Session(i64),
+    /// 裸 `<n>`:两个空间都试(向后兼容脚本);两边都命中时报错让用户消歧。
+    Either(i64),
+}
+
+/// 三种可接受的形态,报错时一条给全,用户不用回去翻 --help。
+const OPEN_ID_FORMS: &str = "accepted forms: t<turn-id> (from `duster search`), \
+     s<conversation-id> (from `duster session list`), or a bare <number> that \
+     matches either — e.g. t42 / s500 / 42";
+
+/// 把 `open` 的 id 参数解析成 [`OpenId`]。纯函数,不碰 IO,形状契约
+/// 全在这里定死,`cmd_open` 只消费结果。
+///
+/// 前缀只认小写,与 search / session list 印出来的一字不差:印的是 `t42`,
+/// 那就该粘 `t42`,宽容大小写只会让报错文案和实际输出对不上号。
+/// 数字只认纯 ASCII 十进制:空 `t`、`t-1`、`+3`、`3_0` 都得死在这里,
+/// 不靠 `parse` 的宽容度兜底(与 parse_older_than 同一套判据)。
+fn parse_open_id(s: &str) -> Result<OpenId, String> {
+    let raw = s.trim();
+    // 首字节是 ASCII 的 t/s 才算前缀:CJK 等多字节字符的首字节 ≥ 0x80,
+    // 不可能误判成前缀。
+    let (space, rest) = match raw.as_bytes().first() {
+        Some(b't') => (Some(OpenSpace::Turn), &raw[1..]),
+        Some(b's') => (Some(OpenSpace::Session), &raw[1..]),
+        _ => (None, raw),
+    };
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid id {s:?}: {OPEN_ID_FORMS}"));
+    }
+    let n: i64 = match rest.parse() {
+        Ok(n) => n,
+        // 位数溢出 i64。正常 id 只有 5~6 位,超长不是笔误就是攻击。
+        Err(_) => {
+            return Err(format!("invalid id {s:?}: number is out of range. {OPEN_ID_FORMS}"))
+        }
+    };
+    Ok(match space {
+        Some(OpenSpace::Turn) => OpenId::Turn(n),
+        Some(OpenSpace::Session) => OpenId::Session(n),
+        None => OpenId::Either(n),
+    })
+}
+
+/// 前缀 → 寻址空间。与 [`OpenId`] 分开:解析先定空间,再填数字。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenSpace {
+    Turn,
+    Session,
+}
+
+/// 把 [`OpenId`] 解析成轮次或整场会话。
+///
+/// 前缀一上来就锁定空间:`t<n>` 只在轮次空间查、`s<n>` 只在会话空间查,
+/// 查不到就报错,不退化去另一个空间——用户既然标了前缀,想要的已经写明,
+/// 替他去另一档找只会把「id 打错了」静默变成「找到了别的东西」。
+/// 裸 `<n>` 保留老行为(两个空间都试、向后兼容脚本),但两档都命中时
+/// **不许自己挑一个**:tid 与 rid 都是自增主键,同一个数字迟早同时存在,
+/// 闷声返回轮次会静默吞掉用户想开的会话,所以这时必须报错并给出两条
+/// 可直接粘贴的 `duster open t<n>` / `duster open s<n>` 让用户消歧。
+fn resolve_open(index: Option<&Path>, id: OpenId) -> anyhow::Result<OpenTarget> {
+    match id {
+        OpenId::Turn(n) => match open_turn(index, n) {
+            Ok(d) => Ok(OpenTarget::Turn(d)),
+            // 只报轮次空间查无,顺带指一下另一种可能,不替用户换空间。
+            Err(e) if is_missing(&e) => anyhow::bail!(
+                "no turn with id t{n}. Turn ids come from `duster search` \
+                 (they look like t42); use `duster open s{n}` only if you \
+                 meant a conversation."
             ),
-            Err(se) => Err(se),
+            Err(e) => Err(e),
         },
-        Err(e) => Err(e),
+        OpenId::Session(n) => match duster_core::session::show(index, n) {
+            Ok(d) => Ok(OpenTarget::Session(d)),
+            Err(e) if is_missing(&e) => anyhow::bail!(
+                "no conversation with id s{n}. Conversation ids come from \
+                 `duster session list` (they look like s500); use \
+                 `duster open t{n}` only if you meant a turn."
+            ),
+            Err(e) => Err(e),
+        },
+        OpenId::Either(n) => {
+            // 先按轮次查。turn 报的不是「查无此项」就直接透传:turn 存在但
+            // 源文件读不动是另一回事,拿同一个数字去 show 只会把错误再包一层
+            // (判据只能匹配 Display 的稳定文案,与 REFUSAL_PHRASES 同一套
+            // 跨层字符串契约,两侧各有测试守着)。
+            let turn = match open_turn(index, n) {
+                Ok(d) => Some(d),
+                Err(e) if is_missing(&e) => None,
+                Err(e) => return Err(e),
+            };
+            let sess = match duster_core::session::show(index, n) {
+                Ok(d) => Some(d),
+                Err(e) if is_missing(&e) => None,
+                Err(e) => return Err(e),
+            };
+            match (turn, sess) {
+                // 两档都命中:不许自己挑一个——见 [`resolve_open`] 的文档,
+                // 这就是那条「数字撞车」的定时炸弹,现在拆掉。
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "id {n} matches both a turn id and a conversation id. \
+                     Pick one: `duster open t{n}` for the turn (from \
+                     `duster search`), or `duster open s{n}` for the \
+                     conversation (from `duster session list`)"
+                ),
+                (Some(d), None) => Ok(OpenTarget::Turn(d)),
+                (None, Some(d)) => Ok(OpenTarget::Session(d)),
+                // 两个都落空:报错必须同时点名两个命令和各自的数字来源,
+                // 让用户知道自己用的是哪一档数字、该去哪一档找。
+                (None, None) => anyhow::bail!(
+                    "id {n} matches neither a turn id nor a conversation id. \
+                     `duster search` prints turn ids (t42); `duster session \
+                     list` prints conversation ids (s500). Use one of those \
+                     to find a valid id."
+                ),
+            }
+        }
     }
 }
 
@@ -1026,15 +1257,34 @@ fn is_missing(err: &anyhow::Error) -> bool {
     err.to_string().contains("does not exist")
 }
 
-fn cmd_open(mode: OutputMode, index: Option<&Path>, id: i64, full: bool) -> i32 {
+fn cmd_open(mode: OutputMode, index: Option<&Path>, id: OpenId, full: bool) -> i32 {
     let target = match resolve_open(index, id) {
         Ok(t) => t,
         Err(e) => return fail(mode, "open", &e),
     };
+    // 裸数字的解读说明:两档 id 长得一模一样,不点破用户下次还会拿
+    // session list 的 id 来 open,再吃一次同样的错。显式前缀(t42 / s500)
+    // 不用解释——空间是用户自己写的。
+    let notice: Option<String> = match (&id, &target) {
+        (OpenId::Either(n), OpenTarget::Turn(_)) => Some(format!(
+            "id {n} is a turn id — showing the turn (conversation ids come \
+             from `duster session list`)"
+        )),
+        (OpenId::Either(n), OpenTarget::Session(_)) => Some(format!(
+            "id {n} is a conversation id — showing the conversation (turn \
+             ids come from `duster search`)"
+        )),
+        _ => None,
+    };
+    let warnings: Vec<String> = notice.into_iter().collect();
     match target {
         OpenTarget::Turn(detail) => match mode {
-            OutputMode::Json => emit_json("open", &detail, &[]),
+            OutputMode::Json => emit_json("open", &detail, &warnings),
             OutputMode::Human => {
+                // 裸数字的解读说明先落地:它解释了下面这轮是怎么被挑出来的。
+                for w in &warnings {
+                    println!("  {}", muted().apply_to(w));
+                }
                 // 元信息一行 + 路径一行:open 的正文来自哪场会话,这是它与
                 // session show 不同的唯一信息(print_turn_body 不印它)。
                 let dot = muted().apply_to("·").to_string();
@@ -1062,19 +1312,14 @@ fn cmd_open(mode: OutputMode, index: Option<&Path>, id: i64, full: bool) -> i32 
                 );
             }
         },
-        OpenTarget::Session(detail) => {
-            // 数字空间撞车是必然会发生的事:不点破,用户下次还会拿
-            // session list 的 id 来 open,再吃一次同样的错。
-            let notice = format!(
-                "id {id} is a conversation id — showing the conversation \
-                 (turn ids come from `duster search`)"
-            );
-            match mode {
-                OutputMode::Json => emit_json("open", &detail, &[notice]),
-                OutputMode::Human => {
-                    println!("  {}", muted().apply_to(notice));
-                    cmd::session::render_show(&detail, full);
+        OpenTarget::Session(detail) => match mode {
+            // 解读说明与 Turn 臂同源(warnings),在渲染正文前落地。
+            OutputMode::Json => emit_json("open", &detail, &warnings),
+            OutputMode::Human => {
+                for w in &warnings {
+                    println!("  {}", muted().apply_to(w));
                 }
+                cmd::session::render_show(&detail, full);
             }
         }
     }
@@ -1090,7 +1335,8 @@ fn cmd_open(mode: OutputMode, index: Option<&Path>, id: i64, full: bool) -> i32 
 enum Consent {
     /// 只出计划,不问也不动(默认;`--dry-run` 同此)。
     Preview,
-    /// 已授权:`--yes`(clean / prune)或逐字输入的 agent id(uninstall)。
+    /// 已授权:`--yes`(clean / prune)或 `--confirm <agent>` / 菜单里的
+    /// 两道确认(uninstall)。
     Granted,
     /// 清单打完当场问,条目多时按类别分组问。只有交互菜单走这条。
     Ask,
@@ -1195,11 +1441,21 @@ fn finish_human(warnings: &[String], hint: Option<&str>) {
 const NOT_CLEANABLE: &str = "not cleanable";
 
 /// 计数 + 名词的英文复数。"1 items" 这种小破绽会让人连带怀疑其余数字。
+///
+/// 辅音 + `y` 结尾走 `-ies`（`copy` → `copies`）：`skill rm` 报的就是
+/// copy 数,"2 copys" 一样是破绽。元音 + `y`（`day`）照旧只加 `s`。
+/// 不做更全的英语变形表——这里的名词是闭集(item / copy / conversation /
+/// server / skill / memory / declaration),够用即止。
 pub(crate) fn plural(n: usize, word: &str) -> String {
     if n == 1 {
-        format!("{n} {word}")
-    } else {
-        format!("{n} {word}s")
+        return format!("{n} {word}");
+    }
+    let mut chars = word.chars().rev();
+    match (chars.next(), chars.next()) {
+        (Some('y'), Some(prev)) if !matches!(prev, 'a' | 'e' | 'i' | 'o' | 'u') => {
+            format!("{n} {}ies", &word[..word.len() - 1])
+        }
+        _ => format!("{n} {word}s"),
     }
 }
 
@@ -1369,8 +1625,35 @@ fn render_plan(plan: &Plan, show_install_total: bool) {
                 style(NOT_CLEANABLE).yellow()
             );
         }
-        for item in items {
-            render_plan_item(item);
+        // not cleanable 的组逐项印 what/why/impact 是纯复读:13 个 install
+        // 项的三段话逐字相同,39 行里有 36 行是同一句,把真正的清理计划挤到
+        // 屏幕外。折成「每项一行 what」+ 组尾一句共用的 why:`what` 本身就
+        // 带着 agent、路径与体积(install 行的 `bytes` 按契约恒为 0,真体积
+        // 只在这句话里),而 `impact` 逐项点名各自的 agent,共用一句会对另外
+        // 十二项说谎——所以共用的只有那句与 agent 无关的 why,处置办法写成
+        // 不点名的通用式。逐项三段仍在 `--json` 里(脚本的入口,不靠人眼扫)。
+        if cleanable {
+            for item in items {
+                render_plan_item(item);
+            }
+        } else {
+            for item in &items {
+                println!("    {}", accent().apply_to(&item.what));
+            }
+            if let Some(first) = items.first() {
+                println!(
+                    "      {} {}",
+                    muted().apply_to(format!("{:<6}", "why")),
+                    muted().apply_to(&first.why)
+                );
+                println!(
+                    "      {} {}",
+                    muted().apply_to(format!("{:<6}", "how")),
+                    muted().apply_to(
+                        "Reclaim it only with `duster uninstall <agent>`, which takes all of that agent's data with it."
+                    )
+                );
+            }
         }
     }
 
@@ -1750,11 +2033,11 @@ fn cmd_uninstall(
         run_package_manager: args.run_package_manager,
     };
     // 预览路径把确认串补齐成 agent id:`dry_run = true` 已经保证一个字节都不动,
-    // 而 core 的确认校验在生成计划之前——不补齐的话「先读报告、再回来逐字确认」
-    // 这条主路径根本走不到报告。真正的授权只有一处:执行路径把用户亲手输入的
-    // 那个串原样交给 core,由它再校验一次。
+    // 而 core 的确认校验在生成计划之前——不补齐的话预览(以及 `--dry-run` /
+    // 确认串不匹配降级成的预览)根本走不到报告。真正的授权只有一处:执行路径
+    // 把用户给的那个串原样交给 core,由它再校验一次。
     let preview = || build(false, Some(args.agent.clone()));
-    let mut report = match uninstall(&if consent == Consent::Granted {
+    let report = match uninstall(&if consent == Consent::Granted {
         build(true, args.confirm.clone())
     } else {
         preview()
@@ -1766,26 +2049,10 @@ fn cmd_uninstall(
     if mode == OutputMode::Human {
         render_plan(&report.plan, true);
         render_checks(&report.checks);
-        // 菜单路径的清单必须在逐字确认**之前**摆全,包括"要动别人家哪一个键"
-        // 和"软件当初是怎么装的"。旗标路径的这一份报告已经是最终结果了,
-        // 留给收尾统一渲染,免得同样的两栏印两遍。
-        if consent == Consent::Ask {
-            render_shared(&report.shared);
-            render_packages(&report.packages);
-        }
     }
-    let mut declined = false;
-    if consent == Consent::Ask {
-        match interactive::confirm_uninstall(&args.agent) {
-            // 走到这里说明用户已经逐字输入过 agent id,原样转交 core 再校验一次。
-            interactive::Approval::Yes => match uninstall(&build(true, Some(args.agent.clone()))) {
-                Ok(r) => report = r,
-                Err(e) => return fail(mode, "uninstall", &e),
-            },
-            interactive::Approval::No => declined = true,
-            interactive::Approval::Aborted => return EXIT_ERROR,
-        }
-    }
+    // 交互路径的确认不在这一层:菜单里两道 y/N 过完才以 Granted 进来
+    // (见 interactive::prompt_uninstall),这里不再有当场问人的分支——
+    // 卸载的全部授权逻辑收进「确认串 == agent id」这一道门,CLI 与菜单同门。
 
     // 残留即"卸载不干净",算部分成功而不是成功——这是这个动词的验收点。
     // 被拒的共享改键同理:文件一个字节没动,那个键还指着已经被删掉的程序。
@@ -1797,7 +2064,7 @@ fn cmd_uninstall(
             .count();
     let mut warnings = merge_warnings(&report.plan.warnings, &report.warnings);
     let next = format!("duster uninstall {a} --confirm {a}", a = args.agent);
-    let hint = (!report.executed).then(|| not_done_hint(declined, &next));
+    let hint = (!report.executed).then(|| not_done_hint(false, &next));
     match mode {
         OutputMode::Json => {
             warnings.extend(hint);
@@ -1936,23 +2203,31 @@ fn render_leftovers(leftovers: &[String]) {
 // skill
 // ---------------------------------------------------------------------------
 
-fn cmd_skill_copies(mode: OutputMode, index: Option<&Path>) -> i32 {
-    let groups = match copies(index) {
+/// `pub(crate)` 而不是私有:同一条实现要能被交互菜单的 skill 屏调用,
+/// 一条命令只有一份渲染。
+pub(crate) fn cmd_skill_list(mode: OutputMode, index: Option<&Path>) -> i32 {
+    let groups = match skill_ops::list(index) {
         Ok(g) => g,
-        Err(e) => return fail(mode, "skill-copies", &e),
+        Err(e) => return fail(mode, "skill-list", &e),
     };
     match mode {
-        OutputMode::Json => emit_json("skill-copies", &groups, &[]),
+        OutputMode::Json => emit_json("skill-list", &groups, &[]),
         OutputMode::Human => println!("{}", render_skill_groups(&groups)),
     }
     EXIT_OK
 }
 
-/// DupState 的人话。
+/// DupState 的人话。五档同居 STATE 一列,行文要能并排读。
 fn dup_state_label(state: DupState) -> &'static str {
     match state {
+        // 不能跟着说 "identical":一份副本说「完全相同」是句胡话——和谁相同?
+        // 读者会以为自己漏看了另一行,回头去数表格。
+        DupState::Single => "only copy",
         DupState::Identical => "identical",
         DupState::Drifted => "drifted",
+        // 软链:指向别处的实体,没有自己的内容;悬空则连目标都没了。
+        DupState::Linked => "linked",
+        DupState::Broken => "broken",
     }
 }
 
@@ -1960,9 +2235,13 @@ fn dup_state_label(state: DupState) -> &'static str {
 /// 这样「INSTALLED 列该不该出现」能被测试逐字核对。
 fn render_skill_groups(groups: &[SkillGroup]) -> String {
     if groups.is_empty() {
+        // 空不再是「没有重复」:表里装的是全部 skill,空意味着一个 skill 都
+        // 没索引到。两件事读者的下一步动作完全不同——前者不用做什么,后者要去扫。
         return format!(
             "\n  {}",
-            muted().apply_to("Every skill lives in exactly one place — nothing to share.")
+            muted().apply_to(
+                "No skill is indexed. Run `duster scan` first — if you just added one, run it again."
+            )
         );
     }
 
@@ -1995,13 +2274,20 @@ fn render_skill_groups(groups: &[SkillGroup]) -> String {
 
     for g in groups {
         for (i, c) in g.copies.iter().enumerate() {
-            // 同一组只在首行写名字与状态,后续行留空——视觉上把一组连成一块。
-            let (name, state) = if i == 0 {
-                (g.name.clone(), dup_state_label(g.state).to_string())
+            // 名字只在首行写——视觉上把一组连成一块。STATE 列不行：
+            // 软链副本的 linked/broken 是这一行自己的事,放组头会把
+            // 「坏的是哪一份」藏进第一行(悬空的那份未必排第一)。
+            let name = if i == 0 {
+                g.name.clone()
             } else {
-                (String::new(), String::new())
+                String::new()
             };
-            let mut row = vec![name, state, c.agent_id.clone(), human_bytes(c.bytes)];
+            let mut row = vec![
+                name,
+                dup_state_label(c.state).to_string(),
+                c.agent_id.clone(),
+                human_bytes(c.bytes),
+            ];
             if show_installed {
                 row.push(human_bytes(c.install_bytes));
             }
@@ -2027,6 +2313,18 @@ fn render_skill_groups(groups: &[SkillGroup]) -> String {
         }
     }
 
+    // 悬空软链的修法:删掉它。只给建议字符串,不做自动删除——用户目录里的
+    // 东西,duster 只动自己建出来的。
+    for g in groups.iter().filter(|g| g.state == DupState::Broken) {
+        for c in g.copies.iter().filter(|c| c.state == DupState::Broken) {
+            out.push_str(&format!(
+                "\n\n  {} {}",
+                style("broken").red().bold(),
+                format!("rm {} (dangling symlink)", c.path.display())
+            ));
+        }
+    }
+
     // 能省多少:只有 IDENTICAL 组能省,省的是「副本数 - 1」份内容体积
     // (install 子路径不算——它本来就不参与哈希,也不该被链接)。
     let shareable: u64 = groups
@@ -2038,14 +2336,24 @@ fn render_skill_groups(groups: &[SkillGroup]) -> String {
         .iter()
         .filter(|g| g.state == DupState::Drifted)
         .count();
-    // 同一份 skill 也可能在一个 agent 里躺两处(目录不同、退化命名),
+    // 两个数必须一起报:表里装的是**全部** skill,只印「34 skills」会被读成
+    // 「我有 34 个重复」,只印「13 in more than one place」又丢掉了「我一共有
+    // 多少 skill」——那正是 list 的本职答案。
+    //
+    // 同一份 skill 也可能在一个 agent 里躺两处(目录名不同、声明的名字相同),
     // 所以说法是「不止一个地方」而不是「不止一个 agent」。
+    // 「不止一个地方」按现场副本数算,不按状态:悬空的单条软链也是 Broken
+    // 组,但它只在一个地方,算进 multi 等于把它说成"装了两处"。
+    let multi = groups
+        .iter()
+        .filter(|g| g.copies.len() > 1)
+        .count();
     out.push_str(&format!(
         "\n\n  {} {} {}",
         muted().apply_to("Total"),
         style(plural(groups.len(), "skill")).bold(),
         muted().apply_to(format!(
-            "in more than one place · {drifted} drifted · {} could be shared with `duster skill link`",
+            "· {multi} in more than one place · {drifted} drifted · {} could be shared with `duster skill link`",
             human_bytes(shareable)
         ))
     ));
@@ -2129,99 +2437,201 @@ fn render_link(report: &LinkReport, dry_run: bool) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// doctor
-// ---------------------------------------------------------------------------
-
-/// `duster doctor` 的参数袋。四个旗标一起决定"跑哪几项",拆开传会让两个
-/// 调用点(main 的分发与交互菜单)各抄一遍同样的四元组。
-pub(crate) struct DoctorArgs {
-    pub secrets: bool,
-    pub ping: bool,
-    /// 只查这几个 agent；空 Vec = 全部。
-    pub agents: Vec<String>,
-    /// 空 = 全跑。取值由 clap 按 [`ALL_CHECKS`] 校验,到手的一定合法。
-    pub checks: Vec<String>,
+/// `duster skill rm`：删除一个 skill 的一份副本。全部业务在
+/// [`duster_core::skill_ops::remove`]——软链只 unlink 不归档、真实目录
+/// 归档后整棵删、删完清索引，都在那边。这里只翻旗标、渲染回执、映射退出码。
+///
+/// 一个 skill 名装在多家时 `--agent` 必选，同一家装了多份时 `--path` 再必选：
+/// 缺了都报错列出候选，**绝不默认删全部**（见 core 的文档）。归档默认开；
+/// `--no-archive` 是脚本用的显式关闭。`--dry-run` 只报将删什么。
+///
+/// `home` 只给测试注入：真实运行恒为 None（= 真实用户主目录）。
+pub(crate) fn cmd_skill_rm(
+    mode: OutputMode,
+    index: Option<&Path>,
+    home: Option<&Path>,
+    name: &str,
+    agent: Option<&str>,
+    path: Option<&str>,
+    archive: bool,
+    dry_run: bool,
+) -> i32 {
+    let report = match skill_ops::remove(
+        &DeleteOptions {
+            index_path: index.map(Path::to_path_buf),
+            home: home.map(Path::to_path_buf),
+            archive,
+            dry_run,
+        },
+        name,
+        agent,
+        path,
+    ) {
+        Ok(r) => r,
+        Err(e) => return fail(mode, "skill-rm", &e),
+    };
+    match mode {
+        OutputMode::Json => emit_json("skill-rm", &report, &report.warnings),
+        OutputMode::Human => println!("{}", render_skill_rm(&report, dry_run)),
+    }
+    render_warnings(&report.warnings);
+    if report.warnings.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_PARTIAL
+    }
 }
 
-fn cmd_doctor(mode: OutputMode, index: Option<&Path>, args: DoctorArgs) -> i32 {
-    let report = match doctor(&DoctorOptions {
-        index_path: index.map(Path::to_path_buf),
-        home: None,
-        agents: args.agents.clone(),
-        secrets: args.secrets,
-        ping: args.ping,
-        checks: args.checks.clone(),
-    }) {
+/// 删除回执的人读排版。整块返回而不是边算边印：这样它能被测试逐字核对。
+///
+/// 干跑与真跑分行文：预览说 `would delete` 并把归档去处也预告出来；
+/// 真跑说 `deleted` + 释放字节，归档包路径必须亮出来——那是用户唯一的退路。
+fn render_skill_rm(report: &DeleteReport, dry_run: bool) -> String {
+    let mut out = format!(
+        "\n  {} {} {}\n",
+        if dry_run { warn_mark() } else { ok_mark() },
+        style(if dry_run {
+            format!(
+                "would delete {} · {}",
+                crate::plural(report.removed.len(), "copy"),
+                human_bytes(report.freed_bytes)
+            )
+        } else {
+            format!(
+                "deleted {} · {} freed",
+                crate::plural(report.removed.len(), "copy"),
+                human_bytes(report.freed_bytes)
+            )
+        })
+        .bold(),
+        muted().apply_to(
+            report
+                .removed
+                .iter()
+                .map(|p| display_tilde(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    );
+    // 四种收场各说各话。干跑里 `archived` 读作「将归档到哪」(目录,不是
+    // 编造的包名),`None` 则说明这一批全是软链副本——它们只 unlink、没有
+    // 自己的内容可归档,笼统说「会归档」就是假话。
+    match (&report.archived, dry_run) {
+        (Some(dir), true) => out.push_str(&format!(
+            "  {} {}\n",
+            muted().apply_to("would archive into"),
+            accent().apply_to(display_tilde(dir))
+        )),
+        (Some(archived), false) => out.push_str(&format!(
+            "  {} {}\n",
+            muted().apply_to("archived to"),
+            accent().apply_to(display_tilde(archived))
+        )),
+        (None, true) => out.push_str(&format!(
+            "  {}\n",
+            muted().apply_to(
+                "nothing to archive — a symlink copy is only unlinked, its target is left alone"
+            )
+        )),
+        (None, false) => out.push_str(&format!(
+            "  {}\n",
+            muted().apply_to("no archive was made (--no-archive, or a symlink copy that has nothing of its own)")
+        )),
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// doctor:duster 自己的自检
+// ---------------------------------------------------------------------------
+
+/// duster 自己的自检。
+///
+/// 不收任何旗标——上上轮的四个(`--no-secrets` / `--ping` / `--agent` /
+/// `--check`)连同它们伺候的六项检查已经整体撤掉,status 也不再捎带它们;
+/// 这一轮又把 status 的 issues / deep / ping 三个旗标一起删了。留在这里的
+/// 是「duster 自己装好没有」:索引库、adapter 清单、home 目录权限、agent 的
+/// SQLite 库读不读得动、版本。退出码同样回到纯 0/失败——发现是输出,
+/// 不是失败:一份报出了问题的自检报告仍然是成功的诊断,脚本据此跑
+/// `duster doctor && deploy` 不会被诊断结果挡住。
+fn cmd_doctor(mode: OutputMode, index: Option<&Path>) -> i32 {
+    let report = match self_check(index) {
         Ok(r) => r,
         Err(e) => return fail(mode, "doctor", &e),
     };
     match mode {
         OutputMode::Json => emit_json("doctor", &report, &report.warnings),
         OutputMode::Human => {
-            render_doctor(&report, &args);
+            println!("{}", render_doctor(&report));
             render_warnings(&report.warnings);
         }
     }
-    doctor_exit_code(&report)
+    EXIT_OK
 }
 
-/// 体检的退出码。
+/// 自检报告:先两行事实(版本、索引库在哪多大),再按检查分组,组内一条一段。
 ///
-/// 有发现不等于命令失败——那些发现正是用户要的结果,报一个非零码会让
-/// `duster doctor && deploy` 这类用法在"扫出两条明文凭据"时也算通过不了。
-/// 但 [`Severity::Error`] 意味着真的有东西坏了(配置解析不了、库损坏、
-/// 某项检查自己摔了),那一档必须让脚本停下来,落"部分成功"这一格。
-fn doctor_exit_code(report: &DoctorReport) -> i32 {
-    if report
-        .findings
-        .iter()
-        .any(|f| f.severity == Severity::Error)
-    {
-        EXIT_PARTIAL
-    } else {
-        EXIT_OK
-    }
-}
-
-/// 体检报告:按检查分组,组内一条一段。
-///
-/// 分组顺序恒为 [`ALL_CHECKS`](即 doctor 的执行顺序),不按发现数排——
-/// 同一台机器两次运行的输出要能直接 diff。
+/// 分组顺序恒为 [`SELF_CHECKS`](即自检的执行顺序),不按发现数排——同一台
+/// 机器两次运行的输出要能直接 diff。
 ///
 /// **跑过却没发现的检查也占一行**(一句 `ok`)。这份报告的价值有一半在
 /// "这一项我查过了",而一片空白既可能是"查过没事"也可能是"根本没查";
 /// 让读者去猜,是这类工具最容易骗人的地方。
-fn render_doctor(report: &DoctorReport, args: &DoctorArgs) {
-    println!();
-    for check in ALL_CHECKS {
+///
+/// 整块返回而不是边算边印:上面那条规矩要能被测试逐字核对(与
+/// [`render_skill_groups`] 同一个理由)。
+fn render_doctor(report: &SelfReport) -> String {
+    let mut out = format!(
+        "\n  {} {}\n",
+        muted().apply_to("duster"),
+        style(&report.version).bold()
+    );
+    // 库的位置与体积单独占一行,而不是等出了问题才由某条 finding 捎出来:
+    // 「库在哪、多大」是读者下一步要用的东西(去看它、去删它),而 `index-db`
+    // 那一项的发现说的是「哪里不对」,两回事。
+    out.push_str(&format!(
+        "  {} {} {}\n",
+        muted().apply_to("index"),
+        report.index_path,
+        muted().apply_to(match report.index_bytes {
+            Some(bytes) => human_bytes(bytes),
+            // None = 库还不存在。这不一定是错(`duster scan` 一跑就有了),
+            // 该不该报成一条发现由 core 的 `index-db` 那一项定,这里只说事实。
+            None => "not built yet".to_string(),
+        })
+    ));
+    for check in SELF_CHECKS {
         if !report.checks_run.iter().any(|c| c == check) {
             continue;
         }
-        println!("  {}", accent().bold().apply_to(check));
+        out.push_str(&format!("\n  {}\n", accent().bold().apply_to(check)));
         let mut found = 0usize;
         for f in report.findings.iter().filter(|f| f.check == check) {
-            render_finding(f);
+            out.push_str(&render_finding(f));
             found += 1;
         }
         if found == 0 {
-            println!("    {}", muted().apply_to("ok — nothing found"));
+            out.push_str(&format!("    {}\n", muted().apply_to("ok — nothing found")));
         }
-        println!();
     }
-    render_doctor_footer(report, args);
+    out.push_str(&render_doctor_footer(report));
+    out
 }
 
 /// 一条发现:`<严重度> <出处>`,说明缩进一层,有修法再来一行。
 ///
-/// 出处**不截断**:它是文件路径、`<库>#<表>.<列>:<行>` 或 server 名,
-/// 用户要照着它去改东西,截掉的正是要复制的那一截。
-fn render_finding(f: &Finding) {
-    println!("    {} {}", severity_tag(f.severity), f.subject);
-    println!("      {}", muted().apply_to(&f.detail));
+/// 出处**不截断**:它是文件路径、库路径或目录,用户要照着它去改东西,
+/// 截掉的正是要复制的那一截。
+///
+/// 整块返回而不是边算边印:自检报告要能被测试逐字核对,而印出去的字节没有
+/// 抓手。每行自带换行,调用方把若干条串起来就是一组。
+fn render_finding(f: &Finding) -> String {
+    let mut out = format!("    {} {}\n", severity_tag(f.severity), f.subject);
+    out.push_str(&format!("      {}\n", muted().apply_to(&f.detail)));
     if let Some(fix) = &f.fix {
-        println!("      {} {fix}", muted().apply_to("fix:"));
+        out.push_str(&format!("      {} {fix}\n", muted().apply_to("fix:")));
     }
+    out
 }
 
 /// 严重度标签。定宽 5 列,好让右边的出处列对齐。
@@ -2234,75 +2644,67 @@ fn severity_tag(s: Severity) -> String {
     style.apply_to(text).to_string()
 }
 
-/// 收尾:总数 + 严重度分布,再逐条说明**哪几项没跑、为什么**。
+/// 收尾:总数 + 严重度分布,再逐条说明**哪几项没跑**。
 ///
-/// 后半截不是补充说明,是这份报告可信的前提:六项里跑了几项、
-/// 剩下的是被旗标关掉还是缺前置条件,不写出来的话,一份"没发现问题"
-/// 的报告和一份"什么都没查"的报告长得一模一样。
-fn render_doctor_footer(report: &DoctorReport, args: &DoctorArgs) {
+/// 后半截不是补充说明,是这份报告可信的前提:五项里跑了几项、剩下的为什么
+/// 没跑,不写出来的话,一份"没发现问题"的报告和一份"什么都没查"的报告长得
+/// 一模一样。
+///
+/// 这里不再有"你少给了个旗标"那一档——doctor 已经没有旗标了。五项自检全都
+/// 无条件跑,一项没跑只能是它自己没跑起来,原因由 core 写进
+/// [`SelfReport::warnings`],紧跟着这份报告印出来(见 [`cmd_doctor`]);
+/// 一句光秃秃的 "not run" 会让读者以为是自己漏了个参数,而现在压根没有参数
+/// 可漏,所以这句话的差事是把眼睛引到那条 warning 上去。
+fn render_doctor_footer(report: &SelfReport) -> String {
     let count = |s: Severity| report.findings.iter().filter(|f| f.severity == s).count();
     let (errors, warns, infos) = (
         count(Severity::Error),
         count(Severity::Warn),
         count(Severity::Info),
     );
+    // 前缀看的是**可行动的**严重度,不是有没有 findings。自检的 `version` 与
+    // `adapters` 两项按设计恒发一条 info(「这一项我查过了」本身就是结论),
+    // 拿 findings 非空当判据的话,一份一切正常的报告永远顶着一个 `!` ——
+    // 三次之后没人再看那个感叹号,而它本该是唯一值得看的东西。
+    let actionable = errors + warns;
     let breakdown: Vec<String> = [(errors, "error"), (warns, "warn"), (infos, "info")]
         .iter()
         .filter(|(n, _)| *n > 0)
         .map(|(n, label)| format!("{n} {label}"))
         .collect();
+    let checks = plural(report.checks_run.len(), "check");
+    // info 的条数照旧报出来:它是「查过了」的凭据,`✔ nothing to fix` 少了它
+    // 就和「什么都没查」难以分辨——这份报告一半的价值在后面那半句。
+    let headline = if actionable == 0 {
+        format!("nothing to fix across {checks}")
+    } else {
+        format!("{} across {checks}", plural(report.findings.len(), "finding"))
+    };
     let tail = if breakdown.is_empty() {
-        "nothing to fix".to_string()
+        String::new()
     } else {
         format!("· {}", breakdown.join(" · "))
     };
-    println!(
-        "  {} {} {}",
-        if report.findings.is_empty() {
+    let mut out = format!(
+        "\n  {} {} {}",
+        if actionable == 0 {
             ok_mark().to_string()
         } else {
             warn_mark().to_string()
         },
-        style(format!(
-            "{} across {}",
-            plural(report.findings.len(), "finding"),
-            plural(report.checks_run.len(), "check")
-        ))
-        .bold(),
+        style(headline).bold(),
         muted().apply_to(tail)
     );
-    for check in ALL_CHECKS {
+    for check in SELF_CHECKS {
         if report.checks_run.iter().any(|c| c == check) {
             continue;
         }
-        println!(
-            "  {}",
-            muted().apply_to(format!("{check}: {}", skip_reason(check, args)))
-        );
+        out.push_str(&format!(
+            "\n  {}",
+            muted().apply_to(format!("{check}: not run (see the warning below)"))
+        ));
     }
-}
-
-/// `--secrets` 打开的那一项。字面量与 core 的 `CHECK_SECRETS` 同源
-/// （测试 `跳过原因指名要加哪个旗标` 钉住这一点）。
-const CHECK_SECRETS: &str = "secrets";
-/// `--ping` 打开的那一项。
-const CHECK_MCP: &str = "mcp-reachability";
-
-/// 某一项没跑的原因。按优先级:先看是不是没被 `--check` 选中,
-/// 再看是不是缺旗标,都不是就只剩缺索引一种可能。
-///
-/// 每条都要带上**怎么才能跑起来**。一句光秃秃的 "not run" 等于让用户
-/// 自己去翻 `--help` 猜是哪个开关。
-fn skip_reason(check: &str, args: &DoctorArgs) -> String {
-    if !args.checks.is_empty() && !args.checks.iter().any(|c| c == check) {
-        return "not run (--check selected other checks)".to_string();
-    }
-    match check {
-        CHECK_SECRETS => "not run (pass --secrets)".to_string(),
-        CHECK_MCP => "not run (pass --ping)".to_string(),
-        // 其余三项只依赖索引;它们被跳过时 core 已经把详情写进 warnings。
-        _ => "not run (needs the index — run `duster scan`)".to_string(),
-    }
+    out
 }
 
 #[cfg(test)]
@@ -2546,6 +2948,11 @@ mod tests {
         assert_eq!(plural(1, "item"), "1 item");
         assert_eq!(plural(0, "item"), "0 items");
         assert_eq!(plural(69, "item"), "69 items");
+        // 辅音 + y → -ies：`skill rm` 报的就是 copy 数,"2 copys" 是破绽。
+        assert_eq!(plural(1, "copy"), "1 copy");
+        assert_eq!(plural(2, "copy"), "2 copies");
+        // 元音 + y 照旧只加 s。
+        assert_eq!(plural(2, "day"), "2 days");
     }
 
     fn f(check: &str, severity: Severity) -> Finding {
@@ -2558,49 +2965,90 @@ mod tests {
         }
     }
 
-    /// 体检的退出码只认 Error 一档:扫出明文凭据是**结果**,不是失败,
-    /// 报非零会让 `duster doctor && deploy` 在有发现时永远过不去;
-    /// 而配置解析不了、库损坏这类 Error 必须让脚本停。
-    #[test]
-    fn doctor_只有_error_档落部分成功() {
-        let mut r = DoctorReport::default();
-        assert_eq!(doctor_exit_code(&r), EXIT_OK);
-
-        r.findings.push(f("secrets", Severity::Warn));
-        r.findings.push(f("dangling-reference", Severity::Info));
-        assert_eq!(doctor_exit_code(&r), EXIT_OK);
-
-        r.findings.push(f("config-syntax", Severity::Error));
-        assert_eq!(doctor_exit_code(&r), EXIT_PARTIAL);
+    /// 一份自检报告夹具。
+    fn self_report(checks_run: &[&str], findings: Vec<Finding>) -> SelfReport {
+        SelfReport {
+            findings,
+            checks_run: checks_run.iter().map(|c| (*c).to_string()).collect(),
+            warnings: Vec::new(),
+            version: "9.9.9".to_string(),
+            index_path: "/tmp/duster/index.db".to_string(),
+            index_bytes: Some(4096),
+        }
     }
 
-    /// 没跑的那几项必须说清**怎么才能跑起来**。一句光秃秃的 "not run"
-    /// 等于让用户回去翻 `--help` 猜是哪个开关。
-    ///
-    /// 顺带钉住两个字面量:它们要和 core 的检查名对得上,否则页脚会把
-    /// "缺 --secrets" 说成"缺索引"——名字在 core 那边改一个字,这里就红。
+    /// 自检报告里**跑过却没发现的项也占一行**。一片空白既可能是「查过没事」
+    /// 也可能是「根本没查」,而这份报告一半的价值就在「这一项我查过了」。
     #[test]
-    fn 跳过原因指名要加哪个旗标() {
-        assert!(ALL_CHECKS.contains(&CHECK_SECRETS));
-        assert!(ALL_CHECKS.contains(&CHECK_MCP));
+    fn 自检报告里跑过没发现的项也占一行() {
+        let out = render_doctor(&self_report(
+            &SELF_CHECKS,
+            vec![f("adapters", Severity::Warn)],
+        ));
+        for check in SELF_CHECKS {
+            assert!(out.contains(check), "{check} 该占一行: {out}");
+        }
+        // 全部跑过、一项有发现,其余各项各一句 ok。
+        assert_eq!(
+            out.matches("ok — nothing found").count(),
+            SELF_CHECKS.len() - 1,
+            "{out}"
+        );
+        // 两行事实:版本、库在哪多大。
+        assert!(out.contains("9.9.9"), "{out}");
+        assert!(out.contains("/tmp/duster/index.db"), "{out}");
+        assert!(out.contains("4 KB"), "{out}");
+        // 全跑过时不许出现「没跑」那一档。
+        assert!(!out.contains("not run"), "{out}");
 
-        let none = DoctorArgs {
-            secrets: false,
-            ping: false,
-            agents: Vec::new(),
-            checks: Vec::new(),
-        };
-        assert!(skip_reason(CHECK_SECRETS, &none).contains("--secrets"));
-        assert!(skip_reason(CHECK_MCP, &none).contains("--ping"));
-        assert!(skip_reason("sqlite-integrity", &none).contains("duster scan"));
+        // 没跑的项各占一行,而且说清去哪找原因:doctor 已经没有旗标可漏,
+        // 一句光秃秃的 "not run" 只会让读者去翻 --help 找一个不存在的开关。
+        let partial = render_doctor(&self_report(&["index-db"], Vec::new()));
+        assert_eq!(
+            partial.matches("not run").count(),
+            SELF_CHECKS.len() - 1,
+            "{partial}"
+        );
+        assert!(partial.contains("warning"), "{partial}");
 
-        // 被 `--check` 挑剩下的,原因是"你没选它",不是"你少给了个旗标"。
-        let picked = DoctorArgs {
-            checks: vec!["config-syntax".to_string()],
-            ..none
-        };
-        assert!(skip_reason(CHECK_SECRETS, &picked).contains("--check"));
-        assert!(skip_reason("sqlite-integrity", &picked).contains("--check"));
+        // 库还没建时说的是那句事实,不是一个 0 B。
+        let mut fresh = self_report(&SELF_CHECKS, Vec::new());
+        fresh.index_bytes = None;
+        let out = render_doctor(&fresh);
+        assert!(out.contains("not built yet"), "{out}");
+        assert!(!out.contains("0 B"), "{out}");
+    }
+
+    /// doctor 不收旗标,status 也不再收——他检那六个连同它们的开关
+    /// (`--no-secrets` / `--ping` / `--agent` / `--check`)早已搬走,这一轮
+    /// 又把 status 自己的 issues / deep / ping 三个旗标一起删了。旧旗标
+    /// 必须被 clap 拒掉而不是默默忽略:脚本里留着 `--deep` 却什么都不发生,
+    /// 比报错难查得多。
+    #[test]
+    fn doctor_与_status_都不再收他检旗标() {
+        assert!(Cli::try_parse_from(["duster", "doctor"]).is_ok());
+        assert!(Cli::try_parse_from(["duster", "status"]).is_ok());
+        for argv in [
+            ["duster", "doctor", "--ping"].as_slice(),
+            &["duster", "doctor", "--no-secrets"],
+            &["duster", "doctor", "--agent", "codex"],
+            &["duster", "doctor", "--check", "secrets"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv.iter().copied()).is_err(),
+                "{argv:?} 该被拒"
+            );
+        }
+        // status 的旧旗标逐个钉死会被拒。旗标串在运行时拼出来,让"这个
+        // 旗标不存在"这件事不靠源码里的字面量背书——老脚本里写什么,
+        // 这里就拒什么。
+        for name in ["issues", "deep", "ping"] {
+            let flag = format!("--{name}");
+            assert!(
+                Cli::try_parse_from(["duster", "status", flag.as_str()]).is_err(),
+                "duster status {flag} 该被拒"
+            );
+        }
     }
 
     /// 严重度三档在人类模式下必须分得开(等宽 5 列,好让出处列对齐),
@@ -2619,35 +3067,91 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // skill copies / open 双 id 空间(B2)
+    // skill list / open 双 id 空间(B2)
     // ---------------------------------------------------------------------
 
-    /// `skill dedupe` 是历史动词,无过渡期:必须被 clap 拒掉,而不是
-    /// 默默当 `copies` 的别名用——脚本一旦开始依赖旧名,改名就白改了。
+    /// `copies` 与 `dedupe` 都是历史动词,无过渡期:必须被 clap 拒掉,而不是
+    /// 默默当 `list` 的别名用——脚本一旦开始依赖旧名,改名就白改了。
+    /// `link` 不在这次改名里,照旧能叫。
     #[test]
-    fn skill_命令树里没有_dedupe_只剩_copies() {
-        assert!(Cli::try_parse_from(["duster", "skill", "copies"]).is_ok());
+    fn skill_命令树里只剩_list_与_link() {
+        assert!(Cli::try_parse_from(["duster", "skill", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["duster", "skill", "copies"]).is_err());
         assert!(Cli::try_parse_from(["duster", "skill", "dedupe"]).is_err());
+        assert!(
+            Cli::try_parse_from(["duster", "skill", "link", "foo", "--from", "a", "--to", "b"])
+                .is_ok()
+        );
         // --json 的命令串随之改名,不许两头都能叫。
-        assert!(Cli::try_parse_from(["duster", "skill", "copies", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["duster", "skill", "list", "--json"]).is_ok());
+    }
+
+    /// 读索引的一次性命令一律先把库对齐磁盘,三条例外一条都不许多、不许少。
+    ///
+    /// `scan` 与 `doctor` 那两条是产品判断,不是优化:前者本身就是扫描,后者
+    /// 自检的是 duster 自己、一个字节都不从 agent 索引里读(而且「库还没建」
+    /// 正是它要报的一项,顺手建一次就把那条诊断抹掉了)。裸 `duster` 也不在
+    /// 这里等——菜单自己把扫描扔进后台线程,同步等一遍正好把那件事作废。
+    #[test]
+    fn 只有读索引的一次性命令先刷新索引() {
+        let needs = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv.iter().copied()).expect("这条 argv 该解析得动");
+            needs_fresh_index(cli.command.as_ref())
+        };
+        for argv in [
+            ["duster", "status"].as_slice(),
+            &["duster", "search", "hello"],
+            &["duster", "open", "t42"],
+            &["duster", "clean"],
+            &["duster", "prune", "--older-than", "30d"],
+            &["duster", "uninstall", "qoder"],
+            &["duster", "skill", "list"],
+            &["duster", "memory", "list"],
+            &["duster", "mcp", "list"],
+            &["duster", "session", "list"],
+        ] {
+            assert!(needs(argv), "{argv:?} 读索引,该先刷新");
+        }
+        assert!(!needs(&["duster", "scan"]), "scan 本身就是扫描");
+        assert!(!needs(&["duster", "doctor"]), "自检不读 agent 索引");
+        assert!(!needs(&["duster", "diff", "a", "b"]), "diff 比路径,不读库");
+        assert!(!needs(&["duster"]), "裸 duster 的菜单自己在后台扫");
     }
 
     /// 一份测试用的副本。install_bytes 由调用方给——「INSTALLED 列该不该
-    /// 出现」只取决于它。
+    /// 出现」只取决于它。state 是占位,`group()` 按组级结果统一改写。
     fn copy(agent: &str, path: &str, bytes: u64, install_bytes: u64) -> SkillCopy {
         SkillCopy {
             agent_id: agent.into(),
             path: PathBuf::from(path),
+            state: DupState::Identical,
+            link_target: None,
             tree_hash: "abc".into(),
             bytes,
             install_bytes,
         }
     }
 
+    /// 状态跟着副本数走,与 `skill_ops::list` 同一条口径:一份是 `Single`,
+    /// 多份默认 `Identical`。
     fn group(name: &str, copies: Vec<SkillCopy>) -> SkillGroup {
+        let state = if copies.len() < 2 {
+            DupState::Single
+        } else {
+            DupState::Identical
+        };
+        // 逐行状态跟随组级结果:STATE 列按副本渲染,夹具得和 `skill_ops::list`
+        // 产出同形,否则渲染路径的测试测的是假数据。
+        let copies: Vec<SkillCopy> = copies
+            .into_iter()
+            .map(|mut c| {
+                c.state = state;
+                c
+            })
+            .collect();
         SkillGroup {
             name: name.into(),
-            state: DupState::Identical,
+            state,
             copies,
             diff: None,
             warnings: Vec::new(),
@@ -2682,10 +3186,50 @@ mod tests {
         assert!(one_nonzero.contains("4 KB"), "{one_nonzero}");
     }
 
+    /// 单份组不再被滤掉,表要容得下「一组一行」。状态列印的是 `only copy`,
+    /// 不是 `identical`;组内差异摘要是 DRIFTED 专属,单份组一行都不该多出来
+    /// (名字在整块里只出现一次)。
+    #[test]
+    fn 单份组渲染成一行且状态是_only_copy() {
+        let out = render_skill_groups(&[group("solo", vec![copy("claude-code", "/a/x", 100, 0)])]);
+        assert!(out.contains("only copy"), "{out}");
+        assert!(!out.contains("identical"), "{out}");
+        assert_eq!(out.matches("solo").count(), 1, "{out}");
+    }
+
+    /// 合计行必须两个数一起报:表里装的是全部 skill,只印总数会被读成
+    /// 「我有 35 个重复」,只印重复数又丢了 list 的本职答案。
+    #[test]
+    fn 合计行同时报出总数与装在多处的个数() {
+        let out = render_skill_groups(&[
+            group("solo", vec![copy("claude-code", "/a/x", 100, 0)]),
+            group(
+                "twins",
+                vec![
+                    copy("claude-code", "/a/y", 100, 0),
+                    copy("codex", "/b/y", 100, 0),
+                ],
+            ),
+        ]);
+        assert!(out.contains("2 skills"), "{out}");
+        assert!(out.contains("1 in more than one place"), "{out}");
+    }
+
+    /// 空表不再意味着「没有重复」——表里装的是全部 skill,空就是一个 skill
+    /// 都没索引到。两件事的下一步动作完全不同,文案不能共用。
+    #[test]
+    fn 空结果说的是没索引到_skill_而不是没有重复() {
+        let out = render_skill_groups(&[]);
+        assert!(out.contains("No skill is indexed"), "{out}");
+        assert!(out.contains("duster scan"), "{out}");
+        assert!(!out.contains("nothing to share"), "{out}");
+    }
+
     /// codex 型会话夹具:假 home + 真扫描,与 cmd/session.rs 的测试同一套。
     /// 两场会话:一场 0 轮(只有 session_meta)、一场 1 轮。轮次 tid 是
     /// 从 1 起连续自增的,而 rid 也一样——单场有轮次的会话,它的 rid 几乎
-    /// 必然撞上某个 tid(`open` 按契约 turn 优先),所以要留一场 0 轮会话
+    /// 必然撞上某个 tid(裸数字两档都命中会报错让用户消歧,见
+    /// `open_两档撞车时报错并给出两条命令`),所以要留一场 0 轮会话
     /// 当「纯会话 id」。返回 (临时目录, home, 索引路径)。
     fn session_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2731,9 +3275,10 @@ mod tests {
             Some(&index),
             &duster_core::session::SessionFilter::default(),
         )
-        .unwrap();
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 2, "夹具里该有两场会话");
-        // 挑一个「不是任何 tid」的 rid:按契约 turn 优先,只有查无 tid
+        // 挑一个「不是任何 tid」的 rid:裸数字按契约先查 turn,只有查无 tid
         // 才会落到会话 id,测试必须真的走上那条路。
         let rid = rows
             .iter()
@@ -2741,30 +3286,268 @@ mod tests {
             .find(|&r| open_turn(Some(&index), r).is_err())
             .expect("夹具里该有一个不属于任何 tid 的会话 id");
 
-        // 会话 id → 会话渲染路径。
-        match resolve_open(Some(&index), rid).unwrap() {
+        // s<rid> 只在会话空间查:会话渲染路径。
+        match resolve_open(Some(&index), OpenId::Session(rid)).unwrap() {
             OpenTarget::Session(_) => {}
             other => panic!("{rid} 是会话 id,应解析成 Session: {other:?}"),
         }
-        // 第一条轮次(tid 1)→ 轮次渲染路径(全新库 tid 从 1 起)。
-        match resolve_open(Some(&index), 1).unwrap() {
+        // t1 → 轮次渲染路径(全新库 tid 从 1 起)。
+        match resolve_open(Some(&index), OpenId::Turn(1)).unwrap() {
             OpenTarget::Turn(t) => assert_eq!(t.role, "user"),
             other => panic!("tid 1 应解析成 Turn: {other:?}"),
         }
         // 两边都不是:报错要同时点名两个命令和各自的数字来源。
-        let err = resolve_open(Some(&index), 999_999).unwrap_err();
+        let err = resolve_open(Some(&index), OpenId::Either(999_999)).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("duster search"), "{msg}");
         assert!(msg.contains("duster session list"), "{msg}");
 
         // 整条命令走通:会话 id 返回成功,而不是落到报错退出码。
         assert_eq!(
-            cmd_open(OutputMode::Human, Some(&index), rid, false),
+            cmd_open(OutputMode::Human, Some(&index), OpenId::Session(rid), false),
             EXIT_OK
         );
         assert_eq!(
-            cmd_open(OutputMode::Human, Some(&index), 999_999, false),
+            cmd_open(
+                OutputMode::Human,
+                Some(&index),
+                OpenId::Either(999_999),
+                false
+            ),
             EXIT_ERROR
+        );
+    }
+
+    /// 解析器的形状契约:三种前缀、大小写、空串、非数字、负数、溢出,
+    /// 全在纯函数里定死,IO 路径只消费结果。
+    #[test]
+    fn parse_open_id_形状() {
+        assert_eq!(parse_open_id("t42"), Ok(OpenId::Turn(42)));
+        assert_eq!(parse_open_id("s500"), Ok(OpenId::Session(500)));
+        assert_eq!(parse_open_id("42"), Ok(OpenId::Either(42)));
+        // 交互输入常常手滑带空格,收。
+        assert_eq!(parse_open_id(" 42 "), Ok(OpenId::Either(42)));
+        assert_eq!(parse_open_id(" t42 "), Ok(OpenId::Turn(42)));
+        // 前缀只认小写,与 search / session list 印出来的一字不差。
+        assert!(parse_open_id("T42").is_err());
+        assert!(parse_open_id("S500").is_err());
+        // 空串、空前缀、非数字、符号数字全在这里死掉。
+        assert!(parse_open_id("").is_err());
+        assert!(parse_open_id("  ").is_err());
+        assert!(parse_open_id("abc").is_err());
+        assert!(parse_open_id("t").is_err());
+        assert!(parse_open_id("s").is_err());
+        assert!(parse_open_id("t-1").is_err());
+        assert!(parse_open_id("-1").is_err());
+        assert!(parse_open_id("+1").is_err());
+        assert!(parse_open_id("1_000").is_err());
+        assert!(parse_open_id("t1x").is_err());
+        assert!(parse_open_id("t1.5").is_err());
+        // 溢出 i64:正常 id 只有 5~6 位,超长不是笔误就是攻击。
+        assert!(parse_open_id("t99999999999999999999").is_err());
+        assert!(parse_open_id("s99999999999999999999").is_err());
+        assert!(parse_open_id("99999999999999999999").is_err());
+        // 报错文案说清期望形状并给可直接照抄的例子。
+        let msg = parse_open_id("abc").unwrap_err();
+        assert!(msg.contains("t42"), "{msg}");
+        assert!(msg.contains("s500"), "{msg}");
+        let msg = parse_open_id("99999999999999999999").unwrap_err();
+        assert!(msg.contains("out of range"), "{msg}");
+    }
+
+    /// 消歧:同一个数字在两个空间都存在时,`open` 不许自己挑一个——
+    /// 必须报错,且报错里同时给出可直接粘贴的 t<n> 与 s<n> 两条命令。
+    /// tid 与 rid 都是自增主键,数字迟早撞车,闷声返回轮次会静默吞掉
+    /// 用户想开的会话。
+    #[test]
+    fn open_两档撞车时报错并给出两条命令() {
+        let (_tmp, _home, index) = session_fixture();
+        let rows = duster_core::session::list(
+            Some(&index),
+            &duster_core::session::SessionFilter::default(),
+        )
+        .unwrap()
+        .rows;
+        // 找一个 rid 同时也是某个 tid 的数字:夹具里 tid 从 1 起、rid 也
+        // 从 1 起,几乎必然撞车;找不到就说明夹具变了,测试该红。
+        let collision = rows
+            .iter()
+            .map(|r| r.rid)
+            .find(|&r| open_turn(Some(&index), r).is_ok())
+            .expect("夹具里该有一个同时是 tid 的会话 id");
+
+        // 裸数字两档都命中:报错,且两条命令都在,让用户照着挑。
+        let err = resolve_open(Some(&index), OpenId::Either(collision)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("duster open t{collision}")),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("duster open s{collision}")),
+            "{msg}"
+        );
+
+        // 同一个数字标上前缀就锁定空间:t<n> 拿轮次、s<n> 拿会话,
+        // 撞车不再影响任何一边。
+        match resolve_open(Some(&index), OpenId::Turn(collision)).unwrap() {
+            OpenTarget::Turn(_) => {}
+            other => panic!("t{collision} 应解析成 Turn: {other:?}"),
+        }
+        match resolve_open(Some(&index), OpenId::Session(collision)).unwrap() {
+            OpenTarget::Session(_) => {}
+            other => panic!("s{collision} 应解析成 Session: {other:?}"),
+        }
+    }
+
+    /// `t<n>` 只查轮次空间:查不到就报错,不退化去查会话——用户标了前缀,
+    /// 想要的已经写明,替他去另一档找只会把打错的 id 静默变成「找到了
+    /// 别的东西」。`s<n>` 同理。
+    #[test]
+    fn open_带前缀查空_不退化到另一空间() {
+        let (_tmp, _home, index) = session_fixture();
+        let rows = duster_core::session::list(
+            Some(&index),
+            &duster_core::session::SessionFilter::default(),
+        )
+        .unwrap()
+        .rows;
+        // 挑一个「是 rid 但不是 tid」的数字:同数字的会话明明存在,
+        // t<n> 也必须报错而不是落到 Session。
+        let rid_only = rows
+            .iter()
+            .map(|r| r.rid)
+            .find(|&r| open_turn(Some(&index), r).is_err())
+            .expect("夹具里该有一个不属于任何 tid 的会话 id");
+        let err = resolve_open(Some(&index), OpenId::Turn(rid_only)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("no turn with id t{rid_only}")), "{msg}");
+        assert!(msg.contains("duster search"), "{msg}");
+        assert!(!msg.contains("matches neither"), "{msg}");
+    }
+
+    /// search 的命中行:turn id 印成 `t42`(不是裸 `#42`),方便直接粘进
+    /// `duster open`。行里带 CJK 也不歪:文件名截断与 snippet 高亮都按
+    /// 显示宽度走,前缀只换了一格,没动其余部件的排版。
+    #[test]
+    fn search_命中行_turn_id_带_t_前缀() {
+        let hits = [
+            SearchHit {
+                tid: 42,
+                rid: 1,
+                agent_id: "codex".into(),
+                resource_path: "/tmp/rollout-2025-01-01-会话-aaaa.jsonl".into(),
+                seq: 3,
+                role: "user".into(),
+                byte_off: 0,
+                byte_len: 4,
+                snippet: "你好 duster".into(),
+                highlights: vec![(6, 12)],
+            },
+            SearchHit {
+                tid: 103_753,
+                rid: 2,
+                agent_id: "claude-code".into(),
+                resource_path: "/tmp/rollout-2025-01-02T00-00-00-bbbb.jsonl".into(),
+                seq: 1,
+                role: "assistant".into(),
+                byte_off: 0,
+                byte_len: 0,
+                snippet: "run duster scan".into(),
+                highlights: vec![],
+            },
+        ];
+        let out = render_search_human(&hits, "duster");
+        // 每行第一格是 t<tid>,没有残留的 # 前缀。
+        assert!(out.contains("t42"), "{out}");
+        assert!(out.contains("t103753"), "{out}");
+        assert!(!out.contains("#42"), "{out}");
+        assert!(!out.contains("#"), "不该再有 # 前缀:{out}");
+        // 页脚给可直接粘贴的命令。
+        assert!(out.contains("duster open t<id>"), "{out}");
+        // CJK:会话文件名与 snippet 原样保留(截断与高亮没把字符切坏)。
+        assert!(out.contains("会话"), "{out}");
+        assert!(out.contains("你好 duster"), "{out}");
+    }
+
+    /// `skill rm` 的 CLI 接线:同名两家未指名报错列出候选且一份不删;
+    /// 指名后只删那家;干跑不动盘。核心逻辑的逐字节断言在 duster-core 的
+    /// skill_ops::remove 测试里,这里只钉外壳的接线与退出码。
+    #[test]
+    fn skill_rm_接线() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let index = home.join(".agent-duster/index.db");
+        // 两个 agent 各一份 foo(内置清单覆盖 claude-code 与 codex)。
+        for (rel, body) in [(".claude", "left body"), (".codex", "right body")] {
+            let root = home.join(rel).join("skills").join("foo");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: foo\ndescription: fixture\n---\n\n{body}\n"),
+            )
+            .unwrap();
+        }
+        duster_core::scan::scan(&duster_core::scan::ScanOptions {
+            home: Some(home.clone()),
+            index_path: Some(index.clone()),
+            full: false,
+        })
+        .expect("scan 夹具");
+
+        // 未指名:报错列出候选,一份不删。
+        let code = cmd_skill_rm(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            "foo",
+            None,
+            None,
+            true,
+            false,
+        );
+        assert_eq!(code, EXIT_ERROR, "多家未指名必须报错");
+        assert!(home.join(".claude/skills/foo").is_dir());
+        assert!(home.join(".codex/skills/foo").is_dir());
+
+        // 指名 claude-code:只删那家,codex 分毫不动,归档包出现。
+        let code = cmd_skill_rm(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            "foo",
+            Some("claude-code"),
+            None,
+            true,
+            false,
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(!home.join(".claude/skills/foo").exists(), "被点名的那份要删");
+        assert!(home.join(".codex/skills/foo").is_dir(), "没点名的那份不动");
+        let archives: Vec<_> = std::fs::read_dir(home.join("agent-duster-exports"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "zst"))
+            .collect();
+        assert_eq!(archives.len(), 1, "真实内容必须先归档: {archives:?}");
+
+        // 干跑:不归档、不删。
+        let code = cmd_skill_rm(
+            OutputMode::Human,
+            Some(&index),
+            Some(&home),
+            "foo",
+            Some("codex"),
+            None,
+            true,
+            true,
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(home.join(".codex/skills/foo").is_dir(), "预览不许删");
+        assert_eq!(
+            std::fs::read_dir(home.join("agent-duster-exports")).unwrap().count(),
+            1,
+            "预览不许新增归档包"
         );
     }
 }

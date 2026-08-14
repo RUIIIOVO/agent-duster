@@ -612,6 +612,17 @@ pub fn builtin_sources() -> &'static [(&'static str, &'static str)] {
     BUILTIN
 }
 
+/// 加载单份用户清单文件。
+///
+/// 单独开一个入口是给 `duster doctor` 的自检用：[`load_user_dir`] 撞上第一份
+/// 坏文件就整体报错，而自检要把用户手写的每一份坏 toml 都点名报出来——
+/// 那是他在那份报告里唯一能自己动手修的东西，一次说全才对得起这一项。
+pub fn load_user_file(path: &Path) -> Result<Manifest> {
+    let src = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read user manifest {}", path.display()))?;
+    parse(&src).with_context(|| format!("invalid user manifest: {}", path.display()))
+}
+
 /// 加载用户清单目录（`~/.agent-duster/adapters/*.toml`）。
 /// 目录不存在视为没有用户清单；单个文件解析失败即整体报错（带文件名）。
 pub fn load_user_dir(dir: &Path) -> Result<Vec<Manifest>> {
@@ -630,11 +641,7 @@ pub fn load_user_dir(dir: &Path) -> Result<Vec<Manifest>> {
         if path.extension().is_none_or(|ext| ext != "toml") {
             continue;
         }
-        let src = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read user manifest {}", path.display()))?;
-        let m =
-            parse(&src).with_context(|| format!("invalid user manifest: {}", path.display()))?;
-        out.push(m);
+        out.push(load_user_file(&path)?);
     }
     Ok(out)
 }

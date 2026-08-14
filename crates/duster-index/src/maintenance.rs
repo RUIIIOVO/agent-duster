@@ -183,6 +183,32 @@ pub fn integrity_ok(path: &Path) -> Result<bool> {
     Ok(rows.len() == 1 && rows[0].eq_ignore_ascii_case("ok"))
 }
 
+/// `PRAGMA quick_check` 是否通过。与 [`integrity_ok`] 同一用途、但快得多：
+/// quick_check 只查库内结构一致性，不校验被索引列与页面交叉引用，
+/// 几个 GB 的库也扛得住——`duster doctor` 用它扫一遍 agent 的库，而不是
+/// 拿完整性全查把一次自检拖慢一个量级。
+///
+/// 返回 `Ok(None)` = 打不开（被独占、加密、损坏到开不动、魔数不对）。
+/// 对诊断而言「打不开」本身就是坏库——quick_check 连跑都跑不起来，
+/// 结论与「check 报了问题」一样是「这库读不动」。
+pub fn quick_check_ok(path: &Path) -> Result<Option<bool>> {
+    // 先走 foreign::open 的判定：魔数 → 只读连接 → `PRAGMA schema_version`
+    // 探针（"文件头是 SQLite 但内容是垃圾"这类损坏在探针上就暴露了）。
+    // 打不开不是错误，是"这一项读不到"，返回 None 让调用方如实报。
+    let conn = match crate::foreign::open(path) {
+        Ok(Some(c)) => c,
+        // 打不开不是错误，是"这一项读不到"；Err 的语义相同（foreign::open
+        // 目前所有失败路径都折叠成 Ok(None)，Err 只是留给未来的逃生门）。
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    // prepare → 取完 → 立刻 drop：读锁存活时间以毫秒计，不卡对方的
+    // checkpoint（见 duster_index::foreign 的调用方义务）。
+    match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
+        Ok(row) => Ok(Some(row.eq_ignore_ascii_case("ok"))),
+        Err(_) => Ok(None),
+    }
+}
+
 /// 孤儿 WAL/SHM 判定：`<db>-wal` / `<db>-shm` 存在，但主库能拿到独占锁
 /// （说明没有活跃连接），且 WAL 已无未 checkpoint 的帧。
 ///

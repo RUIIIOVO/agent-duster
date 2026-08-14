@@ -33,10 +33,10 @@ Agent Duster gives you one CLI to see, search, and manage all of it.
 ## Highlights
 
 - 🔍 **Unified search** — one query across every agent's conversations, then `open` to read the whole turn. CJK-friendly.
-- 🧬 **Duplicate & drift detection** — `skill copies` finds byte-identical copies and same-name-but-diverged skills, wherever they live; `skill link` converges them into one linked source of truth.
+- 🧬 **Duplicate & drift detection** — `skill list` shows every skill you have and flags the ones that live in more than one place — including two copies inside one agent — and which of those copies drifted; `skill link` converges them into one linked source of truth.
 - 🧹 **Three cleanup verbs** — `clean` for regenerable junk, `prune` for stale resources, `uninstall` for a whole agent. Split by what it costs you if the tool guesses wrong, and everything is explained.
 - 🔁 **One declaration, many agents** — `mcp sync` copies an MCP server into other agents and rewrites it into each one's format; `skill link` shares one copy on disk. A conversion that would drop a field is refused, never silently truncated.
-- 🩺 **Doctor** — six checks in one pass: plaintext credentials (masked, never printed in full), MCP reachability, skill metadata, config syntax, dangling references, SQLite integrity.
+- 🩺 **Doctor** — checks duster itself, the way `brew doctor` checks brew: index database, adapter manifests, folder permissions, version — plus whether every SQLite database your agents keep (opencode.db, memories_1.sqlite, cc-switch.db…) is still readable. A broken one means sessions and memory will be unreadable.
 - 🔒 **Safe by default** — dry-run first; every item is listed and justified before it goes; **deletion is permanent**, and anything non-regenerable is archived to a path you can see first. Fully offline, zero telemetry, zero accounts.
 
 ## Quick Start
@@ -46,29 +46,34 @@ Agent Duster gives you one CLI to see, search, and manage all of it.
 
 ```bash
 duster                          # no arguments on a terminal: pick from the menu
-duster scan                     # discover agents & index resources
-duster status                   # overview: agents / sizes / issues
+duster status                   # overview: agents / sizes / what they keep
 duster search "auth middleware"
-duster mcp list                 # every MCP server, merged across the agents declaring it
+duster mcp list                 # every MCP declaration, with merge state per server
 duster session list             # conversations by project, age and size
 duster clean                    # caches and logs, dry-run by default
 duster prune --older-than 90d   # stale skills / sessions, item by item
 ```
+
+There is no "index my machine first" step. Every command that reads the index builds or
+refreshes it on the way in (0.5s incrementally, 4s from nothing), and the menu does it on a
+background thread so it never makes you wait. `duster scan` still exists for the report it
+prints — what was found, what is unclaimed — and `duster scan --full` re-reads every file
+from scratch if search ever looks wrong.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `duster` | With no arguments on a terminal: a menu. Pick a command and duster asks for whatever it needs, then runs the same code path the flags do. Piped, or with `--json`: prints help instead. |
-| `duster scan` | Detect installed agents, index MCP / skills / memories / sessions. Incremental by default; unknown paths are reported, never touched. |
-| `duster status` | Per-agent disk usage, resource counts, and when each was last scanned. |
+| `duster scan` | Detect installed agents, index MCP / skills / memories / sessions, and print what was found — including paths inside a claimed folder that no manifest declares. You never need to run it to make another command work; they refresh the index themselves. Incremental by default; unknown paths are reported, never touched. `--full` re-reads every file. |
+| `duster status` | Per-agent disk usage, resource counts, when each was last scanned. Exits 0 on success, non-zero only when it fails. |
 | `duster search <query>` | Full-text search across every agent's conversations; `--agent` narrows it (comma-separated for several), `--limit` sizes it. Hits are the extracted conversation text, not the raw transcript line. `duster open <id>` prints the whole turn a hit came from — hand it a conversation id instead and it prints the conversation, saying so. |
-| `duster session list \| show \| export \| prune` | Browse conversations across all agents, newest first; filter by `--agent` / `--project` / `--older-than` / `--min-bytes`. `show` prints one conversation as prose: tool output collapses to one line each (`## tool · read · 4.3 KB`) and long bodies stop at 40 lines, because you came to read the conversation, not the return value of `read()`; `--full` gives you everything. `export` writes it out as Markdown or JSON, always in full. `prune --older-than 90d` compresses in place to `.zst` and deletes the original only after the decompressed bytes hash back to the same BLAKE3 — search and open still read it afterwards. |
-| `duster memory list \| show` | Read-only view over `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, Qoder's per-project memory trees and SQLite-backed stores alike. `list` gives you the key, `show` prints that one memory. |
-| `duster mcp list \| show \| diff \| sync \| ping` | One row per server, merged across every agent that declares it, with each agent's dialect. `show` prints one in full with env values and headers masked. `diff --from A --to B` compares the same server as two agents declare it. `sync <name> --to codex,opencode` copies one declaration into other agents, converting formats; dry-run by default, snapshots each file before writing, and **refuses** any target whose format would drop a field. `ping` starts each server once, says `initialize`, and hangs up. |
-| `duster skill copies \| link` | Cross-agent skill management. `copies` lists skills that exist in more than one place — including two copies inside one agent — and which of them drifted; `link` converges duplicates onto one copy on disk — edit once, effective everywhere. |
+| `duster session list \| show \| export \| migrate \| prune \| rm` | Browse conversations across all agents, newest first; filter by `--agent` / `--project` / `--older-than` / `--min-bytes`. `show` prints one conversation as prose: tool output collapses to one line each (`## tool · read · 4.3 KB`) and long bodies stop at 40 lines, because you came to read the conversation, not the return value of `read()`; `--full` gives you everything. `export` writes it out as Markdown or JSON, always in full. `migrate <id> --to <agent>` plants a **text-only copy** of one conversation into claude-code, codex or omp — **deliberately lossy**: only user/assistant prose is carried over; thinking and tool activity are dropped, each dropped stretch collapsing to one `[tool activity omitted]` line, and the first message is stamped with where the copy came from. The three formats' tool records are mutually untranslatable, so duster refuses to forge them — and it re-reads the written file with the same parser `scan` uses before reporting success (`--dry-run` previews, any other agent gets `sessions are stats-only, cannot migrate`). `prune --older-than 90d` compresses in place to `.zst` and deletes the original only after the decompressed bytes hash back to the same BLAKE3 — search and open still read it afterwards. `rm <id>` deletes one conversation for good — a readable copy is archived into `~/agent-duster-exports/` first (`--no-archive` skips that for scripts); conversations stored in an agent's SQLite database (opencode / omp) are removed row by row from that database, with a whole-file snapshot taken before the write. |
+| `duster memory list \| show \| migrate \| rm` | One view over `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, Qoder's per-project memory trees and SQLite-backed stores alike. `list` gives you the key, `show` prints that one memory. `migrate --from <A> --to <B>` copies the text into a marked block inside the target agent's memory file (`<!-- duster:begin from=… -->`); re-running replaces the block instead of stacking a second copy, your own writing around it is never touched, and `--dry-run` prints the block without writing anything. `rm <key> [--from <A>]` cuts out exactly the marked block migrated from A — byte for byte around it — and `--whole-file` deletes the whole file instead; a file that is only duster's block (a `from-<agent>-*.md` in a directory target, or a file left with nothing but blocks) is removed whole. Agents whose "memory" is a settings file or database (stats-only) are refused as source and as target. Everything is archived to `~/agent-duster-exports/` before it is deleted (`--no-archive` opts out, scripts). Two confirmation gates apply to a file **you wrote yourself** (no duster blocks, or `--whole-file`): it is your own writing, not something duster put there, so `--no-archive` is **refused** for it — duster never deletes your own words without a way back — and the menu asks twice, naming the paths, the bytes and the archive destination. A file holding several duster blocks and no `--from` is refused with the block list and both ways out spelled out. |
+- | `duster mcp list \| show \| sync \| rm \| ping` | One row per declaration, with a STATE column saying whether every agent declares that server identically (`identical`), differently (`drifted`), or only one agent declares it (`only copy`) — differences are visible in the table, no separate diff command. `show` prints one in full with env values and headers masked. `sync <name> --to codex,opencode` copies one declaration into other agents, converting formats; dry-run by default, snapshots each file before writing, and **refuses** any target whose format would drop a field. `rm <name> --agent <A>` removes that one declaration from **that agent's own main config file** (`~/.claude.json`, `~/.codex/config.toml`, `~/.gemini/settings.json` …) — **your primary configuration**, not duster's: the same schema guard refuses to write when the file's shape drifted, only that one key is touched (everything else in the file stays byte for byte), and the **whole config file is packed into `~/agent-duster-exports/` first**, so `tar -xf` brings it back; `--no-archive` opts out for scripts, `--dry-run` prints which key disappears from which file, `--all-agents` removes every declaration of the name. `ping` starts each server once, says `initialize`, and hangs up. |
+| `duster skill list \| link \| rm` | Cross-agent skill management. `list` lists every skill you have and flags which ones live in more than one place — including two copies inside one agent — and which of those copies drifted; `link` converges duplicates onto one copy on disk — edit once, effective everywhere. `rm <name> --agent <A> [--path <P>]` deletes exactly one copy — `--agent` is required when several agents share the name, and `--path` is required when one agent keeps the skill in several directories, because duster never deletes all copies for you; real directories are archived into `~/agent-duster-exports/` first, while symlink copies are just unlinked (the content they point to stays). |
 | `duster diff <a> <b>` | Compare two files or two folders, line by line. `--no-line-level` keeps it to which entries differ; `--include-same` also lists the identical ones. |
-| `duster doctor` | Six checks in one pass: `secrets` (needs `--secrets`), `skill-metadata`, `config-syntax`, `dangling-reference`, `sqlite-integrity`, `mcp-reachability` (needs `--ping`). `--check <name>` runs only the ones you name. Every check gets a line in the report — the ones that were skipped say so, and say which flag turns them on. |
+| `duster doctor` | Checks **duster itself**, the way `brew doctor` checks brew: index database, adapter manifests, home-folder permissions, version — plus whether every SQLite database your agents keep (opencode.db, memories_1.sqlite, cc-switch.db…) is still readable: a broken one means sessions and memory will be unreadable. Takes no flags. Every check gets a line, including the ones that found nothing: "we haven't looked" and "we looked and found nothing" are different facts. |
 | `duster clean` | Reclaim **regenerable junk**: SQLite free pages, orphan WAL/SHM, caches, logs, temp leftovers. Dry-run by default, `--yes` executes, **really deleted, no copy kept**. Finishes by reporting the other two buckets (stale resources / installed software) and where they go. Never removes installed software. |
 | `duster prune --older-than 30d` | Reclaim **stale resources you created**: skills that neither changed for N days nor appear in any *invocation record* (a name mentioned in prose is not evidence — see below), expired backups and archives; sessions older than N days get compressed, not deleted. `--keep-generations` additionally clears surplus copies of per-generation resources such as database backups, which are redundant by count rather than by age. Always lists every item first (what it is / why it's stale / what breaks), then deletes permanently — non-regenerable content is archived to `~/agent-duster-exports/` beforehand. |
 | `duster uninstall <agent>` | **Remove one agent entirely**, in three parts: the folders and files the manifest declares as its own; its keys inside config files *other* agents own (removed surgically, whole-file snapshot first); and how the software itself was installed — that uninstall command is printed and **never run**, unless you pass `--run-package-manager`. `--data-only` opts out of the last two and reports how many edits and hints it skipped. Requires typing the agent id to confirm; `--export-first` (on by default) archives sessions and memory, `--keep sessions,memory` leaves them in place. |
@@ -76,9 +81,8 @@ duster prune --older-than 90d   # stale skills / sessions, item by item
 ### Not built yet
 
 - `duster migrate --from <A> --to <B>` — move everything between two agents in one planned, idempotent pass.
-- `duster mcp remove` and `duster skill unlink \| remove` — deleting a declaration still means editing the file yourself, or `uninstall`ing the whole agent.
-- `duster memory merge \| export` — the memory view is read-only today.
-- Pruning stale MCP declarations. `prune` handles files; dropping one server out of a config file others still use rides on the same machinery as `mcp sync` and lands with it.
+- `duster memory merge \| export` — beyond `memory migrate`'s marked-block copy: merging and per-agent projection need the capability matrix to know which conversions are lossy.
+- Age-based pruning of MCP declarations. Removing one specific server is `duster mcp rm <name> --agent <A>` — but "drop the servers I haven't touched in N days" still needs the staleness rules `prune` has, and the same `prune` machinery to drive it.
 - `search` over memories, skills and MCP configs. Today it searches conversation text only.
 
 ### Three verbs, split by what a wrong guess costs you
@@ -106,7 +110,7 @@ the run. The full `what / why / impact` report is the command-line path (`--dry-
 stays redirectable to a file.
 
 Every other list view in the menu is a browser rather than a dump: `session list`,
-`memory list`, `mcp list`, `skill copies` and `search` page through their rows (↑/↓ to move,
+`memory list`, `mcp list`, `skill list` and `search` page through their rows (↑/↓ to move,
 ←/→ to page, Enter to open, Esc to go back) and Enter runs the detail command on the row you
 picked — no hand-copying a key into a second command. Anything scoped by `--agent` asks with
 a checklist of your agents carrying each one's size and reclaimable bytes, **everything checked
@@ -170,7 +174,7 @@ Four stronger guarantees replace it:
 `--json` is global and turns any command into one line of JSON. The rest belong to the
 commands that have them: `--yes` on `clean` / `prune` / `session prune` / `mcp sync`,
 `--dry-run` on all of those except `mcp sync` (which has no plan-only flag because plan-only
-is what it does without `--yes`), `--confirm <agent>` on `uninstall`, `--full` on `session show`
+is what it does without `--yes`) plus `session migrate`, `--confirm <agent>` on `uninstall`, `--full` on `session show`
 and `open`, `--agent <id>[,<id>]` wherever
 a scope makes sense. In `--json` mode nothing destructive runs without `--yes`: there is no
 terminal to ask at, so duster prints the plan and exits 4.

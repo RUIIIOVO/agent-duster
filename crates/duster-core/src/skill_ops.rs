@@ -1,10 +1,19 @@
 //! skill 的横向操作：跨 agent 去重 / 漂移检测 / 链接。
 //!
-//! 同一份 skill 常常在三四个 agent 目录下各躺一份。三种状态要分清：
+//! 同一份 skill 常常在三四个 agent 目录下各躺一份。五种状态要分清：
 //! - **IDENTICAL**：树哈希全等。可以链接成一份，省的是体积也是维护成本。
 //! - **DRIFTED**：同名不同哈希。**这是要报出来的那个**——用户以为三处一样，
 //!   实际上早就各自改过了，改了哪儿得给出 diff。
-//! - 只有一份：不参与。
+//! - **SINGLE**：全机只有这一份，没有可比对象。照样列出来——`skill list`
+//!   回答的是「我有哪些 skill」，本机实测 34 个名字里 21 个只有一份，滤掉它们
+//!   就只剩 13 行，「列出全部 skill」这句话直接是假的。
+//! - **LINKED**：副本根路径是软链，或**整份目录只含软链**（`connect-chrome` /
+//!   `open-gstack-browser` 就是 SKILL.md 软链指向 gstack 的目录），且目标
+//!   解析成功。这类副本没有自己的内容，不该拿 0 字节的哈希去和实体副本比——
+//!   本机指向 gstack 的一票软链，旧逻辑不 follow 读出 0 字节、树哈希全相同
+//!   （只含软链的目录文件表为空，哈希必然全等），整组被误判成 identical。
+//! - **BROKEN**：软链悬空（根软链，或只含软链的目录里存在悬空链）。skill
+//!   名下这份"副本"实际不存在，是最该先修的一档。
 //!
 //! 树哈希一律**剪掉 install 子路径**（`node_modules` / `dist` / `bin` / `.git`）。
 //! 理由和 status 体积口径是同一个：本机 `gstack` 一个 skill 就 1.1 GB，
@@ -21,18 +30,41 @@ use duster_adapter::manifest;
 use duster_fs::hash::hash_tree;
 use duster_fs::walk::{WalkOptions, walk_files, walk_stats};
 use duster_index::db::Index;
+use duster_index::query;
 use duster_model::ResourceKind;
 
+use crate::delete::{self, DeleteOptions, DeleteReport};
 use crate::diff::{Change, DiffOptions, diff_trees};
+use crate::freshness;
 
 /// 一组同名 skill 的比较结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DupState {
+    /// 全机只有这一份，没有可比对象。
+    ///
+    /// 不并进 `Identical`：一份副本说「完全相同」是句胡话——和谁相同？
+    /// 读者会以为自己漏看了另一行，回头去数表格。
+    Single,
     /// 树哈希全等。
     Identical,
     /// 同名不同哈希。
     Drifted,
+    /// 副本根路径是软链，或整份目录只含软链（如 SKILL.md 软链指向 gstack
+    /// 的 `connect-chrome`），且目标能解析到有效位置（组内另一份或别处的
+    /// 实体）。
+    ///
+    /// 这类副本没有自己的内容，不该参与 identical/drifted 的哈希比较——
+    /// 不 follow 读出 0 字节、树哈希全相同（只含软链的目录文件表为空，
+    /// 哈希必然全等），正是本机把一堆指向 gstack 的软链误判成 identical
+    /// 的病根。判它只认目标能不能解析，不认内容。
+    Linked,
+    /// 副本根路径是软链，或整份目录只含软链，且其中存在悬空链（目标被删了 /
+    /// 从没存在过）。
+    ///
+    /// 悬空链是坏账：skill 名下这份"副本"实际不存在。比 Drifted 更该报，
+    /// 组级状态里它压过一切——先修了坏链再谈比较。
+    Broken,
 }
 
 /// 一份副本。
@@ -40,7 +72,15 @@ pub enum DupState {
 pub struct SkillCopy {
     pub agent_id: String,
     pub path: PathBuf,
-    /// 剪枝后的树哈希（hex）。
+    /// 这份副本自己的状态：软链副本是 `Linked`/`Broken`，普通目录副本
+    /// 跟随组级比较结果（`Identical`/`Drifted`/`Single`）。
+    pub state: DupState,
+    /// 软链指向的目标（根软链，或整份只含软链的副本）：`Linked` 是解析后的
+    /// 绝对路径，`Broken` 是 `read_link` 原文（目标已消失、解析不了，原文是
+    /// 最后一份记录）。普通目录副本为 `None`，JSON 里整个字段省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<PathBuf>,
+    /// 剪枝后的树哈希（hex）。软链副本不参与比较，恒为空串。
     pub tree_hash: String,
     /// 剪枝后的用户内容体积。
     pub bytes: u64,
@@ -65,40 +105,120 @@ pub struct SkillGroup {
     pub warnings: Vec<String>,
 }
 
-/// 跨 agent 扫描全部 skill，按名分组比较。只返回副本数 ≥ 2 的组。
+/// 跨 agent 扫描全部 skill，按名分组比较。**每个名字都返回一组**，只有一份的
+/// 也在内——本机实测 34 个名字里 21 个只有一份，滤掉就只剩 13 行。
 ///
 /// 读索引拿路径，现场算树哈希（索引里的 `hash_content` 对 skill 恒为空——
 /// 目录树哈希开销大，只在这里按需算）。
-pub fn copies(index_path: Option<&std::path::Path>) -> Result<Vec<SkillGroup>> {
+///
+/// 单份组照走 `measure_copy`：体积要报，`tree_hash` 照填。给它另开一条
+/// 「只量体积、不算哈希」的快路径，省下的是本机 0.35s → 0.5s 这一档，
+/// 换来的是两条测量口径迟早走散——不值。
+///
+/// 分组键是**声明的 skill 名**而不是目录名：同一个 agent 里两个目录声明同一个
+/// 名字是真实存在的（本机 `open-gstack-browser` 就在 claude-code 下有
+/// `connect-chrome` 与同名目录两份），它们必须落进同一组才比得出漂移。
+pub fn list(index_path: Option<&std::path::Path>) -> Result<Vec<SkillGroup>> {
     let idx = open_index(index_path)?;
     let groups = duster_index::query::skill_groups(idx.conn())?;
     let prune = install_prune();
 
     let mut out: Vec<SkillGroup> = Vec::new();
     for (name, rows) in groups {
-        // 索引里就只有一份的组不参与：没有可比对象，报出来只是噪音。
-        if rows.len() < 2 {
-            continue;
-        }
-
         let mut copies: Vec<SkillCopy> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
         for r in &rows {
             let root = PathBuf::from(&r.path);
-            if !root.is_dir() {
+            // symlink_metadata 不 follow：根路径到底是软链还是真目录，只有它
+            // 说了算。is_dir() 会跟着软链走，悬空链判成"消失"、有效链读出
+            // 0 字节，两种都被它骗过去——软链的判定必须看链接本身。
+            let meta = match std::fs::symlink_metadata(&root) {
+                Ok(m) => m,
+                Err(_) => {
+                    warnings.push(format!(
+                        "copy for agent `{}` is gone from disk: {} (something removed it \
+                         outside duster after it was indexed; re-scanning only drops the row too)",
+                        r.agent_id, r.path
+                    ));
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                // 软链副本：不 follow、不量体积、不参与哈希比较。状态只看
+                // 目标能不能解析——能就是 linked（记下指向哪），不能就是
+                // broken。悬空时 canonicalize 失败，退回 read_link 原文：
+                // 目标已删，这份原文是"它曾经想指向哪"的最后记录。
+                let resolved = std::fs::canonicalize(&root).ok();
+                let state = if resolved.is_some() {
+                    DupState::Linked
+                } else {
+                    DupState::Broken
+                };
+                let link_target = resolved.or_else(|| std::fs::read_link(&root).ok());
+                copies.push(SkillCopy {
+                    agent_id: r.agent_id.clone(),
+                    path: root,
+                    state,
+                    link_target,
+                    tree_hash: String::new(),
+                    bytes: 0,
+                    install_bytes: 0,
+                });
+                continue;
+            }
+            if !meta.is_dir() {
+                // 存在但不是目录（普通文件占了位）：与"消失"同样降级成警告。
                 warnings.push(format!(
-                    "copy for agent `{}` is gone from disk: {} (index is stale, re-run `duster scan`)",
+                    "copy for agent `{}` is not a directory: {}",
                     r.agent_id, r.path
                 ));
                 continue;
             }
             match measure_copy(&root, &prune) {
                 Ok(m) => {
+                    // 只含软链的 copy：内容住在别处（通常指向另一份实体），
+                    // 既不是独立副本也不该参与 identical/drifted 比较——目录
+                    // 文件表为空时哈希必然全等，这正是 connect-chrome /
+                    // open-gstack-browser 假 identical 的病根。整份判
+                    // Linked（每条软链都能解析）或 Broken（任一悬空）。
+                    let (state, link_target, tree_hash) =
+                        if m.regular_count == 0 && !m.symlinks.is_empty() {
+                            let mut syms = m.symlinks;
+                            syms.sort_by(|a, b| a.rel.cmp(&b.rel));
+                            // 解析只在需要时做：夹着常规文件的零星软链是
+                            // 噪音，不判状态，省掉那几次 canonicalize。
+                            let resolved: Vec<Option<PathBuf>> = syms
+                                .iter()
+                                .map(|s| std::fs::canonicalize(root.join(&s.rel)).ok())
+                                .collect();
+                            let all_resolve = resolved.iter().all(Option::is_some);
+                            (
+                                if all_resolve {
+                                    DupState::Linked
+                                } else {
+                                    DupState::Broken
+                                },
+                                // 按相对路径排序取第一条：Linked 记解析后的
+                                // 目标，Broken 记 read_link 原文（目标已消失，
+                                // 原文是最后一份记录）。
+                                if all_resolve {
+                                    resolved[0].clone()
+                                } else {
+                                    syms[0].target_raw.clone()
+                                },
+                                // 不参与比较：树哈希置空，跟根软链副本同一口径。
+                                String::new(),
+                            )
+                        } else {
+                            (DupState::Single, None, m.tree_hash)
+                        };
                     copies.push(SkillCopy {
                         agent_id: r.agent_id.clone(),
                         path: root,
-                        tree_hash: m.tree_hash,
+                        state,
+                        link_target,
+                        tree_hash,
                         bytes: m.bytes,
                         install_bytes: m.install_bytes,
                     });
@@ -112,8 +232,40 @@ pub fn copies(index_path: Option<&std::path::Path>) -> Result<Vec<SkillGroup>> {
             }
         }
 
-        let drifted = copies.iter().any(|c| c.tree_hash != copies[0].tree_hash);
-        let diff = if drifted {
+        // 状态按**现场量到的**副本数判，不按索引行数：索引说两份、磁盘上
+        // 只剩一份时（上面那条警告），说它 identical 等于拿一份副本和自己比，
+        // 而用户眼前确实只有一行。
+        //
+        // 软链副本不参与 identical/drifted：普通目录单独拿出来比，组级状态
+        // 再让悬空链压过一切——broken 是坏账，先修它；全是软链没得比就整个
+        // 报 linked。
+        let regular_state = {
+            let regular: Vec<&SkillCopy> = copies
+                .iter()
+                .filter(|c| !matches!(c.state, DupState::Linked | DupState::Broken))
+                .collect();
+            if regular.len() < 2 {
+                DupState::Single
+            } else if regular.iter().any(|c| c.tree_hash != regular[0].tree_hash) {
+                DupState::Drifted
+            } else {
+                DupState::Identical
+            }
+        };
+        let state = if copies.iter().any(|c| c.state == DupState::Broken) {
+            DupState::Broken
+        } else if !copies.is_empty() && copies.iter().all(|c| c.state == DupState::Linked) {
+            DupState::Linked
+        } else {
+            regular_state
+        };
+        // 普通副本的逐行状态跟随比较结果；软链副本保持 Linked/Broken 不动。
+        for c in &mut copies {
+            if !matches!(c.state, DupState::Linked | DupState::Broken) {
+                c.state = regular_state;
+            }
+        }
+        let diff = if state == DupState::Drifted {
             Some(build_diff(&copies, &prune, &mut warnings)?)
         } else {
             None
@@ -121,11 +273,7 @@ pub fn copies(index_path: Option<&std::path::Path>) -> Result<Vec<SkillGroup>> {
 
         out.push(SkillGroup {
             name,
-            state: if drifted {
-                DupState::Drifted
-            } else {
-                DupState::Identical
-            },
+            state,
             copies,
             diff,
             warnings,
@@ -226,7 +374,8 @@ pub fn link(
     let src_root = PathBuf::from(&src.path);
     if !src_root.is_dir() {
         bail!(
-            "source skill directory is gone: {} (index is stale, re-run `duster scan`)",
+            "source skill directory is gone: {} (something removed it outside duster \
+             after it was indexed; there is nothing left to link from)",
             src.path
         );
     }
@@ -322,10 +471,298 @@ pub fn link(
     })
 }
 
+// ---------------------------------------------------------------------------
+// rm
+// ---------------------------------------------------------------------------
+
+/// 一份副本的现场形态。删除方式由它决定。
+///
+/// 软链副本（Linked / Broken）**没有自己的内容**——内容住在链接指向的地方
+/// （另一家 agent 的副本，或 `duster skill link` 建的 CAS 实体）。删这种
+/// 副本只准删链接本身，**绝不跟随链去删目标**：目标可能是另一家正在用的
+/// 那一份，也可能是几家共享的本体。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyKind {
+    /// 根路径是软链。只 unlink 链接本身，不归档。
+    Symlink,
+    /// 目录但没有任何常规文件（只含软链，或空目录）。内容同样住在别处：
+    /// 删目录（里面的软链原样随删，不跟随），不归档。
+    NoContent,
+    /// 目录且含常规文件：真实内容，归档后整棵删。
+    RealDir,
+}
+
+/// `duster skill rm`：删除一个 skill 的一份副本。
+///
+/// # 指名与「别默认删全部」
+///
+/// 同一个 skill 名装在多家 agent 里时，`--agent` **必选**：缺了就报错并
+/// 列出候选，**绝不默认删全部**——用户刚看完 `skill list` 想删 claude-code
+/// 那份，duster 却把他三家全删了，没有比这更糟的默认值。全机只有一份时
+/// 不必指名（没什么可歧义的）。
+///
+/// **同一 agent 名下同名多份**（目录不同，本机 `open-gstack-browser` 在
+/// claude-code 里就有 `connect-chrome` 与 `open-gstack-browser` 两个目录）
+/// 走同一条铁律：`--agent` 收窄之后仍剩多份，就要 `path` 再指一次，缺了
+/// 报错列路径。理由与上一段逐字相同——「指名一家」不等于「同意删掉那家
+/// 的每一份」，而这两份的内容可以完全不同。
+///
+/// # 三种形态，三种删法
+///
+/// - **RealDir**（普通目录，有真实内容）：先归档整目录再删——skill 是
+///   用户写的东西，删了要有一条退路（`--no-archive` 显式关）。
+/// - **Symlink / NoContent**（根软链，或只含软链的目录）：只删链接本身，
+///   不归档。没自己的内容可归——归一个断链或归一条指向别处的链，都是
+///   假安全感；内容在别处，删链不丢东西。
+///
+/// 删完清索引行（Contract 3：不留幽灵行，下一次 `skill list` 不再列出）。
+pub fn remove(
+    opts: &DeleteOptions,
+    name: &str,
+    agent: Option<&str>,
+    path: Option<&str>,
+) -> Result<DeleteReport> {
+    let home = resolve_home(opts.home.as_deref())?;
+    let index_path = match &opts.index_path {
+        Some(p) => p.clone(),
+        None => crate::scan::default_index_path(&home),
+    };
+    let idx = Index::open(&index_path)
+        .with_context(|| format!("failed to open index for writing: {}", index_path.display()))?;
+    let conn = idx.conn();
+
+    let groups = duster_index::query::skill_groups(conn)?;
+    let Some(rows) = groups.get(name) else {
+        bail!(
+            "unknown skill `{name}`; indexed skills: {}",
+            join_or_none(groups.keys().map(|s| s.as_str()))
+        );
+    };
+
+    // 候选：先按 --agent 收窄，再按 path 收窄。每一步收窄之后仍剩多份就
+    // 报错列候选，绝不默认删全部——收窄的粒度是「agent 有几家」与「这一家
+    // 有几份」两个独立问题，各要用户答一次。
+    let by_agent: Vec<&duster_index::query::ResourceRecord> = match agent {
+        Some(a) => {
+            let hits: Vec<_> = rows.iter().filter(|r| r.agent_id == a).collect();
+            if hits.is_empty() {
+                bail!(
+                    "skill `{name}` is not installed for agent `{a}`; it exists in: {}",
+                    join_or_none(distinct_agents(rows).into_iter())
+                );
+            }
+            hits
+        }
+        None => {
+            let agents = distinct_agents(rows);
+            if agents.len() > 1 {
+                bail!(
+                    "skill `{name}` is installed for {} agents ({}). Pass --agent to pick \
+                     one — duster never deletes all copies of a shared skill",
+                    agents.len(),
+                    join_or_none(agents.into_iter())
+                );
+            }
+            rows.iter().collect::<Vec<_>>()
+        }
+    };
+
+    let copies: Vec<&duster_index::query::ResourceRecord> = match path {
+        Some(p) => {
+            let hits: Vec<_> = by_agent.iter().copied().filter(|r| r.path == p).collect();
+            if hits.is_empty() {
+                bail!(
+                    "no copy of skill `{name}` at `{p}`; candidates: {}",
+                    join_or_none(by_agent.iter().map(|r| r.path.as_str()))
+                );
+            }
+            hits
+        }
+        None => {
+            if by_agent.len() > 1 {
+                bail!(
+                    "agent `{}` keeps {} copies of skill `{name}` in different directories \
+                     ({}). Name the one to delete with --path — picking an agent is not the \
+                     same as agreeing to delete every copy it keeps",
+                    by_agent[0].agent_id,
+                    by_agent.len(),
+                    join_or_none(by_agent.iter().map(|r| r.path.as_str()))
+                );
+            }
+            by_agent
+        }
+    };
+
+    let mut report = DeleteReport::default();
+    let mut to_archive: Vec<PathBuf> = Vec::new();
+    let mut targets: Vec<(i64, PathBuf, CopyKind)> = Vec::new();
+
+    // 第一遍：现场分类 + 收集归档内容。分类失败只作废那一条。
+    for rec in &copies {
+        let root = PathBuf::from(&rec.path);
+        match classify_copy(&root) {
+            Ok(kind) => {
+                if kind == CopyKind::RealDir && opts.archive && !opts.dry_run {
+                    to_archive.push(root.clone());
+                }
+                targets.push((rec.rid, root, kind));
+            }
+            Err(e) => report
+                .warnings
+                .push(format!("skill `{name}` for agent `{}`: {e:#}; skipped", rec.agent_id)),
+        }
+    }
+
+    if targets.is_empty() {
+        return Ok(report);
+    }
+
+    // 先归档后删：归档失败整体中止（一个字节都不删）。
+    let archived = if opts.archive && !opts.dry_run && !to_archive.is_empty() {
+        Some(delete::archive_before_delete(&to_archive, "skill-rm", &home)?)
+    } else {
+        None
+    };
+
+    // 干跑：只报将删什么。`removed` 在这条路径上读作「将删」——整个
+    // `DeleteReport` 在干跑里都是条件式的，所以 `archived` 同样读作
+    // 「将归档到哪」，给的是目录而不是编造一个带秒级时间戳的包名。
+    // 软链副本只 unlink、没有自己的内容可归档，所以一份 RealDir 都没有时
+    // 这里是 None——外壳照这一位分行文，不能笼统说「会归档」。
+    if opts.dry_run {
+        report.removed = targets.iter().map(|(_, p, _)| p.clone()).collect();
+        report.freed_bytes = targets
+            .iter()
+            .filter(|(_, _, k)| *k == CopyKind::RealDir)
+            .map(|(_, p, _)| dir_bytes(p))
+            .sum();
+        let any_real = targets.iter().any(|(_, _, k)| *k == CopyKind::RealDir);
+        if opts.archive && any_real {
+            report.archived = Some(delete::exports_dir(&home));
+        }
+        return Ok(report);
+    }
+
+    // 第二遍：真删。每条的失败只作废它自己。
+    for (rid, root, kind) in &targets {
+        match delete_one_copy(root, *kind) {
+            Ok(freed) => {
+                report.removed.push(root.clone());
+                report.freed_bytes += freed;
+                if let Err(e) = query::delete_resource(conn, *rid) {
+                    report.warnings.push(format!(
+                        "skill `{name}` was deleted but the index entry could not be \
+                         removed: {e:#} (a rescan will clean it up)"
+                    ));
+                }
+            }
+            Err(e) => report
+                .warnings
+                .push(format!("skill `{name}` at {}: {e:#}; kept", root.display())),
+        }
+    }
+    report.archived = archived;
+    Ok(report)
+}
+
+/// 现场判定一份副本的形态。读不到路径（被外力删了）按 NoContent 处理——
+/// 没有内容可归档，删的动作会落空，索引行照清。
+fn classify_copy(root: &Path) -> Result<CopyKind> {
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(_) => return Ok(CopyKind::NoContent),
+    };
+    if meta.file_type().is_symlink() {
+        // 根软链：Linked 或 Broken 都只删链接本身。
+        return Ok(CopyKind::Symlink);
+    }
+    if !meta.is_dir() {
+        // 存在但不是目录（普通文件占了位）：不是一份 skill，别归档也别删
+        // 内容，按「没有可删的真实内容」处理。
+        return Ok(CopyKind::NoContent);
+    }
+    // 目录：有没有常规文件？只含软链的目录（connect-chrome 这类转发副本）
+    // 内容住在别处，不该归档。软链按链接本身计，不跟随。
+    let mut has_regular = false;
+    let mut bytes = 0u64;
+    walk_files(
+        root,
+        &WalkOptions {
+            follow_links: false,
+            prune_dirs: Vec::new(),
+        },
+        |_, m| {
+            if m.is_file() {
+                has_regular = true;
+                bytes += m.len();
+            }
+        },
+    )
+    .with_context(|| format!("failed to walk skill directory: {}", root.display()))?;
+    let _ = bytes;
+    if has_regular {
+        Ok(CopyKind::RealDir)
+    } else {
+        Ok(CopyKind::NoContent)
+    }
+}
+
+/// 删一份副本，返回释放的字节数。
+///
+/// - Symlink：unlink 链接本身，**绝不跟随**（`remove_file` 只删目录项，
+///   目标一个字节都不碰）。
+/// - NoContent：删目录（内含的软链原样随删）。已经不在盘上 = 视为已删。
+/// - RealDir：整棵删（`remove_dir_all` 不跟随内部软链，它们按链接删掉）。
+fn delete_one_copy(root: &Path, kind: CopyKind) -> Result<u64> {
+    match kind {
+        CopyKind::Symlink => {
+            let freed = 0;
+            match std::fs::remove_file(root) {
+                Ok(()) => Ok(freed),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(freed),
+                Err(e) => Err(e)
+                    .with_context(|| format!("failed to unlink skill symlink: {}", root.display())),
+            }
+        }
+        CopyKind::NoContent => {
+            let freed = 0;
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => Ok(freed),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(freed),
+                Err(e) => Err(e).with_context(|| {
+                    format!("failed to remove skill directory: {}", root.display())
+                }),
+            }
+        }
+        CopyKind::RealDir => {
+            let freed = dir_bytes(root);
+            std::fs::remove_dir_all(root)
+                .with_context(|| format!("failed to remove skill directory: {}", root.display()))?;
+            Ok(freed)
+        }
+    }
+}
+
+/// 目录内常规文件的体积和。读不到的路径按 0 计（与 uninstall 的实测口径
+/// 同一侧：报告里的 freed_bytes 必须和用户拿 du 量出来的一致）。
+fn dir_bytes(root: &Path) -> u64 {
+    let mut bytes = 0u64;
+    let opts = WalkOptions {
+        follow_links: false,
+        prune_dirs: Vec::new(),
+    };
+    let _ = walk_files(root, &opts, |_, m| {
+        if m.is_file() {
+            bytes += m.len();
+        }
+    });
+    bytes
+}
+
 /// 树哈希与体积统计时剪掉的 install 子路径名。
 ///
 /// 与清单里 skill 资源的 `install_paths` 默认值保持一致——三处口径
-/// （status 体积 / 归档排除 / copies 检测的树哈希）必须是同一份定义。
+/// （status 体积 / 归档排除 / `skill list` 检测的树哈希）必须是同一份定义。
 pub const DEFAULT_INSTALL_DIRS: [&str; 4] = ["node_modules", "dist", "bin", ".git"];
 
 /// [`DEFAULT_INSTALL_DIRS`] 的 `Vec<String>` 形态（walk / hash 的入参口径）。
@@ -333,18 +770,10 @@ fn install_prune() -> Vec<String> {
     DEFAULT_INSTALL_DIRS.iter().map(|s| s.to_string()).collect()
 }
 
-/// 与 [`crate::status::status`] 同一套只读打开：同一默认路径、同一句提示。
+/// 与 [`crate::status::status`] 同一套只读打开：同一默认路径、同一条
+/// [`crate::freshness::ensure_exists`]（库还没建过就先建一次）。
 fn open_index(index_path: Option<&Path>) -> Result<Index> {
-    let path: PathBuf = match index_path {
-        Some(p) => p.to_path_buf(),
-        None => duster_fs::path::expand_tilde("~/.agent-duster/index.db"),
-    };
-    if !path.is_file() {
-        bail!(
-            "index database not found: {}. Run `duster scan` first to build it.",
-            path.display()
-        );
-    }
+    let path = freshness::ensure_exists(index_path)?;
     Index::open_readonly(&path)
         .with_context(|| format!("failed to open index read-only: {}", path.display()))
 }
@@ -391,6 +820,21 @@ fn agent_skill_root(home: &Path, agent: &str) -> Result<PathBuf> {
     Ok(expand_tilde_at(home, &r.path))
 }
 
+/// 一组副本涉及的 agent，按出现顺序去重。
+///
+/// 错误文案里必须报「几**家**」而不是「几**份**」：同一家装了两份时,
+/// 拿副本数当家数会印出 `installed for 2 agents (claude-code, claude-code)`
+/// ——数字和名单自相矛盾,用户会当成 duster 算错了。
+fn distinct_agents(rows: &[duster_index::query::ResourceRecord]) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for r in rows {
+        if !out.contains(&r.agent_id.as_str()) {
+            out.push(&r.agent_id);
+        }
+    }
+    out
+}
+
 /// 逗号分隔；空集给一句人话而不是空字符串。
 fn join_or_none<'a>(items: impl Iterator<Item = &'a str>) -> String {
     let v: Vec<&str> = items.collect();
@@ -401,6 +845,15 @@ fn join_or_none<'a>(items: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
+/// 树内一条软链：相对路径 + `read_link` 原文（不 resolve）。
+struct SymlinkEntry {
+    /// 相对 root 的路径（`/` 分隔，与 hash_tree 同一编码）。
+    rel: String,
+    /// `read_link` 原文（目标是否存在与 read_link 无关）；读不到（竞态 /
+    /// 权限）为 `None`。
+    target_raw: Option<PathBuf>,
+}
+
 /// 一份副本的现场测量结果。
 struct CopyMeasure {
     tree_hash: String,
@@ -408,9 +861,23 @@ struct CopyMeasure {
     bytes: u64,
     /// 剪掉那部分的体积。
     install_bytes: u64,
+    /// 递归遍历到的常规文件数（`gstack/` 那种嵌了真文件的子目录也算）。
+    /// 为 0 且 [`Self::symlinks`] 非空时，这份 copy 是「只含软链」的转发
+    /// 副本，整份判 Linked/Broken、不参与 identical/drifted 比较。
+    regular_count: u64,
+    /// 树内软链条目（相对路径 + 原文）。夹着常规文件时是噪音，不改变状态，
+    /// 解析成败留给 [`list`] 在真正需要时再查。
+    symlinks: Vec<SymlinkEntry>,
 }
 
-/// 现场测量一份副本：树哈希 + 体积拆分。
+/// 现场测量一份副本：树哈希 + 体积拆分 + 软链条目。调用方保证 `root` 不是
+/// 软链（根软链副本在 [`list`] 里单独处理，不走进这里——它们没有自己的内容
+/// 可量）。三个事实在同一次 [`walk_files`] 里收齐，不为软链判定再走第二遍。
+///
+/// **不 follow 软链读目标内容**：这是磁盘工具，软链本身几乎不占盘；跟随会
+/// 把 gstack 的字节在 benchmark 和 gstack 两处重复计数。所以「只含软链」
+/// 的副本在 [`list`] 里走状态规则 2（Linked/Broken），根本不进哈希比较——
+/// 它们的内容住在别处，拿空文件表哈希判 identical 是最严重的谎。
 fn measure_copy(root: &Path, prune: &[String]) -> Result<CopyMeasure> {
     let opts = WalkOptions {
         follow_links: false,
@@ -425,23 +892,50 @@ fn measure_copy(root: &Path, prune: &[String]) -> Result<CopyMeasure> {
         .with_context(|| format!("failed to stat skill directory: {}", root.display()))?;
 
     let mut bytes = 0u64;
-    walk_files(root, &opts, |_p, meta| {
-        if !meta.is_file() {
-            return; // 与 hash_tree 一致：只认常规文件。
+    let mut regular_count = 0u64;
+    let mut symlinks: Vec<SymlinkEntry> = Vec::new();
+    walk_files(root, &opts, |p, meta| {
+        if meta.is_file() {
+            regular_count += 1;
+            bytes += meta.len();
+            return;
         }
-        bytes += meta.len();
+        if meta.file_type().is_symlink() {
+            // 只记链接本身（相对路径 + read_link 原文），不跟随、不读目标
+            // 内容（见函数注释：重复计数）；解析成败由 list 按需再查。
+            let rel = p
+                .strip_prefix(root)
+                .expect("walk 产出的路径必在 root 之下")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            symlinks.push(SymlinkEntry {
+                rel,
+                target_raw: std::fs::read_link(p).ok(),
+            });
+        }
     })
     .with_context(|| format!("failed to walk skill directory: {}", root.display()))?;
 
-    let tree_hash = hash_tree(root, prune)
-        .with_context(|| format!("failed to hash skill directory: {}", root.display()))?
-        .to_hex()
-        .to_string();
+    // 没有常规文件的目录（只含软链，或全空）不哈希：文件表为空时哈希是
+    // 个与内容无关的常量，正是假 identical 的病根，这类 copy 的树哈希
+    // 一律置空（[`list`] 里也只对常规副本用 tree_hash 比较）。
+    let tree_hash = if regular_count == 0 {
+        String::new()
+    } else {
+        hash_tree(root, prune)
+            .with_context(|| format!("failed to hash skill directory: {}", root.display()))?
+            .to_hex()
+            .to_string()
+    };
 
     Ok(CopyMeasure {
         tree_hash,
         bytes,
         install_bytes: stats.pruned_bytes,
+        regular_count,
+        symlinks,
     })
 }
 
@@ -458,6 +952,13 @@ fn build_diff(
     prune: &[String],
     warnings: &mut Vec<String>,
 ) -> Result<String> {
+    // 软链副本没有可比内容，先滤掉：不滤的话它们的空 tree_hash 会和任何
+    // 普通副本不同，被拖进 diff_trees 对一条软链路径做树遍历，产出整屏
+    // "only in …" 垃圾。
+    let copies: Vec<&SkillCopy> = copies
+        .iter()
+        .filter(|c| !matches!(c.state, DupState::Linked | DupState::Broken))
+        .collect();
     let opts = DiffOptions {
         line_level: false,
         prune_dirs: prune.to_vec(),
@@ -715,6 +1216,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();
@@ -738,7 +1240,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (db, _, _) = two_copies(home.path(), "same body", "same body");
 
-        let groups = copies(Some(&db)).unwrap();
+        let groups = list(Some(&db)).unwrap();
         assert_eq!(groups.len(), 1, "{groups:#?}");
         assert_eq!(groups[0].name, "foo");
         assert_eq!(groups[0].state, DupState::Identical);
@@ -763,7 +1265,7 @@ mod tests {
         )
         .unwrap();
 
-        let groups = copies(Some(&db)).unwrap();
+        let groups = list(Some(&db)).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].state, DupState::Identical, "{:#?}", groups[0]);
         // 剪掉的那部分要单独报出来，且两侧确实各有内容（证明真走到了）。
@@ -782,7 +1284,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (db, _, _) = two_copies(home.path(), "left body", "right body");
 
-        let groups = copies(Some(&db)).unwrap();
+        let groups = list(Some(&db)).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].state, DupState::Drifted);
         let diff = groups[0].diff.as_deref().unwrap();
@@ -793,16 +1295,47 @@ mod tests {
         );
     }
 
+    /// 只有一份的 skill 也要列出来：本机实测 34 个名字里 21 个只有一份，滤掉
+    /// 它们，`skill list` 剩下 13 行，名不副实。状态是 `Single` 而不是
+    /// `Identical`——没有可比对象，也就永远没有 diff。
     #[test]
-    fn 只有一份的_skill_不出现在结果里() {
+    fn 只有一份的_skill_照样列出且判定为_single() {
         let home = tempfile::tempdir().unwrap();
         let db = home.path().join(".agent-duster").join("index.db");
         let a = home.path().join(".claude").join("skills").join("solo");
         make_skill(&a, "solo", "body");
         seed_skill_row(&db, "claude-code", "solo", &a);
 
-        let groups = copies(Some(&db)).unwrap();
-        assert!(groups.is_empty(), "{groups:#?}");
+        let groups = list(Some(&db)).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:#?}");
+        assert_eq!(groups[0].name, "solo");
+        assert_eq!(groups[0].state, DupState::Single);
+        assert!(groups[0].diff.is_none(), "没有可比对象就不该有 diff");
+        assert_eq!(groups[0].copies.len(), 1);
+        // 体积照量、哈希照填：单份组走的是同一条 measure_copy，没有快路径。
+        assert!(groups[0].copies[0].bytes > 0);
+        assert!(!groups[0].copies[0].tree_hash.is_empty());
+    }
+
+    /// 单份组与多份组同表返回，且**按名字混排**——单份的不排到末尾另成一区。
+    /// 用户是来找名字的，按名字排才扫得动；「哪几个重复」由状态列回答。
+    #[test]
+    fn 单份组与多份组按名字混排() {
+        let home = tempfile::tempdir().unwrap();
+        // foo 两份；aaa 一份，名字排在 foo 前面。
+        let (db, _, _) = two_copies(home.path(), "same body", "same body");
+        let solo = home.path().join(".claude").join("skills").join("aaa");
+        make_skill(&solo, "aaa", "body");
+        seed_skill_row(&db, "claude-code", "aaa", &solo);
+
+        let groups = list(Some(&db)).unwrap();
+        let seen: Vec<(&str, DupState)> =
+            groups.iter().map(|g| (g.name.as_str(), g.state)).collect();
+        assert_eq!(
+            seen,
+            vec![("aaa", DupState::Single), ("foo", DupState::Identical)],
+            "{groups:#?}"
+        );
     }
 
     #[test]
@@ -811,11 +1344,262 @@ mod tests {
         let (db, _, b) = two_copies(home.path(), "same body", "same body");
         std::fs::remove_dir_all(&b).unwrap();
 
-        let groups = copies(Some(&db)).unwrap();
+        let groups = list(Some(&db)).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].copies.len(), 1);
+        // 索引说两份、磁盘只剩一份：状态按现场算，否则就是拿这一份和自己比。
+        assert_eq!(groups[0].state, DupState::Single);
         assert_eq!(groups[0].warnings.len(), 1, "{:#?}", groups[0]);
         assert!(groups[0].warnings[0].contains("codex"));
+    }
+
+    /// 软链副本的判定：根路径是软链时不 follow、不量体积、不参与哈希比较。
+    /// resolve 得了 → linked（记下指向哪），悬空 → broken。0 字节软链
+    /// 绝不能因为树哈希相同就并进 identical——本机 bark-notify 四条悬空链
+    /// 与 benchmark/browse/careful 六条有效链正是这个 bug 的现场。
+    #[test]
+    fn 软链判linked悬空判broken普通副本照旧() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+
+        // 有效目标：别的 skill 的实体目录（gstack 场景）。
+        let real_target = home.path().join("gstack-real");
+        make_skill(&real_target, "gstack", "gstack body");
+
+        // 同名组 foo：两份普通副本（同内容）+ 一条有效软链 + 一条悬空软链。
+        let a = home.path().join(".claude").join("skills").join("foo");
+        make_skill(&a, "foo", "foo body");
+        let b = home.path().join(".codex").join("skills").join("foo");
+        make_skill(&b, "foo", "foo body");
+
+        let linked = home.path().join(".omp").join("skills").join("foo");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_target, &linked).unwrap();
+
+        let dangling = home.path().join(".qoder").join("skills").join("foo");
+        std::fs::create_dir_all(dangling.parent().unwrap()).unwrap();
+        let deleted = home.path().join("deleted-target");
+        std::os::unix::fs::symlink(&deleted, &dangling).unwrap();
+
+        seed_skill_row(&db, "claude-code", "foo", &a);
+        seed_skill_row(&db, "codex", "foo", &b);
+        seed_skill_row(&db, "omp", "foo", &linked);
+        seed_skill_row(&db, "qoder", "foo", &dangling);
+
+        let groups = list(Some(&db)).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:#?}");
+        let g = &groups[0];
+
+        // 三态各归各：普通副本照旧 identical，软链各按能否解析归位，
+        // 0 字节软链绝不判 identical。
+        let by_agent = |agent: &str| g.copies.iter().find(|c| c.agent_id == agent).unwrap();
+        assert_eq!(by_agent("claude-code").state, DupState::Identical, "{g:#?}");
+        assert_eq!(by_agent("codex").state, DupState::Identical, "{g:#?}");
+        assert_eq!(by_agent("omp").state, DupState::Linked, "{g:#?}");
+        assert_eq!(by_agent("qoder").state, DupState::Broken, "{g:#?}");
+
+        // linked 记下指向哪（canonicalize 后的绝对路径）。
+        assert_eq!(
+            by_agent("omp").link_target.as_deref(),
+            Some(real_target.canonicalize().unwrap().as_path()),
+            "linked 要带目标: {g:#?}"
+        );
+        // broken 记 read_link 原文——目标已消失，这就是最后一份记录。
+        assert_eq!(
+            by_agent("qoder").link_target.as_deref(),
+            Some(deleted.as_path()),
+            "broken 要带链接原文: {g:#?}"
+        );
+        // 普通副本没有 link_target。
+        assert_eq!(by_agent("claude-code").link_target, None);
+
+        // 软链副本不量体积、不填哈希：它们没有自己的内容。
+        assert_eq!(by_agent("omp").bytes, 0);
+        assert!(by_agent("omp").tree_hash.is_empty());
+        assert_eq!(by_agent("qoder").bytes, 0);
+
+        // 悬空链压过组级状态：先修坏账再谈比较，也就没有 diff。
+        assert_eq!(g.state, DupState::Broken, "{g:#?}");
+        assert!(g.diff.is_none(), "组级是 broken，不该有 diff: {:#?}", g.diff);
+
+        // 序列化名小写（--json 的契约）。
+        assert_eq!(serde_json::to_value(DupState::Linked).unwrap(), "linked");
+        assert_eq!(serde_json::to_value(DupState::Broken).unwrap(), "broken");
+    }
+
+    /// 全软链组（benchmark/browse/careful 这类指向 gstack 的）判 linked 而
+    /// 不是 identical：旧逻辑不 follow 读出 0 字节、树哈希全相同，整组被
+    /// 误判成 identical，链接建议全部放到了本来就不存在的"实体"上。
+    #[test]
+    fn 全软链组判linked而不是identical() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+
+        let target = home.path().join("gstack-real");
+        make_skill(&target, "gstack", "body");
+
+        let a = home.path().join(".claude").join("skills").join("benchmark");
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &a).unwrap();
+        let b = home.path().join(".codex").join("skills").join("benchmark");
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &b).unwrap();
+
+        seed_skill_row(&db, "claude-code", "benchmark", &a);
+        seed_skill_row(&db, "codex", "benchmark", &b);
+
+        let groups = list(Some(&db)).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:#?}");
+        let g = &groups[0];
+        assert_eq!(g.state, DupState::Linked, "{g:#?}");
+        for c in &g.copies {
+            assert_eq!(c.state, DupState::Linked, "{c:#?}");
+            assert!(c.link_target.is_some(), "linked 必带目标: {c:#?}");
+        }
+        assert!(g.diff.is_none());
+    }
+
+    /// 嵌套软链（SKILL.md 是目录**里**的软链，而不是目录本身）：只含软链的
+    /// 目录，内容住在别处，整份判 Linked/Broken，绝不进哈希比较。
+    /// connect-chrome / open-gstack-browser 就是现场——两个目录各只有一条
+    /// 指向**不同**目标的 SKILL.md 软链，旧逻辑读出空文件表哈希、互相判成
+    /// identical。
+    #[test]
+    fn 只含软链的目录按目标能否解析判linked_broken() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+
+        // 两个不同的有效目标（gstack 场景：各 skill 软链指向自己的实体）。
+        let target_a = home.path().join("gstack-a");
+        make_skill(&target_a, "gstack", "gstack a body");
+        let target_b = home.path().join("gstack-b");
+        make_skill(&target_b, "gstack", "gstack b body");
+        std::fs::write(target_b.join("notes.md"), "extra").unwrap();
+
+        // 副本目录里只有软链，没有常规文件。
+        let a = home.path().join(".claude").join("skills").join("browser");
+        std::fs::create_dir_all(&a).unwrap();
+        std::os::unix::fs::symlink(target_a.join("SKILL.md"), a.join("SKILL.md")).unwrap();
+
+        // 两条软链指向不同目标；`0-first.md` 按相对路径排第一，link_target
+        // 必须记它——证明「取第一条」真是按排序取，不是碰巧拿 SKILL.md。
+        let b = home.path().join(".codex").join("skills").join("browser");
+        std::fs::create_dir_all(&b).unwrap();
+        std::os::unix::fs::symlink(target_b.join("notes.md"), b.join("0-first.md")).unwrap();
+        std::os::unix::fs::symlink(target_b.join("SKILL.md"), b.join("SKILL.md")).unwrap();
+
+        seed_skill_row(&db, "claude-code", "browser", &a);
+        seed_skill_row(&db, "codex", "browser", &b);
+
+        let groups = list(Some(&db)).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:#?}");
+        let g = &groups[0];
+
+        // 两份都 Linked（目标各自可解析），组绝不是 identical——指向不同目标
+        // 的两份说"完全相同"是最严重的谎。
+        let by_agent = |agent: &str| g.copies.iter().find(|c| c.agent_id == agent).unwrap();
+        assert_eq!(by_agent("claude-code").state, DupState::Linked, "{g:#?}");
+        assert_eq!(by_agent("codex").state, DupState::Linked, "{g:#?}");
+        assert_ne!(g.state, DupState::Identical, "{g:#?}");
+        assert_eq!(g.state, DupState::Linked, "{g:#?}");
+        assert!(g.diff.is_none());
+
+        // 不量内容、不填哈希：0 字节的软链类 copy 绝不判 identical。
+        assert_eq!(by_agent("claude-code").bytes, 0);
+        assert!(by_agent("claude-code").tree_hash.is_empty());
+        assert_eq!(by_agent("codex").bytes, 0);
+        assert!(by_agent("codex").tree_hash.is_empty());
+
+        // link_target：Linked 记第一条（按相对路径排序）解析后的目标。
+        assert_eq!(
+            by_agent("claude-code").link_target.as_deref(),
+            Some(target_a.join("SKILL.md").canonicalize().unwrap().as_path()),
+            "{g:#?}"
+        );
+        assert_eq!(
+            by_agent("codex").link_target.as_deref(),
+            Some(target_b.join("notes.md").canonicalize().unwrap().as_path()),
+            "取的是排序后第一条: {g:#?}"
+        );
+    }
+
+    /// 只含软链的目录里**任一**悬空 → 整份 Broken（不只是"唯一那条"悬空才报）。
+    #[test]
+    fn 只含软链的目录有悬空链即broken() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+
+        let target = home.path().join("real");
+        make_skill(&target, "real", "body");
+
+        let dir = home.path().join(".claude").join("skills").join("gone");
+        std::fs::create_dir_all(&dir).unwrap();
+        let deleted = home.path().join("deleted-target").join("SKILL.md");
+        // 排序第一的是悬空链 → 状态 Broken，link_target 记它的 read_link 原文。
+        std::os::unix::fs::symlink(&deleted, dir.join("0-dangling.md")).unwrap();
+        std::os::unix::fs::symlink(target.join("SKILL.md"), dir.join("SKILL.md")).unwrap();
+
+        seed_skill_row(&db, "claude-code", "gone", &dir);
+
+        let groups = list(Some(&db)).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:#?}");
+        let g = &groups[0];
+        assert_eq!(g.state, DupState::Broken, "{g:#?}");
+        assert_eq!(g.copies[0].state, DupState::Broken, "{g:#?}");
+        assert!(g.copies[0].tree_hash.is_empty());
+        assert_eq!(
+            g.copies[0].link_target.as_deref(),
+            Some(deleted.as_path()),
+            "broken 记 read_link 原文: {g:#?}"
+        );
+        assert!(g.diff.is_none(), "broken 组不该有 diff: {g:#?}");
+    }
+
+    /// 夹着常规文件的零星软链是噪音：不改变 Identical/Drifted 判定。
+    #[test]
+    fn 常规文件里的零星软链不改状态() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+
+        // 每份常规副本里塞一条悬空软链——resolve 都不该被问起，状态照旧。
+        let mk = |agent: &str, name: &str, body: &str| {
+            let dir = home.path().join(agent).join("skills").join(name);
+            make_skill(&dir, name, body);
+            // 真目录里嵌真文件（gstack 形态）也要正常计为"有常规文件"。
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("sub").join("inner.txt"), "x").unwrap();
+            std::os::unix::fs::symlink(
+                home.path().join("elsewhere").join("x.txt"),
+                dir.join("stray-link"),
+            )
+            .unwrap();
+            seed_skill_row(&db, agent, name, &dir);
+        };
+        mk(".claude", "foo", "same body");
+        mk(".codex", "foo", "same body");
+
+        let groups = list(Some(&db)).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:#?}");
+        let g = &groups[0];
+        assert_eq!(g.state, DupState::Identical, "{g:#?}");
+        assert_eq!(g.copies.len(), 2);
+        for c in &g.copies {
+            assert_eq!(c.state, DupState::Identical, "{c:#?}");
+            // 常规文件照常量体积、照常哈希；软链字节不计入（不跟随）。
+            assert!(c.bytes > 0, "常规文件字节要照量: {c:#?}");
+            assert!(!c.tree_hash.is_empty(), "{c:#?}");
+        }
+
+        // 内容不同时照旧 drifted，软链同样不改状态。
+        mk(".omp", "bar", "left");
+        mk(".qoder", "bar", "right");
+        let groups = list(Some(&db)).unwrap();
+        let bar = groups.iter().find(|g| g.name == "bar").unwrap();
+        assert_eq!(bar.state, DupState::Drifted, "{bar:#?}");
+        assert!(bar.diff.is_some());
+        for c in &bar.copies {
+            assert_eq!(c.state, DupState::Drifted, "{c:#?}");
+        }
     }
 
     #[test]
@@ -989,5 +1773,232 @@ mod tests {
         std::fs::write(cas_dir.join("SKILL.md"), "tampered").unwrap();
         let err = ingest_cas(&src, &cas_dir, &prune, &hex, &mut warnings).unwrap_err();
         assert!(err.to_string().contains("corrupted"), "{err:#}");
+    }
+
+    // -----------------------------------------------------------------------
+    // rm
+    // -----------------------------------------------------------------------
+
+    fn rm_opts(db: &Path, home: &Path, archive: bool, dry_run: bool) -> DeleteOptions {
+        DeleteOptions {
+            index_path: Some(db.to_path_buf()),
+            home: Some(home.to_path_buf()),
+            archive,
+            dry_run,
+        }
+    }
+
+    /// 悬空软链：只 unlink 链接本身，不归档（没内容可归，归一个断链是
+    /// 假安全感），索引行照清。
+    #[test]
+    fn rm_悬空软链只unlink_且不归档() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+        let dangling = home.path().join(".qoder").join("skills").join("gone");
+        std::fs::create_dir_all(dangling.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(home.path().join("deleted-target"), &dangling).unwrap();
+        seed_skill_row(&db, "qoder", "gone", &dangling);
+
+        let report = remove(&rm_opts(&db, home.path(), true, false), "gone", None, None).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling).is_err(),
+            "悬空链接应被 unlink"
+        );
+        assert_eq!(report.removed, vec![dangling.clone()], "{:?}", report.removed);
+        assert!(report.archived.is_none(), "断链没有内容,不许归档");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // 索引无幽灵行。
+        assert!(list(Some(&db)).unwrap().is_empty(), "删完不该再列出来");
+    }
+
+    /// 有效软链：只 unlink 链接本身，**目标必须原封不动**——目标可能是
+    /// 另一家 agent 正在用的那一份，也可能是 `skill link` 建的共享本体。
+    #[test]
+    fn rm_有效软链删后目标仍在() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+        let target = home.path().join("real-skill");
+        make_skill(&target, "foo", "precious body");
+        let link = home.path().join(".claude").join("skills").join("foo");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        seed_skill_row(&db, "claude-code", "foo", &link);
+
+        let report = remove(&rm_opts(&db, home.path(), true, false), "foo", None, None).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err(), "链接应被 unlink");
+        assert!(report.archived.is_none(), "链接没有自己的内容,不许归档");
+        // 目标仍在、内容原封不动。
+        assert!(target.is_dir(), "目标目录必须还在");
+        assert!(
+            std::fs::read_to_string(target.join("SKILL.md"))
+                .unwrap()
+                .contains("precious body"),
+            "目标内容必须原封不动"
+        );
+        assert!(list(Some(&db)).unwrap().is_empty());
+    }
+
+    /// 真实目录：归档整目录后删除；归档里是完整的内容树。
+    #[test]
+    fn rm_真实目录归档后删除() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+        let dir = home.path().join(".claude").join("skills").join("foo");
+        make_skill(&dir, "foo", "body");
+        std::fs::write(dir.join("notes.md"), "extra notes").unwrap();
+        seed_skill_row(&db, "claude-code", "foo", &dir);
+
+        let report = remove(&rm_opts(&db, home.path(), true, false), "foo", None, None).unwrap();
+        assert!(!dir.exists(), "目录应被整棵删除");
+        assert!(report.removed.contains(&dir), "{:?}", report.removed);
+        assert!(report.freed_bytes > 0);
+        let archive = report.archived.expect("真实内容必须归档");
+
+        let dest = home.path().join("restore");
+        duster_fs::archive::extract_to(&archive, &dest).unwrap();
+        assert!(dest.join(".claude/skills/foo/SKILL.md").is_file());
+        assert!(dest.join(".claude/skills/foo/notes.md").is_file());
+        assert!(list(Some(&db)).unwrap().is_empty());
+    }
+
+    /// 同名装在多家、没指名：报错列出候选，一份都不许删。
+    #[test]
+    fn rm_多家未指名报错列出候选_一份不删() {
+        let home = tempfile::tempdir().unwrap();
+        let (db, a, b) = two_copies(home.path(), "left body", "right body");
+
+        let err = remove(&rm_opts(&db, home.path(), true, false), "foo", None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--agent"), "缺 --agent 必须明说: {msg}");
+        assert!(msg.contains("claude-code") && msg.contains("codex"), "列出候选: {msg}");
+        assert!(a.is_dir() && b.is_dir(), "报错不许删任何一份");
+    }
+
+    /// 指名 agent：只删那一家，另一家分毫不动。
+    #[test]
+    fn rm_指名agent只删那一家() {
+        let home = tempfile::tempdir().unwrap();
+        let (db, a, b) = two_copies(home.path(), "left body", "right body");
+
+        let report =
+            remove(&rm_opts(&db, home.path(), true, false), "foo", Some("claude-code"), None).unwrap();
+        assert!(!a.exists(), "被点名的那份要删");
+        assert!(b.is_dir(), "没点名的那份分毫不动");
+        assert!(report.removed.contains(&a));
+        // 索引里只剩 codex 那行。
+        let groups = list(Some(&db)).unwrap();
+        assert_eq!(groups[0].copies.len(), 1, "{groups:#?}");
+        assert_eq!(groups[0].copies[0].agent_id, "codex");
+    }
+
+    /// 指名了没装过的 agent：报错列出候选。
+    #[test]
+    fn rm_指名未装的agent报错() {
+        let home = tempfile::tempdir().unwrap();
+        let (db, a, _) = two_copies(home.path(), "left body", "right body");
+        let err = remove(&rm_opts(&db, home.path(), true, false), "foo", Some("qoder"), None).unwrap_err();
+        assert!(err.to_string().contains("qoder"), "{err:#}");
+        assert!(a.is_dir());
+    }
+    /// 同一 agent 名下同名多份（目录不同）：`--agent` 收窄之后仍剩多份，
+    /// 必须再要 `path`，缺了报错列路径、一份不删。
+    ///
+    /// 这是真机形状：`open-gstack-browser` 在 claude-code 下就有
+    /// `connect-chrome` 与 `open-gstack-browser` 两个目录，内容可以完全不同。
+    /// 「指名一家」不等于「同意删掉那家的每一份」。
+    #[test]
+    fn rm_同一家多份必须再指名路径() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+        let one = home.path().join(".claude").join("skills").join("dir-a");
+        let two = home.path().join(".claude").join("skills").join("dir-b");
+        make_skill(&one, "foo", "body a");
+        make_skill(&two, "foo", "body b");
+        // 真机形状：同一 agent 同名两份靠 `name@目录名` 降级键共存
+        // （见 `scan::scan_skills` 的去重），`skill_groups` 再按最后一个
+        // `@` 切回同一组。直接用裸 name 播两行会撞 UNIQUE 被覆盖成一行。
+        seed_skill_row(&db, "claude-code", "foo@dir-a", &one);
+        seed_skill_row(&db, "claude-code", "foo@dir-b", &two);
+
+        // 缺 path：报错，两份都还在。
+        let err = remove(
+            &rm_opts(&db, home.path(), true, false),
+            "foo",
+            Some("claude-code"),
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--path"), "必须明说要 --path: {msg}");
+        assert!(one.is_dir() && two.is_dir(), "一份都不许删");
+
+        // 指名 path：只删那一份。
+        let report = remove(
+            &rm_opts(&db, home.path(), true, false),
+            "foo",
+            Some("claude-code"),
+            Some(&one.display().to_string()),
+        )
+        .unwrap();
+        assert!(!one.exists(), "被点名的那份要删");
+        assert!(two.is_dir(), "没点名的那份分毫不动");
+        assert_eq!(report.removed, vec![one]);
+    }
+
+    /// 未指名 agent 时的错误要报「几**家**」而不是「几**份**」：同一家两份
+    /// 时拿副本数当家数会印出自相矛盾的 `2 agents (claude-code, claude-code)`。
+    #[test]
+    fn rm_未指名时按家数报错不重复列同一家() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+        let one = home.path().join(".claude").join("skills").join("dir-a");
+        let two = home.path().join(".claude").join("skills").join("dir-b");
+        make_skill(&one, "foo", "a");
+        make_skill(&two, "foo", "b");
+        seed_skill_row(&db, "claude-code", "foo@dir-a", &one);
+        seed_skill_row(&db, "claude-code", "foo@dir-b", &two);
+
+        // 只有一家 → 不该报「多家」，而是走到 path 那一关。
+        let err = remove(&rm_opts(&db, home.path(), true, false), "foo", None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--path"), "只有一家时该问 path: {msg}");
+        assert!(!msg.contains("claude-code, claude-code"), "同一家不许列两次: {msg}");
+    }
+
+    /// 干跑：不归档、不删、不动索引；但要报出**将**归档到哪个目录——
+    /// `archived` 在干跑里读作「将归档到哪」（与 `removed` 读作「将删」
+    /// 同一个约定），给目录而不是编造一个带秒级时间戳的包名。
+    #[test]
+    fn rm_干跑不动盘() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+        let dir = home.path().join(".claude").join("skills").join("foo");
+        make_skill(&dir, "foo", "body");
+        seed_skill_row(&db, "claude-code", "foo", &dir);
+
+        let report = remove(&rm_opts(&db, home.path(), true, true), "foo", None, None).unwrap();
+        assert!(dir.is_dir(), "预览不许删");
+        assert_eq!(
+            report.archived.as_deref(),
+            Some(home.path().join("agent-duster-exports").as_path()),
+            "预览要报将归档到哪个目录"
+        );
+        assert!(!home.path().join("agent-duster-exports").exists(), "预览不许写导出目录");
+        assert!(report.removed.contains(&dir), "预览要报将删什么");
+        assert!(list(Some(&db)).unwrap().len() == 1, "索引行不许动");
+    }
+
+    /// `--no-archive`：显式接受内容消失，直接删。
+    #[test]
+    fn rm_不归档直接删() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".agent-duster").join("index.db");
+        let dir = home.path().join(".claude").join("skills").join("foo");
+        make_skill(&dir, "foo", "body");
+        seed_skill_row(&db, "claude-code", "foo", &dir);
+
+        let report = remove(&rm_opts(&db, home.path(), false, false), "foo", None, None).unwrap();
+        assert!(!dir.exists());
+        assert!(report.archived.is_none());
     }
 }

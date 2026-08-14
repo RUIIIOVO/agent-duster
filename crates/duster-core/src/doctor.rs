@@ -1,22 +1,36 @@
-//! `duster doctor`：一份**只读**的健康报告。
+//! 一份**只读**的健康报告：[`self_check`] 查 duster 自己。
 //!
-//! 六项检查，每项独立跑、独立失败：`secrets`（明文凭据）·
-//! `skill-metadata`（SKILL.md 元数据）· `config-syntax`（配置能不能解析）·
-//! `dangling-reference`（索引行与符号链接是否悬空）· `sqlite-integrity`
-//! （库是否完好）· `mcp-reachability`（声明还能不能启动）。
+//! `duster doctor` 与 `brew doctor` / `flutter doctor` 同义：报告的对象是
+//! 这个工具本身（索引库、适配器清单、home 与导出目录、版本），不是它管着
+//! 的那一堆 agent 数据。查**你的 agent 有什么毛病**的那一类检查（明文凭据、
+//! 断链、坏配置、MCP 起不起得来）已随上一轮改造整体撤下——`duster status`
+//! 不再捎带它们，退出码也只留 0/失败。
 //!
-//! # 两条框架层的规矩
+//! 唯一的例外是 [`check_sqlite`]：**agent 的 SQLite 库读不读得动**留在自检里。
+//! 归属理由是它查的是**环境事实**，不查无从得知——opencode 的会话在
+//! `opencode.db` 里、omp 的在 `history.db` 里、codex 的记忆在
+//! `memories_1.sqlite` 里，库一坏，`session show` / `memory list` 当场全瞎，
+//! 而 duster 不可能知道它坏了，除非真的打开看一眼。这与检查 adapters / index
+//! 同属「这台机器现在什么样」，所以归自检，不归任何 `status` 旗标——
+//! `status` 已经没有旗标了。
 //!
-//! 1. **单项失败绝不中断整轮**。一项检查报错就变成一条
-//!    [`Severity::Error`] 的 [`Finding`] 外加一条 warning，其余照跑——
-//!    体检报告死在第一个问题上就不是报告了。
-//! 2. **[`DoctorReport::checks_run`] 只记真的跑过的**。跑了没发现是信息，
-//!    没跑却装作跑过是撒谎：被开关关掉的（`--secrets` / `--ping`）与
-//!    前置条件缺失的（索引还没建）都不进这个列表，改进 warnings 说明原因。
+//! [`self_check`] **绝不建库、绝不写任何东西**——「这台机器上还没有索引」
+//! 正是它要报告的现状之一，顺手建一个就把结论抹掉了；何况一份会改变现状的
+//! 自检报告，用户下次就不敢跑它了。
 //!
-//! # `--secrets`：明文凭据扫描
+//! # 一条框架层的规矩
 //!
-//! ## 三条不可协商的约束
+//! **单项失败绝不中断整轮**。一项检查报错就变成一条 [`Severity::Error`] 的
+//! [`Finding`] 外加一条 warning，其余照跑——体检报告死在第一个问题上就不是
+//! 报告了。[`DoctorReport::checks_run`] 只记真的跑过的：跑了没发现是信息，
+//! 没跑却装作跑过是撒谎。
+//!
+//! # secrets：明文凭据扫描
+//!
+//! [`scan_secrets`] 不再属于任何体检命令——上一轮把它连同整个他检一起撤了。
+//! 它现在还活着，是因为 `duster uninstall` 的预检要靠它：删掉的文件里如果
+//! 躺着明文凭据，光删文件不撤销 token 等于没卸干净，预检先扫一遍、把命中
+//! 报出来让用户去 platform 撤销。三条不可协商的约束不变：
 //!
 //! 1. **掩码输出**。命中的值一律只显示前 4 后 4，中间打码。
 //!    一个扫描凭据的工具把凭据原样打进终端，等于自己变成了泄露源
@@ -26,28 +40,19 @@
 //! 3. **只报告，不修改**。撤销 token 必须去 platform 做，duster 报出
 //!    "在哪、是什么、建议去哪撤销"就到此为止。
 //!
-//! ## 判据
-//!
-//! 已知位置（[`known_secret_paths`]）优先——那是实测出来的确定命中点；
+//! 判据：已知位置（[`known_secret_paths`]）优先——那是实测出来的确定命中点；
 //! 熵检测作为补充，用于捞出未知位置里的高熵串，宁可多报几条让用户自己看。
-//!
-//! 文本扫描有一个天生的盲区：**opencode 把 token 存在 SQLite 列里**
-//! （`account.access_token` / `control_account.refresh_token` /
-//! `credential.value`，本机实测 2026-08-11 确有其表）。逐行扫文本永远看不见
-//! 它们，所以 [`doctor`] 额外只读打开那个库、按列取值、掩码后报出。
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use duster_adapter::codec;
 use duster_adapter::manifest;
 use duster_fs::walk::{WalkOptions, walk_files};
 use duster_index::db::Index;
-use duster_index::query::{self, ResourceFilter, ResourceRecord};
-use duster_index::{foreign, maintenance};
+use duster_index::{foreign, maintenance, schema};
 
 /// 一条发现的严重程度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -55,7 +60,7 @@ use duster_index::{foreign, maintenance};
 pub enum Severity {
     /// 值得知道，但不用做什么。
     Info,
-    /// 该看一眼：明文凭据、缺元数据的 skill、悬空的索引行。
+    /// 该看一眼。
     Warn,
     /// 坏了：配置解析不了、库损坏、某项检查自己跑挂了。
     Error,
@@ -67,188 +72,28 @@ pub struct Finding {
     /// 产出它的检查名，与 [`DoctorReport::checks_run`] 里的字符串一致。
     pub check: String,
     pub severity: Severity,
-    /// 出问题的东西：文件路径、`<库>#<表>.<列>:<行>`、或 server 名。
+    /// 出问题的东西：文件路径、库路径、或目录。
     pub subject: String,
-    /// 人话描述。**凭据一律已掩码**，任何时候都不含原文。
+    /// 人话描述。
     pub detail: String,
-    /// 可照做的修法（如 `duster scan`）；没有明确修法为 None。
+    /// 可照做的修法；没有明确修法为 None。
     pub fix: Option<String>,
 }
 
-/// 一轮体检的结果。整体直接进 `--json` 信封的 `data`。
+/// 一轮自检的累加器。整体直接进 `--json` 信封的 `data`（自检报告在
+/// [`SelfReport`] 里再包一层版本/索引位置）。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
     pub findings: Vec<Finding>,
     /// **真的跑过**的检查名，按执行顺序。
     ///
     /// 跑了没发现的检查也在这里——那是信息（"这一项我查过了"）。
-    /// 被开关关掉或前置条件缺失而没跑的**不在**这里，原因进
+    /// 前置条件缺失而没跑的**不在**这里，原因进
     /// [`DoctorReport::warnings`]。
     pub checks_run: Vec<String>,
     pub warnings: Vec<String>,
 }
 
-/// 体检的输入。
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct DoctorOptions {
-    /// 索引库路径；缺省 `<home>/.agent-duster/index.db`。
-    pub index_path: Option<PathBuf>,
-    /// 假 home 注入口（测试用）；缺省真实用户主目录。
-    pub home: Option<PathBuf>,
-    /// 只查这几个 agent；空 Vec = 全部。
-    pub agents: Vec<String>,
-    /// 是否跑明文凭据扫描。**默认关**：它要读遍 agent 的配置文件，
-    /// 用户得先说要。
-    pub secrets: bool,
-    /// 是否 ping MCP。**默认关**：凭一份配置文件就去 spawn 别人机器上的
-    /// 进程，是不该在没被要求时做的事——`doctor` 的其余五项一个字节都不写、
-    /// 一个进程都不起，这一项破的正是那条性质。
-    pub ping: bool,
-    /// 只跑这几项（取值域 [`ALL_CHECKS`]）；空 = 全跑，即默认行为。
-    ///
-    /// 这是**真的不跑**，不是跑完再筛结果：`sqlite-integrity` 在本机要对
-    /// 822 MB 的库做全库校验，用户明说了不要还照跑，等于这个参数没有。
-    pub checks: Vec<String>,
-}
-
-/// 检查名。集中一处，`checks_run` 与每条 [`Finding::check`] 共用同一份字面量。
-const CHECK_SECRETS: &str = "secrets";
-const CHECK_SKILL_METADATA: &str = "skill-metadata";
-const CHECK_CONFIG_SYNTAX: &str = "config-syntax";
-const CHECK_DANGLING: &str = "dangling-reference";
-const CHECK_SQLITE: &str = "sqlite-integrity";
-const CHECK_MCP: &str = "mcp-reachability";
-
-/// 全部检查名，**按 [`doctor`] 的执行顺序**。
-///
-/// 同时是 [`DoctorOptions::checks`] 的取值域与 CLI `--check` 的候选表：
-/// 名字写在这里一处，命令行的补全、报错清单与报告里的分组顺序就不会走散。
-pub const ALL_CHECKS: [&str; 6] = [
-    CHECK_SECRETS,
-    CHECK_SKILL_METADATA,
-    CHECK_CONFIG_SYNTAX,
-    CHECK_DANGLING,
-    CHECK_SQLITE,
-    CHECK_MCP,
-];
-
-/// opencode 的库（本机实测 2026-08-11）。token 存在库内列里，文本扫描看不见。
-const OPENCODE_DB: &str = ".local/share/opencode/opencode.db";
-
-/// 库内 token 列（表名, 列名）。表或列缺席一律跳过——上游改 schema 是常态。
-const OPENCODE_TOKEN_COLS: [(&str, &str); 4] = [
-    ("account", "access_token"),
-    ("account", "refresh_token"),
-    ("control_account", "access_token"),
-    ("control_account", "refresh_token"),
-];
-
-/// 凭据表。本机实测列为 `id` / `label` / `value`。
-const CREDENTIAL_TABLE: &str = "credential";
-
-/// 跑一轮体检。
-///
-/// **全程只读**：不写任何文件、不改索引、不碰 agent 的数据；唯一的例外是
-/// `--ping` 会 spawn 子进程，所以它默认关着。
-///
-/// 任何一项检查失败都只变成一条 [`Severity::Error`] 的 [`Finding`] 加一条
-/// warning，其余照跑。返回 `Err` 只剩两种情况：连 home 都定不下来，
-/// 或者 [`DoctorOptions::checks`] 里有不认识的名字——那时候什么都无从查起，
-/// 而后者若默默跑成一份空报告，用户会把「名字打错了」读成「一切正常」。
-pub fn doctor(opts: &DoctorOptions) -> Result<DoctorReport> {
-    if let Some(bad) = opts
-        .checks
-        .iter()
-        .find(|c| !ALL_CHECKS.contains(&c.as_str()))
-    {
-        bail!(
-            "unknown check: {bad}. Valid checks are: {}",
-            ALL_CHECKS.join(", ")
-        );
-    }
-    let home = resolve_home(opts.home.as_deref())?;
-    let index_path = match &opts.index_path {
-        Some(p) => p.clone(),
-        None => home.join(".agent-duster").join("index.db"),
-    };
-    let mut rep = DoctorReport::default();
-
-    if opts.secrets && selected(opts, CHECK_SECRETS) {
-        run_check(&mut rep, CHECK_SECRETS, |f, w| check_secrets(&home, f, w));
-    }
-
-    // 三项要读索引。库还没建时它们**没跑**，于是不进 checks_run，
-    // 原因写进 warnings——把"没查过"混进"查过没发现"里是这份报告最贵的谎。
-    //
-    // 一项都没选中就连索引都不开：那条 warning 说的是"这几项被跳过了"，
-    // 而用户压根没要它们，报出来是无中生有。
-    let wanted: Vec<&str> = [CHECK_SKILL_METADATA, CHECK_DANGLING, CHECK_SQLITE]
-        .into_iter()
-        .filter(|c| selected(opts, c))
-        .collect();
-    let rows: Option<Vec<ResourceRecord>> = if wanted.is_empty() {
-        None
-    } else if index_path.is_file() {
-        match load_rows(&index_path, &opts.agents) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                rep.warnings.push(format!(
-                    "{}: {e:#}; skipped {}",
-                    index_path.display(),
-                    wanted.join(", ")
-                ));
-                None
-            }
-        }
-    } else {
-        rep.warnings.push(format!(
-            "index database not found: {}; skipped {}. Run `duster scan` first.",
-            index_path.display(),
-            wanted.join(", ")
-        ));
-        None
-    };
-
-    if let Some(rows) = &rows
-        && selected(opts, CHECK_SKILL_METADATA)
-    {
-        run_check(&mut rep, CHECK_SKILL_METADATA, |f, _| {
-            check_skill_metadata(rows, f)
-        });
-    }
-
-    if selected(opts, CHECK_CONFIG_SYNTAX) {
-        run_check(&mut rep, CHECK_CONFIG_SYNTAX, |f, _| {
-            check_config_syntax(&home, &opts.agents, f)
-        });
-    }
-
-    if let Some(rows) = &rows {
-        if selected(opts, CHECK_DANGLING) {
-            run_check(&mut rep, CHECK_DANGLING, |f, w| {
-                check_dangling(rows, &home, &opts.agents, f, w)
-            });
-        }
-        if selected(opts, CHECK_SQLITE) {
-            run_check(&mut rep, CHECK_SQLITE, |f, _| {
-                check_sqlite_integrity(rows, &index_path, opts.agents.is_empty(), f)
-            });
-        }
-    }
-
-    if opts.ping && selected(opts, CHECK_MCP) {
-        run_check(&mut rep, CHECK_MCP, |f, w| {
-            check_mcp(&index_path, &opts.agents, f, w)
-        });
-    }
-
-    Ok(rep)
-}
-
-/// 这一项在不在 `--check` 的选择里。空 = 全选，即默认行为。
-fn selected(opts: &DoctorOptions, name: &str) -> bool {
-    opts.checks.is_empty() || opts.checks.iter().any(|c| c == name)
-}
 
 /// 跑一项检查并统一降级：报错变成一条 Error finding + 一条 warning。
 ///
@@ -294,433 +139,33 @@ fn finding(
     }
 }
 
-/// 只读取出索引里的资源行（按 agent 过滤）。
-fn load_rows(index_path: &Path, agents: &[String]) -> Result<Vec<ResourceRecord>> {
-    let idx = Index::open_readonly(index_path)
-        .with_context(|| format!("failed to open index read-only: {}", index_path.display()))?;
-    query::list_resources(
-        idx.conn(),
-        &ResourceFilter {
-            agents: agents.to_vec(),
-            kinds: Vec::new(),
-            clean_levels: Vec::new(),
-        },
-    )
-}
-
-/// 检查 1：明文凭据。文本扫描 + opencode 的库内列。
-fn check_secrets(
-    home: &Path,
-    findings: &mut Vec<Finding>,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    let report = scan_secrets(Some(home), &[])?;
-    warnings.extend(report.warnings.iter().cloned());
-    for h in &report.hits {
-        findings.push(finding(
-            CHECK_SECRETS,
-            Severity::Warn,
-            format!("{}:{}", h.path, h.line),
-            format!(
-                "{} {} = {}",
-                h.kind,
-                if h.key.is_empty() {
-                    "(inline value)"
-                } else {
-                    h.key.as_str()
-                },
-                h.masked
-            ),
-            Some(h.advice.as_str()),
-        ));
-    }
-    check_opencode_db_secrets(home, findings, warnings)
-}
-
-/// 采集结论 5 的盲区：opencode 把 token 存进 SQLite 列，逐行扫文本看不见。
+/// 把路径包成可直接粘贴执行的 shell 参数。
 ///
-/// 只读打开、只取值、**只报掩码**。取到的原文除了喂给 [`mask`] 之外
-/// 不进任何变量之外的地方：不打印、不入索引、不写文件。
-fn check_opencode_db_secrets(
-    home: &Path,
-    findings: &mut Vec<Finding>,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    let db = home.join(OPENCODE_DB);
-    if !db.is_file() {
-        return Ok(());
-    }
-    let Some(conn) = foreign::open(&db)? else {
-        // 读不到就明说。悄悄跳过等于给用户一份看不见这块盲区的报告。
-        warnings.push(format!(
-            "{}: not readable; credentials stored in its columns were not checked",
-            db.display()
-        ));
-        return Ok(());
-    };
-    let shown = db.display().to_string();
-
-    // 闭包持有 conn 的共享借用与 findings 的可变借用；本函数其余部分
-    // 只做表/列探测（同样是共享借用），不再直接碰 findings。
-    let mut emit = |table: &str, id_expr: &str, label_expr: &str, col: &str| -> Result<()> {
-        // 表名与列名全部来自本文件的字面量或 foreign::columns 的校验结果，
-        // 不含外部输入，拼进 SQL 是安全的。
-        let sql = format!(
-            "SELECT {id_expr}, {label_expr}, {col} FROM {table} \
-             WHERE {col} IS NOT NULL AND {col} <> ''"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let id: String = r.get::<_, Option<String>>(0)?.unwrap_or_default();
-            let label: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
-            let value: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
-            if value.is_empty() {
-                continue;
-            }
-            let named = if label.is_empty() {
-                String::new()
-            } else {
-                format!(" ({label})")
-            };
-            findings.push(finding(
-                CHECK_SECRETS,
-                Severity::Warn,
-                format!("{shown}#{table}.{col}:{id}"),
-                format!(
-                    "plaintext credential in a SQLite column{named} = {}",
-                    mask(&value)
-                ),
-                Some("revoke it with the provider, then sign in again from opencode"),
-            ));
-        }
-        Ok(())
-    };
-
-    for (table, col) in OPENCODE_TOKEN_COLS {
-        if !foreign::has_table(&conn, table)? {
-            continue;
-        }
-        let cols = foreign::columns(&conn, table)?;
-        if !cols.iter().any(|c| c == col) {
-            continue;
-        }
-        emit(table, &id_expr(&cols), label_expr(&cols), col)?;
-    }
-
-    if foreign::has_table(&conn, CREDENTIAL_TABLE)? {
-        let cols = foreign::columns(&conn, CREDENTIAL_TABLE)?;
-        // `value` 是实测的列名；上游改名了就按名字形状找回来，
-        // 免得一次重命名就让整张凭据表从报告里消失。
-        let value_cols: Vec<&str> = if cols.iter().any(|c| c == "value") {
-            vec!["value"]
-        } else {
-            cols.iter()
-                .filter(|c| looks_secret_column(c))
-                .map(String::as_str)
-                .collect()
-        };
-        let id = id_expr(&cols);
-        let label = label_expr(&cols);
-        for col in value_cols {
-            emit(CREDENTIAL_TABLE, &id, label, col)?;
-        }
-    }
-    Ok(())
-}
-
-/// 行标识列：有 `id` 用它，否则退回 `rowid`。一律 CAST 成 TEXT——
-/// `id` 可能是整数也可能是字符串，取值端只想要一个能显示的东西。
-fn id_expr(cols: &[String]) -> String {
-    if cols.iter().any(|c| c == "id") {
-        "CAST(id AS TEXT)".to_string()
+/// 路径必须是绝对的：用户很可能贴在别的 cwd 下执行，相对路径会作用到别处去；
+/// 含空白或 shell 元字符的用单引号包一层，保证整条命令原样粘贴就能跑。
+fn shell_arg(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let needs_quotes = s
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | '$' | '`'));
+    if needs_quotes {
+        format!("'{}'", s.replace('\'', "'\\''"))
     } else {
-        "CAST(rowid AS TEXT)".to_string()
+        s.into_owned()
     }
 }
 
-/// 人可读的标签列；没有就给个空串占位（`emit` 的第二列必须存在）。
-fn label_expr(cols: &[String]) -> &'static str {
-    if cols.iter().any(|c| c == "label") {
-        "label"
-    } else {
-        "''"
-    }
-}
-
-/// 列名看着像不像装凭据的。只在 `value` 缺席时兜底用。
-fn looks_secret_column(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    ["token", "secret", "password", "credential", "apikey"]
-        .iter()
-        .any(|k| n.contains(k))
-        || n == "key"
-}
-
-/// 检查 2：skill 目录的 `SKILL.md` 缺失、读不动、或没有 frontmatter `name`。
+/// 断链的修法：一条可直接粘贴执行的 `rm <绝对路径>`。
 ///
-/// 没有 `name` 不是致命错（`duster_adapter::mapper::skill` 会退回目录名），
-/// 但那意味着这个 skill 在跨 agent 视图里的身份是目录名——改个目录名它就
-/// 变成另一个 skill，copies 与 link 都会跟着走偏。
-fn check_skill_metadata(rows: &[ResourceRecord], findings: &mut Vec<Finding>) -> Result<()> {
-    for r in rows.iter().filter(|r| r.kind == "skill") {
-        let root = Path::new(&r.path);
-        // 整个目录都不在了是 dangling-reference 的活，这里不重复报。
-        if !root.exists() {
-            continue;
-        }
-        let md = if root.is_dir() {
-            root.join("SKILL.md")
-        } else {
-            root.to_path_buf()
-        };
-        let subject = md.display().to_string();
-        match std::fs::read_to_string(&md) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => findings.push(finding(
-                CHECK_SKILL_METADATA,
-                Severity::Warn,
-                subject,
-                "SKILL.md is missing".to_string(),
-                Some("add a SKILL.md with a `name:` field in its YAML frontmatter"),
-            )),
-            Err(e) => findings.push(finding(
-                CHECK_SKILL_METADATA,
-                Severity::Warn,
-                subject,
-                format!("SKILL.md is unreadable: {e}"),
-                Some("fix the file permissions"),
-            )),
-            Ok(text) => {
-                let named = crate::memory::frontmatter(&text)
-                    .and_then(|fm| crate::memory::yaml_scalar(fm, "name"))
-                    .is_some();
-                if !named {
-                    findings.push(finding(
-                        CHECK_SKILL_METADATA,
-                        Severity::Warn,
-                        subject,
-                        "SKILL.md has no `name` in its YAML frontmatter; the directory name is \
-                         used instead"
-                            .to_string(),
-                        Some("add a `name:` field to the YAML frontmatter"),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
+/// duster 自己永不代删——医生开药方，不动手术。
+fn rm_fix(p: &Path) -> String {
+    format!("rm {}", shell_arg(p))
 }
 
-/// 检查 3：清单声明的 JSON/TOML 资源里，有哪些解析不了。
-///
-/// JSONC 现在能正常读（注释、尾逗号、BOM 都不再是问题），所以命中这一项
-/// 的必然是**真的语法错**，而不是 duster 认不出的方言。
-fn check_config_syntax(home: &Path, agents: &[String], findings: &mut Vec<Finding>) -> Result<()> {
-    let manifests = manifest::load_all(Some(&home.join(".agent-duster").join("adapters")))?;
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    for m in &manifests {
-        if !agents.is_empty() && !agents.contains(&m.agent.id) {
-            continue;
-        }
-        for r in &m.resources {
-            let p = expand(&r.path, home);
-            if !is_structured_config(&p) || !p.is_file() || !seen.insert(p.clone()) {
-                continue;
-            }
-            if let Err(e) = codec::read_file(&p) {
-                findings.push(finding(
-                    CHECK_CONFIG_SYNTAX,
-                    Severity::Error,
-                    p.display().to_string(),
-                    format!("{e:#}"),
-                    Some(
-                        "fix the syntax error; duster refuses to read or rewrite a file it \
-                         cannot parse",
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 扩展名是不是 duster 会当结构化配置去解析的那几种。
-fn is_structured_config(p: &Path) -> bool {
-    p.extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .is_some_and(|e| matches!(e.as_str(), "json" | "jsonc" | "toml"))
-}
-
-/// 检查 4：悬空引用。两路来源，索引行与磁盘上的断链。
-///
-/// 遍历 agent 根是这六项里最贵的一步（`~/.claude` 可以有十万个会话文件），
-/// 但断链只可能在磁盘上，索引里根本没有它们的行——不走一遍就看不见。
-/// 跳过 `node_modules` / `.git` / `dist` 把最坏情况压下来。
-fn check_dangling(
-    rows: &[ResourceRecord],
-    home: &Path,
-    agents: &[String],
-    findings: &mut Vec<Finding>,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    let mut reported: BTreeSet<String> = BTreeSet::new();
-
-    for r in rows {
-        let p = Path::new(&r.path);
-        let detail = match std::fs::symlink_metadata(p) {
-            Err(_) => format!("indexed {} no longer exists on disk", r.kind),
-            Ok(m) if m.file_type().is_symlink() && std::fs::metadata(p).is_err() => {
-                format!("indexed {} is a symlink that resolves nowhere", r.kind)
-            }
-            Ok(_) => continue,
-        };
-        if reported.insert(r.path.clone()) {
-            findings.push(finding(
-                CHECK_DANGLING,
-                Severity::Warn,
-                r.path.clone(),
-                detail,
-                Some("duster scan"),
-            ));
-        }
-    }
-
-    let manifests = manifest::load_all(Some(&home.join(".agent-duster").join("adapters")))?;
-    let mut roots: BTreeSet<PathBuf> = BTreeSet::new();
-    for m in &manifests {
-        if !agents.is_empty() && !agents.contains(&m.agent.id) {
-            continue;
-        }
-        for raw in m.probe.any_of.iter().chain(m.probe.all_of.iter()) {
-            let p = expand(raw, home);
-            if p.is_dir() {
-                roots.insert(p);
-            }
-        }
-    }
-
-    let opts = WalkOptions {
-        follow_links: false,
-        prune_dirs: PRUNE_DIRS.iter().map(|s| (*s).to_string()).collect(),
-    };
-    for root in &roots {
-        // 先收集再逐个 stat：walk_files 的回调跑在并行 worker 上。
-        let mut links: Vec<PathBuf> = Vec::new();
-        if let Err(e) = walk_files(root, &opts, |p, m| {
-            if m.file_type().is_symlink() {
-                links.push(p.to_path_buf());
-            }
-        }) {
-            warnings.push(format!("{}: {e}", root.display()));
-            continue;
-        }
-        for l in links {
-            let shown = l.display().to_string();
-            if std::fs::metadata(&l).is_err() && reported.insert(shown.clone()) {
-                findings.push(finding(
-                    CHECK_DANGLING,
-                    Severity::Warn,
-                    shown,
-                    "symlink resolves nowhere".to_string(),
-                    Some("duster scan"),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 检查 5：每个已索引的 SQLite 资源过一遍 `PRAGMA integrity_check`，
-/// 外加 duster 自己的索引库。
-///
-/// 单个库检查失败（打不开、报出问题）只变成一条 Error finding，
-/// 下一个库照查——一块坏盘不该让其余十个库的结论一起丢掉。
-///
-/// 代价要认：`integrity_check` 是全库校验，本机的 `~/.codex/logs_2.sqlite`
-/// 有 822 MB，这一项会真的花掉几秒。这是 doctor 的定位换来的——
-/// 它是"体检"不是"看一眼"。
-fn check_sqlite_integrity(
-    rows: &[ResourceRecord],
-    index_path: &Path,
-    include_own: bool,
-    findings: &mut Vec<Finding>,
-) -> Result<()> {
-    let mut targets: BTreeSet<PathBuf> = rows
-        .iter()
-        .map(|r| PathBuf::from(&r.path))
-        .filter(|p| foreign::is_sqlite(p))
-        .collect();
-    // 按 agent 过滤时不查 duster 自己的库——那不属于任何一个 agent。
-    if include_own && index_path.is_file() {
-        targets.insert(index_path.to_path_buf());
-    }
-    for t in &targets {
-        let own = t == index_path;
-        let fix = if own {
-            Some("delete the index and run `duster scan`; it is a disposable derivative")
-        } else {
-            Some("restore the file from a backup, or repair it with `sqlite3 .recover`")
-        };
-        match maintenance::integrity_ok(t) {
-            Ok(true) => {}
-            Ok(false) => findings.push(finding(
-                CHECK_SQLITE,
-                Severity::Error,
-                t.display().to_string(),
-                "PRAGMA integrity_check reported problems".to_string(),
-                fix,
-            )),
-            Err(e) => findings.push(finding(
-                CHECK_SQLITE,
-                Severity::Error,
-                t.display().to_string(),
-                format!("integrity check could not run: {e:#}"),
-                fix,
-            )),
-        }
-    }
-    Ok(())
-}
-
-/// 检查 6：MCP 可达性。**只在 `--ping` 时跑**。
-///
-/// 每个合并后的 server 只 ping 一次：合并的前提就是规格逐字节相同，
-/// 按声明处各 spawn 一遍纯属重复烧进程。归属算给第一处匹配的声明。
-fn check_mcp(
-    index_path: &Path,
-    agents: &[String],
-    findings: &mut Vec<Finding>,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    let list = crate::mcp::list(Some(index_path))?;
-    warnings.extend(list.warnings.iter().cloned());
-    for s in &list.servers {
-        let Some(d) = s
-            .declared_in
-            .iter()
-            .find(|d| agents.is_empty() || agents.contains(&d.agent_id))
-        else {
-            continue;
-        };
-        let r = crate::mcp::ping(
-            &s.spec,
-            &d.agent_id,
-            &crate::mcp::PingOptions {
-                enabled: true,
-                ..Default::default()
-            },
-        );
-        if !r.ok {
-            findings.push(finding(
-                CHECK_MCP,
-                Severity::Warn,
-                format!("{} ({})", s.name, d.agent_id),
-                r.error.unwrap_or_else(|| "handshake failed".to_string()),
-                Some("check the command and its PATH, or remove the declaration"),
-            ));
-        }
-    }
-    Ok(())
+/// 目录写不进去的修法。同样只给命令、不代改权限位：改别人 home 底下的
+/// 权限是能把人锁在门外的操作，得由他自己按那一下回车。
+fn chmod_fix(p: &Path) -> String {
+    format!("chmod u+w {}", shell_arg(p))
 }
 
 /// 把清单里的 `~`/`~/...` 相对给定 home 展开；其余形式原样返回。
@@ -734,6 +179,402 @@ fn expand(raw: &str, home: &Path) -> PathBuf {
         Some(rest) => home.join(rest),
         None => PathBuf::from(raw),
     }
+}
+
+// ─────────────────── 自检：duster 自己 ───────────────────
+
+/// 自检的检查名。他检那六个已经整体撤下（见模块文档），只剩这一张表；
+/// 名字写在这里一处，`checks_run` 与每条 [`Finding::check`] 共用同一份字面量，
+/// 报告里的分组顺序也不会走散。
+const CHECK_INDEX_DB: &str = "index-db";
+const CHECK_ADAPTERS: &str = "adapters";
+const CHECK_HOME: &str = "home";
+const CHECK_SQLITE: &str = "sqlite";
+const CHECK_VERSION: &str = "version";
+
+/// 自检的全部检查名，**按 [`self_check`] 的执行顺序**。
+pub const SELF_CHECKS: [&str; 5] = [
+    CHECK_INDEX_DB,
+    CHECK_ADAPTERS,
+    CHECK_HOME,
+    CHECK_SQLITE,
+    CHECK_VERSION,
+];
+
+/// 一轮自检的结果。整体直接进 `--json` 信封的 `data`。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SelfReport {
+    pub findings: Vec<Finding>,
+    /// **真的跑过**的检查名，按执行顺序；口径同 [`DoctorReport::checks_run`]。
+    pub checks_run: Vec<String>,
+    pub warnings: Vec<String>,
+    /// duster 自己的版本。
+    pub version: String,
+    /// 索引库该在的位置——**不管它在不在**。报告要能回答「我该去哪找它」。
+    pub index_path: String,
+    /// 索引库字节数；`None` = 库还不存在，那不是错误（见 [`self_check`]）。
+    pub index_bytes: Option<u64>,
+}
+
+/// 跑一轮**自检**：duster 自己装好没有。
+///
+/// 这才是 `duster doctor` 该做的事，与 `brew doctor` / `flutter doctor` 同义：
+/// 报告的对象是这个工具本身（索引库、适配器清单、home 与导出目录、版本、
+/// 以及 agent 的 SQLite 库读不读得动——见 [`check_sqlite`] 的归属理由）。
+///
+/// **绝不建库、绝不写任何东西。**「这台机器上还没有索引」正是自检要报告的
+/// 现状之一，顺手建一个就把结论抹掉了；何况一份会改变现状的自检报告，
+/// 用户下次就不敢跑它了。
+///
+/// `index_path` 同时指明了「这是谁的机器」：库按约定住在
+/// `<home>/.agent-duster/index.db`，反推出的 home 决定 `adapters` 与 `home`
+/// 两项查哪里，口径与 [`crate::freshness::ensure_fresh`] 一致。形状对不上
+/// （测试夹具、从别的机器拷回来的库）才回落到真实主目录。
+pub fn self_check(index_path: Option<&Path>) -> Result<SelfReport> {
+    let path = match index_path {
+        Some(p) => p.to_path_buf(),
+        None => duster_fs::path::expand_tilde("~/.agent-duster/index.db"),
+    };
+    let home = match crate::freshness::home_of_index(&path) {
+        Some(h) => h,
+        None => resolve_home(None)?,
+    };
+
+    // 借 DoctorReport 当累加器：自检与撤掉前的他检共用同一条框架规矩
+    // （单项失败降级成一条 Error finding、其余照跑），没必要再写一遍 run_check。
+    let mut acc = DoctorReport::default();
+    let mut bytes: Option<u64> = None;
+    run_check(&mut acc, CHECK_INDEX_DB, |f, _| {
+        check_index_db(&path, &mut bytes, f)
+    });
+    run_check(&mut acc, CHECK_ADAPTERS, |f, _| check_adapters(&home, f));
+    run_check(&mut acc, CHECK_HOME, |f, _| check_home(&home, f));
+    run_check(&mut acc, CHECK_SQLITE, |f, _| check_sqlite(&home, f));
+    run_check(&mut acc, CHECK_VERSION, |f, _| check_version(f));
+
+    Ok(SelfReport {
+        findings: acc.findings,
+        checks_run: acc.checks_run,
+        warnings: acc.warnings,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        index_path: path.display().to_string(),
+        index_bytes: bytes,
+    })
+}
+
+/// 自检 1：索引库。在不在、多大、schema 是不是这一代、内容坏没坏。
+///
+/// **库不存在不是错误，是一条 info。**[`crate::freshness::ensure_fresh`]
+/// 会在任何一条命令里顺手把它建出来，用户根本不需要知道「索引」这个词；
+/// 报成 error 等于给一件已经自动化掉的事发工单。
+///
+/// 不去探 `.lock` 到底有没有被人占着：探法只有一种——自己去抢一次
+/// `BEGIN EXCLUSIVE`——而写锁的 `busy_timeout` 是 0，隔壁正在跑的
+/// `duster scan` 会当场撞锁失败。一条只读的诊断命令不该有本事弄挂一条
+/// 正在干活的命令，所以这里只看那个文件在不在。
+fn check_index_db(path: &Path, bytes: &mut Option<u64>, findings: &mut Vec<Finding>) -> Result<()> {
+    if !path.is_file() {
+        findings.push(finding(
+            CHECK_INDEX_DB,
+            Severity::Info,
+            path.display().to_string(),
+            "nothing has been indexed yet; any duster command builds the index automatically"
+                .to_string(),
+            None,
+        ));
+        // 有锁旁路却没有库：上一次首建卡在抢锁那一步。它不占任何东西、
+        // 下次照样能建，但它是那次失败留下的唯一痕迹，值得说一句。
+        let lock = lock_sidecar(path);
+        if lock.is_file() {
+            let fix = rm_fix(&lock);
+            findings.push(finding(
+                CHECK_INDEX_DB,
+                Severity::Info,
+                lock.display().to_string(),
+                "stray write-lock sidecar with no index database; a previous first build \
+                 failed before creating it"
+                    .to_string(),
+                Some(fix.as_str()),
+            ));
+        }
+        return Ok(());
+    }
+
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat index database: {}", path.display()))?;
+    *bytes = Some(meta.len());
+
+    // 自己的库坏了不用去翻备份：它是可丢弃的派生物，删掉重扫就回来了。
+    let own_fix = "delete the index and run `duster scan`; it is a disposable derivative";
+    match schema_version(path) {
+        Ok(v) if v < schema::SCHEMA_VERSION => findings.push(finding(
+            CHECK_INDEX_DB,
+            Severity::Warn,
+            path.display().to_string(),
+            format!(
+                "index schema is v{v}, this duster writes v{}",
+                schema::SCHEMA_VERSION
+            ),
+            Some("duster scan --full"),
+        )),
+        Ok(v) if v > schema::SCHEMA_VERSION => findings.push(finding(
+            CHECK_INDEX_DB,
+            Severity::Error,
+            path.display().to_string(),
+            format!(
+                "index schema is v{v}, newer than this duster understands (v{}) — \
+                 a newer duster wrote it",
+                schema::SCHEMA_VERSION
+            ),
+            Some("upgrade duster, or delete the index and let it rebuild"),
+        )),
+        Ok(_) => {}
+        Err(e) => findings.push(finding(
+            CHECK_INDEX_DB,
+            Severity::Error,
+            path.display().to_string(),
+            format!("cannot read the index schema version: {e:#}"),
+            Some(own_fix),
+        )),
+    }
+
+    match maintenance::integrity_ok(path) {
+        Ok(true) => {}
+        Ok(false) => findings.push(finding(
+            CHECK_INDEX_DB,
+            Severity::Error,
+            path.display().to_string(),
+            "PRAGMA integrity_check reported problems".to_string(),
+            Some(own_fix),
+        )),
+        Err(e) => findings.push(finding(
+            CHECK_INDEX_DB,
+            Severity::Error,
+            path.display().to_string(),
+            format!("integrity check could not run: {e:#}"),
+            Some(own_fix),
+        )),
+    }
+    Ok(())
+}
+
+/// 单实例写锁的旁路库：`<db>.lock`，口径见 `duster_index::db::Index::open`。
+fn lock_sidecar(index_path: &Path) -> PathBuf {
+    let mut p = index_path.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+/// 只读取出库上的 `PRAGMA user_version`，也就是 schema 的代数。
+fn schema_version(path: &Path) -> Result<i64> {
+    let idx = Index::open_readonly(path)?;
+    let v: i64 = idx
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(v)
+}
+
+/// 自检 2：适配器清单。内置的一份份、用户自己塞进
+/// `<home>/.agent-duster/adapters` 的一份份。
+///
+/// 逐个文件解析而不是直接 `manifest::load_all`：后者撞上第一份坏文件就整体
+/// 报错，用户手上有三份自定义清单时只会被告知其中一份的名字，修完再跑才
+/// 知道还有下一份。**用户手写的 toml 是这整份自检里唯一他能自己动手修的
+/// 东西**，一次把话说全才对得起这一项。
+fn check_adapters(home: &Path, findings: &mut Vec<Finding>) -> Result<()> {
+    let builtin = manifest::load_builtin().len();
+    let dir = home.join(".agent-duster").join("adapters");
+    let mut loaded = 0usize;
+    if dir.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .with_context(|| format!("failed to read adapter directory: {}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        // 排序只为让两次运行的报告能直接 diff：read_dir 的顺序由文件系统定。
+        files.sort();
+        for f in &files {
+            match manifest::load_user_file(f) {
+                Ok(_) => loaded += 1,
+                Err(e) => findings.push(finding(
+                    CHECK_ADAPTERS,
+                    Severity::Error,
+                    f.display().to_string(),
+                    format!("{e:#}"),
+                    Some("fix the manifest, or move it out of the adapters directory"),
+                )),
+            }
+        }
+    }
+    findings.push(finding(
+        CHECK_ADAPTERS,
+        Severity::Info,
+        dir.display().to_string(),
+        format!("{builtin} built-in adapters, {loaded} user manifests"),
+        None,
+    ));
+    Ok(())
+}
+
+/// 自检 3：home，以及 duster 迟早要往里写东西的那两个目录。
+///
+/// HOME 定不下来时 duster 的每一条命令都无从谈起（索引、清单、导出全挂在
+/// 它底下），所以这里报 error 而不是 warn。
+fn check_home(home: &Path, findings: &mut Vec<Finding>) -> Result<()> {
+    if !home.is_dir() {
+        findings.push(finding(
+            CHECK_HOME,
+            Severity::Error,
+            home.display().to_string(),
+            "home directory does not exist; duster keeps its index, adapter manifests \
+             and exports under it"
+                .to_string(),
+            Some("set HOME to an existing directory"),
+        ));
+        return Ok(());
+    }
+    check_writable(
+        &home.join(".agent-duster"),
+        "duster state directory",
+        findings,
+    );
+    check_writable(
+        &home.join("agent-duster-exports"),
+        "export directory",
+        findings,
+    );
+    Ok(())
+}
+
+/// 一个 duster 迟早要往里写东西的目录，现在写不写得进去。
+///
+/// 目录还不存在时改看父目录：真问题是「建得出来吗」而不是「在不在」——
+/// `~/agent-duster-exports` 本来就是第一次导出时才建，报它不存在纯是噪声。
+fn check_writable(dir: &Path, what: &str, findings: &mut Vec<Finding>) {
+    if dir.exists() && !dir.is_dir() {
+        let fix = rm_fix(dir);
+        findings.push(finding(
+            CHECK_HOME,
+            Severity::Error,
+            dir.display().to_string(),
+            format!("{what} is occupied by something that is not a directory"),
+            Some(fix.as_str()),
+        ));
+        return;
+    }
+    let (target, missing) = if dir.is_dir() {
+        (dir, false)
+    } else {
+        match dir.parent() {
+            Some(p) => (p, true),
+            None => return,
+        }
+    };
+    if writable(target) {
+        return;
+    }
+    let fix = chmod_fix(target);
+    findings.push(finding(
+        CHECK_HOME,
+        Severity::Error,
+        target.display().to_string(),
+        if missing {
+            format!("{what} does not exist yet and this directory is not writable")
+        } else {
+            format!("{what} is not writable")
+        },
+        Some(fix.as_str()),
+    ));
+}
+
+/// 当前用户写不写得进这个目录。
+///
+/// 只看属主写位。duster 碰的目录全在用户自己的 home 底下，真会发生的是
+/// `chmod 500 ~/.agent-duster`（或从备份里恢复出一份坏权限），属主那一位
+/// 就是决定权所在；为了「目录属于别人」这种在自己家里根本不成立的情形
+/// 去引一个 libc 依赖，不划算。
+fn writable(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir)
+        .map(|m| m.permissions().mode() & 0o200 != 0)
+        .unwrap_or(false)
+}
+
+/// 自检 4：agent 的 SQLite 库读不读得动。
+///
+/// 归属理由写在模块文档里：agent 库坏了是**环境事实**，不查无从得知——
+/// opencode 的会话在 `opencode.db` 里、omp 的在 `history.db` 里、codex 的
+/// 记忆在 `memories_1.sqlite` 里，库一坏 `session show` / `memory list`
+/// 当场全瞎，而 duster 只有打开看一眼才知道。这与 adapters / index 两项
+/// 同属「这台机器现在什么样」，所以留在自检里，不归 `status`——status
+/// 已经没有旗标了。
+///
+/// 枚举源用**清单**（adapters 目录）而不是索引：索引库可能还没建，而自检
+/// 绝不建库（见 [`self_check`]）；清单在任何一台装过 agent 的机器上都存在，
+/// 声明即事实。同一个库可能被多家声明（`cc-switch.db` 谁都在用），按路径
+/// 去重，但报错带上 agent id——用户得知道「谁的会话读不出来了」。
+///
+/// 判坏用 `PRAGMA quick_check`（`duster_index::maintenance::quick_check_ok`）：
+/// 它是完整性检查的快版，几个 GB 的库也扛得住；打不开（被独占、加密、
+/// 损坏到开不动）与 check 报了问题同样判坏——对「能不能读」这个结论而言，
+/// 两者没有区别。
+fn check_sqlite(home: &Path, findings: &mut Vec<Finding>) -> Result<()> {
+    let manifests = manifest::load_all(Some(&home.join(".agent-duster").join("adapters")))?;
+    let mut by_path: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    for m in &manifests {
+        for r in &m.resources {
+            let p = expand(&r.path, home);
+            if foreign::is_sqlite(&p) {
+                by_path.entry(p).or_default().push(m.agent.id.clone());
+            }
+        }
+    }
+    let fix = Some("restore the file from a backup, or repair it with `sqlite3 .recover`");
+    for (path, agents) in by_path {
+        // 声明了却还没落盘的库（agent 装了没跑过）不算坏——「不存在」
+        // 是别的检查（悬空引用那一套）的话题，这里只判"存在却读不动"。
+        if !path.is_file() {
+            continue;
+        }
+        let who = format!("agent {} ", agents.join(", "));
+        match maintenance::quick_check_ok(&path)? {
+            Some(true) => {}
+            Some(false) => findings.push(finding(
+                CHECK_SQLITE,
+                Severity::Error,
+                path.display().to_string(),
+                format!("database is corrupted ({who}sessions/memory will be unreadable)"),
+                fix,
+            )),
+            None => findings.push(finding(
+                CHECK_SQLITE,
+                Severity::Error,
+                path.display().to_string(),
+                format!(
+                    "database is corrupted or unreadable ({who}sessions/memory will be unreadable)"
+                ),
+                fix,
+            )),
+        }
+    }
+    Ok(())
+}
+
+/// 自检 5：版本。**恒有一条输出。**
+///
+/// 别的几项都可能一条不报——那正是健康的样子。可一份一条都没有的报告，
+/// 与「根本没查」长得一模一样，那是这类工具最容易骗人的地方（同一条道理
+/// 见模块文档的框架规矩）。这一项负责让自检永远至少落下一行事实：
+/// duster 是哪个版本、索引 schema 是第几代。
+fn check_version(findings: &mut Vec<Finding>) -> Result<()> {
+    findings.push(finding(
+        CHECK_VERSION,
+        Severity::Info,
+        format!("agent-duster {}", env!("CARGO_PKG_VERSION")),
+        format!("index schema v{}", schema::SCHEMA_VERSION),
+        None,
+    ));
+    Ok(())
 }
 
 /// 一处命中。
@@ -779,7 +620,7 @@ pub fn known_secret_paths(home: &Path) -> Vec<PathBuf> {
 }
 
 /// 单个文件的扫描上限 4 MB。凭据不会藏在 100 MB 的日志里，扫它只是在烧时间；
-/// 有上限还能保证 `doctor --secrets` 的耗时不被一个巨型文件拖爆。
+/// 有上限还能保证 secrets 扫描的耗时不被一个巨型文件拖爆。
 const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 二进制嗅探窗口：前 8 KiB 内出现 NUL 就判定为二进制。
@@ -1456,417 +1297,235 @@ mod tests {
     // ─────────────────── doctor 框架 ───────────────────
 
     use duster_index::db::Index;
-    use duster_index::upsert::{self, ResourceRow};
 
-    /// 往假 home 的索引里塞一条资源行，返回索引路径。
-    fn seed_index(home: &Path, kind: &str, key: &str, path: &Path) -> PathBuf {
-        let db = home.join(".agent-duster").join("index.db");
-        let idx = Index::open(&db).unwrap();
-        upsert::upsert_agent(
-            idx.conn(),
-            &duster_model::AgentInfo {
-                id: "fixture".to_string(),
-                display_name: "Fixture".to_string(),
-                root: home.join(".fixture"),
-                version: None,
-            },
-            0,
-        )
-        .unwrap();
-        upsert::upsert_resource(
-            idx.conn(),
-            &ResourceRow {
-                agent_id: "fixture".to_string(),
-                kind: kind.to_string(),
-                scope: "global".to_string(),
-                key: key.to_string(),
-                path: path.display().to_string(),
-                size: 0,
-                mtime_ns: 0,
-                hash_content: None,
-                cheap_print: None,
-                clean_level: None,
-                reclaimable: None,
-                install_bytes: None,
-            },
-        )
-        .unwrap();
-        // Index 持有单实例写锁，doctor 只读之前必须放手。
-        drop(idx);
-        db
-    }
-
-    fn opts(home: &Path) -> DoctorOptions {
-        DoctorOptions {
-            index_path: Some(home.join(".agent-duster").join("index.db")),
-            home: Some(home.to_path_buf()),
-            agents: Vec::new(),
-            secrets: false,
-            ping: false,
-            checks: Vec::new(),
-        }
-    }
-
-    /// `--check` 是真的不跑，不是跑完再筛：没选中的那几项连 checks_run
-    /// 都不进（"跑了没发现"与"没跑"必须分得开），也不产生它们的 warning。
+    /// 库不存在是 **info** 而不是 error：`freshness::ensure_fresh` 会在任何
+    /// 一条命令里顺手把它建出来，报成错等于给一件已经自动化掉的事发工单。
+    /// 顺带钉死自检的底线——它一个字节都不许写。
     #[test]
-    fn 只跑选中的检查() {
+    fn 自检_索引不存在时报_info_而不是_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        put(home, ".codex/config.toml", "this is = not = toml\n");
+        let index = tmp.path().join(".agent-duster").join("index.db");
 
-        let r = doctor(&DoctorOptions {
-            checks: vec![CHECK_CONFIG_SYNTAX.to_string()],
-            secrets: true,
-            ..opts(home)
-        })
-        .unwrap();
+        let r = self_check(Some(&index)).unwrap();
 
-        assert_eq!(r.checks_run, vec![CHECK_CONFIG_SYNTAX.to_string()]);
-        // 索引三项一个都没选中 -> 连"索引不存在"这条 warning 都不该出现：
-        // 用户压根没要它们，报"跳过了"是无中生有。
+        assert_eq!(r.index_bytes, None, "库不在就没有体积可报");
+        assert_eq!(r.index_path, index.display().to_string());
+        let f = r
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_INDEX_DB)
+            .expect("该有一条说明库还不在");
+        assert_eq!(f.severity, Severity::Info);
         assert!(
-            r.warnings.iter().all(|w| !w.contains("index database")),
+            r.findings.iter().all(|f| f.severity != Severity::Error),
             "{:?}",
-            r.warnings
+            r.findings
         );
+        assert!(!index.exists(), "自检绝不建库");
+        assert!(!index.parent().unwrap().exists(), "连目录都不许建");
     }
 
-    /// 名字打错必须报错并列出候选。默默跑成一份空报告，用户会把
-    /// 「我把名字拼错了」读成「一切正常」——那是这个参数最贵的失败模式。
+    /// 用户自己塞进 adapters 的坏 toml，是这份自检里唯一他能自己动手修的
+    /// 东西：每一份都要点名，还要说清错在哪。撞上第一份就整体报错的话，
+    /// 他得修一个跑一次、修一个跑一次。
     #[test]
-    fn 检查名写错时报错并列出全部候选() {
-        let tmp = tempfile::tempdir().unwrap();
-        let err = doctor(&DoctorOptions {
-            checks: vec!["sqlite_integrity".to_string()],
-            ..opts(tmp.path())
-        })
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("unknown check: sqlite_integrity"), "{msg}");
-        for c in ALL_CHECKS {
-            assert!(msg.contains(c), "{msg} 缺 {c}");
-        }
-    }
-
-    #[test]
-    fn 关掉的检查不进_checks_run() {
+    fn 自检_坏的适配器清单逐个点名并说清错在哪() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        // 埋一个真凭据，证明"没报"是因为没跑而不是因为没有。
+        // 一份语法就不对，一份语法对但缺 [probe] 段——两种坏法都要抓到。
         put(
             home,
-            ".codex/auth.json",
-            "{\"OPENAI_API_KEY\": \"sk-live-ABCDEFGHIJKL1234\"}\n",
+            ".agent-duster/adapters/a-syntax.toml",
+            "id = = \"no\"\n",
+        );
+        put(
+            home,
+            ".agent-duster/adapters/b-schema.toml",
+            "[agent]\nid = \"demo\"\ndisplay_name = \"Demo\"\n",
         );
 
-        let r = doctor(&opts(home)).unwrap();
+        let r = self_check(Some(&home.join(".agent-duster").join("index.db"))).unwrap();
 
-        assert!(!r.checks_run.contains(&CHECK_SECRETS.to_string()));
-        assert!(!r.checks_run.contains(&CHECK_MCP.to_string()));
-        assert!(r.findings.iter().all(|f| f.check != CHECK_SECRETS));
-        // 没被开关关掉的那一项照跑。
-        assert!(r.checks_run.contains(&CHECK_CONFIG_SYNTAX.to_string()));
-        // 索引不存在 -> 依赖它的三项**不进** checks_run，原因进 warnings。
-        assert!(!r.checks_run.contains(&CHECK_SQLITE.to_string()));
+        let bad: Vec<&Finding> = r
+            .findings
+            .iter()
+            .filter(|f| f.check == CHECK_ADAPTERS && f.severity == Severity::Error)
+            .collect();
+        assert_eq!(bad.len(), 2, "两份都要点名：{bad:?}");
         assert!(
-            r.warnings
-                .iter()
-                .any(|w| w.contains("index database not found"))
+            bad[0].subject.ends_with("a-syntax.toml"),
+            "{}",
+            bad[0].subject
         );
+        assert!(
+            bad[1].subject.ends_with("b-schema.toml"),
+            "{}",
+            bad[1].subject
+        );
+        // 只说一句"解析不了"等于没说；错在哪必须落进 detail。
+        assert!(bad[1].detail.contains("probe"), "{}", bad[1].detail);
+        assert!(bad.iter().all(|f| f.fix.is_some()));
     }
 
-    /// 文本里的与库内列里的都要报，且序列化结果里不许出现任何原文。
+    /// `<home>/.agent-duster` 不可写 → error，并给一条能直接粘贴的修法。
+    /// 索引、清单、快照全在这个目录底下，它写不进去就没有一条命令能收尾。
     #[test]
-    fn secrets_同时覆盖文本与_sqlite_列且只输出掩码() {
-        const FILE_TOKEN: &str = "sk-live-FILEabcdefghijkl9876";
-        const DB_TOKEN: &str = "oc_access_ZZZZmnopqrstuvwx4321";
+    fn 自检_state_目录不可写时报_error() {
+        use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        put(
-            home,
-            ".codex/auth.json",
-            &format!("{{\"OPENAI_API_KEY\": \"{FILE_TOKEN}\"}}\n"),
+        let state = tmp.path().join(".agent-duster");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let r = self_check(Some(&state.join("index.db"))).unwrap();
+
+        // 先复权：TempDir 的 Drop 删不掉一个不可写的目录，断言失败时也不能漏。
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let home_findings: Vec<&Finding> = r
+            .findings
+            .iter()
+            .filter(|f| f.check == CHECK_HOME)
+            .collect();
+        // 导出目录只是还不存在，不该跟着报——「建得出来吗」才是那一项的问题。
+        assert_eq!(home_findings.len(), 1, "{home_findings:?}");
+        let f = home_findings[0];
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(f.subject, state.display().to_string());
+        let fix = f.fix.as_deref().expect("要给修法");
+        assert!(fix.starts_with("chmod u+w "), "{fix}");
+        assert!(fix.contains(&state.display().to_string()), "{fix}");
+    }
+
+    /// version 这一项**恒有输出**。一份「什么都没发现」的自检报告与
+    /// 「根本没查」长得一模一样时就没有价值了；这一项负责让前者永远
+    /// 不可能发生。
+    #[test]
+    fn 自检_version_项恒有输出() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = self_check(Some(&tmp.path().join(".agent-duster/index.db"))).unwrap();
+
+        // 五项一项不少地跑过，顺序即 SELF_CHECKS。
+        let ran: Vec<String> = SELF_CHECKS.iter().map(|c| c.to_string()).collect();
+        assert_eq!(r.checks_run, ran);
+
+        let v = r
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_VERSION)
+            .expect("version 恒有一条");
+        assert_eq!(v.severity, Severity::Info);
+        assert!(
+            v.subject.contains(env!("CARGO_PKG_VERSION")),
+            "{}",
+            v.subject
         );
-        let db_path = home.join(OPENCODE_DB);
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        {
-            let c = rusqlite::Connection::open(&db_path).unwrap();
-            c.execute_batch(&format!(
-                "CREATE TABLE account(
-                     id TEXT PRIMARY KEY, email TEXT NOT NULL, url TEXT NOT NULL,
-                     access_token TEXT NOT NULL, refresh_token TEXT NOT NULL);
-                 INSERT INTO account VALUES
-                   ('acc1', 'a@b.c', 'https://x', '{DB_TOKEN}', '');"
-            ))
+        assert!(
+            v.detail.contains(&format!("v{}", schema::SCHEMA_VERSION)),
+            "{}",
+            v.detail
+        );
+        assert_eq!(r.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// 库在盘上、schema 是这一代：index-db 跑过却一条不报，体积照样进报告。
+    /// 「查过、没事」与「压根没查」在结构上就得分得开。
+    #[test]
+    fn 自检_健康的索引不报问题但记下体积() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join(".agent-duster").join("index.db");
+        drop(Index::open(&db).unwrap());
+
+        let r = self_check(Some(&db)).unwrap();
+
+        assert!(r.checks_run.contains(&CHECK_INDEX_DB.to_string()));
+        assert!(
+            r.findings.iter().all(|f| f.check != CHECK_INDEX_DB),
+            "{:?}",
+            r.findings
+        );
+        assert!(r.index_bytes.is_some_and(|b| b > 0), "{:?}", r.index_bytes);
+    }
+
+    /// 旧代 schema → warn 加一条能直接敲的重扫命令。不是 error：库还读得动，
+    /// 只是解析规则换过代，重扫一遍就对齐了。
+    #[test]
+    fn 自检_旧代_schema_报_warn_并给出重扫命令() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join(".agent-duster").join("index.db");
+        drop(Index::open(&db).unwrap());
+        // 把 user_version 倒回上一代：这正是「用旧 duster 建过的库」的样子。
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION - 1)
             .unwrap();
-        }
+        drop(conn);
 
-        let mut o = opts(home);
-        o.secrets = true;
-        let r = doctor(&o).unwrap();
+        let r = self_check(Some(&db)).unwrap();
 
-        assert!(r.checks_run.contains(&CHECK_SECRETS.to_string()));
-        let secret_findings: Vec<&Finding> = r
-            .findings
-            .iter()
-            .filter(|f| f.check == CHECK_SECRETS)
-            .collect();
-        assert!(
-            secret_findings
-                .iter()
-                .any(|f| f.subject.ends_with("auth.json:1")),
-            "{secret_findings:?}"
-        );
-        assert!(
-            secret_findings
-                .iter()
-                .any(|f| f.subject.contains("#account.access_token:acc1")),
-            "{secret_findings:?}"
-        );
-        // 空串的 refresh_token 不该被报——那不是凭据，是"还没登录"。
-        assert!(
-            !secret_findings
-                .iter()
-                .any(|f| f.subject.contains("refresh_token"))
-        );
-
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(!json.contains(FILE_TOKEN), "原文泄漏进了报告");
-        assert!(!json.contains(DB_TOKEN), "库内原文泄漏进了报告");
-        assert!(json.contains(&mask(DB_TOKEN)));
-    }
-
-    /// JSONC 现在能解析，所以命中 config-syntax 的必然是真语法错。
-    #[test]
-    fn config_syntax_只报真错不报带注释的_jsonc() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let broken = put(home, ".claude/settings.json", "{\"hooks\": }\n");
-        let jsonc = put(
-            home,
-            ".config/opencode/opencode.jsonc",
-            "{\n  // 带注释，还有尾逗号\n  \"mcp\": {},\n}\n",
-        );
-
-        let r = doctor(&opts(home)).unwrap();
-
-        assert!(r.checks_run.contains(&CHECK_CONFIG_SYNTAX.to_string()));
-        let subjects: Vec<&str> = r
-            .findings
-            .iter()
-            .filter(|f| f.check == CHECK_CONFIG_SYNTAX)
-            .map(|f| f.subject.as_str())
-            .collect();
-        assert!(
-            subjects.contains(&broken.display().to_string().as_str()),
-            "{subjects:?}"
-        );
-        assert!(
-            !subjects.contains(&jsonc.display().to_string().as_str()),
-            "{subjects:?}"
-        );
-        assert!(
-            r.findings
-                .iter()
-                .any(|f| f.check == CHECK_CONFIG_SYNTAX && f.severity == Severity::Error)
-        );
-    }
-
-    #[test]
-    fn dangling_reference_报出被删掉的索引行并建议重扫() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let gone = put(
-            home,
-            ".fixture/skills/thing/SKILL.md",
-            "---\nname: thing\n---\n",
-        );
-        let db = seed_index(home, "artifact", "thing", &gone);
-        std::fs::remove_file(&gone).unwrap();
-
-        let mut o = opts(home);
-        o.index_path = Some(db);
-        let r = doctor(&o).unwrap();
-
-        assert!(r.checks_run.contains(&CHECK_DANGLING.to_string()));
         let f = r
             .findings
             .iter()
-            .find(|f| f.check == CHECK_DANGLING)
-            .expect("应报出悬空索引行");
-        assert_eq!(f.subject, gone.display().to_string());
-        assert_eq!(f.fix.as_deref(), Some("duster scan"));
+            .find(|f| f.check == CHECK_INDEX_DB)
+            .expect("旧库该报一条");
         assert_eq!(f.severity, Severity::Warn);
+        assert_eq!(f.fix.as_deref(), Some("duster scan --full"));
     }
 
-    /// 断链在磁盘上、索引里没有它的行，只有走一遍 agent 根才看得见。
+    /// 清单声明的 sqlite 库被人为写坏（截断）时，自检要报 corrupted，
+    /// 并点名是哪个 agent 的会话/记忆会读不出来。
+    ///
+    /// 归属理由：agent 库坏了是**环境事实**，不查无从得知——库一坏，
+    /// `session show` / `memory list` 当场全瞎，而 duster 只有打开看一眼
+    /// 才知道。这与检查 adapters / index 同类，所以归自检。
     #[test]
-    fn dangling_reference_捡出_agent_根下的断链() {
+    fn 自检_坏的_agent_sqlite_库报_corrupted() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        let alive = put(home, ".codex/AGENTS.md", "# a\n");
-        let broken = home.join(".codex/skills/ghost");
-        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(home.join("nowhere"), &broken).unwrap();
-        let db = seed_index(home, "memory", "AGENTS.md", &alive);
 
-        let mut o = opts(home);
-        o.index_path = Some(db);
-        let r = doctor(&o).unwrap();
-
-        assert!(
-            r.findings.iter().any(|f| f.check == CHECK_DANGLING
-                && f.subject == broken.display().to_string()
-                && f.detail.contains("resolves nowhere")),
-            "{:?}",
-            r.findings
-        );
-    }
-
-    #[test]
-    fn skill_metadata_报出缺失与无_name_的_skill_md() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let no_name = home.join(".fixture/skills/anon");
-        std::fs::create_dir_all(&no_name).unwrap();
-        std::fs::write(no_name.join("SKILL.md"), "# just a heading\n").unwrap();
-        let missing = home.join(".fixture/skills/bare");
-        std::fs::create_dir_all(&missing).unwrap();
-
-        let db = home.join(".agent-duster").join("index.db");
-        {
-            let idx = Index::open(&db).unwrap();
-            for (key, p) in [("anon", &no_name), ("bare", &missing)] {
-                upsert::upsert_resource(
-                    idx.conn(),
-                    &ResourceRow {
-                        agent_id: "fixture".to_string(),
-                        kind: "skill".to_string(),
-                        scope: "global".to_string(),
-                        key: key.to_string(),
-                        path: p.display().to_string(),
-                        size: 0,
-                        mtime_ns: 0,
-                        hash_content: None,
-                        cheap_print: None,
-                        clean_level: None,
-                        reclaimable: None,
-                        install_bytes: None,
-                    },
-                )
-                .unwrap();
-            }
-        }
-
-        let r = doctor(&opts(home)).unwrap();
-
-        assert!(r.checks_run.contains(&CHECK_SKILL_METADATA.to_string()));
-        let details: Vec<&str> = r
-            .findings
-            .iter()
-            .filter(|f| f.check == CHECK_SKILL_METADATA)
-            .map(|f| f.detail.as_str())
-            .collect();
-        assert_eq!(details.len(), 2, "{details:?}");
-        assert!(details.iter().any(|d| d.contains("is missing")));
-        assert!(details.iter().any(|d| d.contains("no `name`")));
-    }
-
-    /// 一个库炸了只变成一条 Error finding，其余检查照跑到底。
-    #[test]
-    fn 单项失败降级成_error_finding_其余检查照跑() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let corrupt = home.join(".fixture/logs.sqlite");
-        std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
-        let mut bytes = b"SQLite format 3\0".to_vec();
-        bytes.extend(std::iter::repeat_n(0xCDu8, 8192));
-        std::fs::write(&corrupt, &bytes).unwrap();
-        let db = seed_index(home, "artifact", "logs", &corrupt);
-
-        let mut o = opts(home);
-        o.index_path = Some(db);
-        let r = doctor(&o).unwrap();
-
-        let bad = r
-            .findings
-            .iter()
-            .find(|f| f.check == CHECK_SQLITE && f.subject == corrupt.display().to_string())
-            .expect("损坏的库应报出来");
-        assert_eq!(bad.severity, Severity::Error);
-        // 其余检查一项没少。
-        for c in [
-            CHECK_SKILL_METADATA,
-            CHECK_CONFIG_SYNTAX,
-            CHECK_DANGLING,
-            CHECK_SQLITE,
-        ] {
-            assert!(r.checks_run.contains(&c.to_string()), "{:?}", r.checks_run);
-        }
-        // duster 自己的索引也在体检范围内，而且它是好的。
-        assert!(r.findings.iter().all(|f| !f.subject.ends_with("index.db")));
-    }
-
-    /// 跑了没发现，也要在 checks_run 里留名——"查过了"本身就是信息。
-    #[test]
-    fn 干净的树上每项都留名且零_finding() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let ok = put(home, ".fixture/notes.md", "# fine\n");
-        let db = seed_index(home, "memory", "notes", &ok);
-
-        let mut o = opts(home);
-        o.index_path = Some(db);
-        o.secrets = true;
-        let r = doctor(&o).unwrap();
-
-        assert_eq!(
-            r.checks_run,
-            vec![
-                CHECK_SECRETS.to_string(),
-                CHECK_SKILL_METADATA.to_string(),
-                CHECK_CONFIG_SYNTAX.to_string(),
-                CHECK_DANGLING.to_string(),
-                CHECK_SQLITE.to_string(),
-            ]
-        );
-        assert!(r.findings.is_empty(), "{:?}", r.findings);
-    }
-
-    /// `--ping` 的端到端：从假 home 扫出一条 MCP 声明，ping 一个根本不存在的
-    /// 二进制，应得到一条 Warn 而不是让整轮体检倒下。
-    #[test]
-    fn mcp_reachability_报出起不来的声明() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        // 清单声明一条 sqlite 资源（形状照抄 cc-switch.toml 的声明）。
         put(
             home,
-            ".claude.json",
-            "{\"mcpServers\": {\"ghost\": \
-             {\"command\": \"duster-no-such-binary-9f2c\", \"args\": []}}}\n",
+            ".agent-duster/adapters/fixture.toml",
+            "[agent]\n\
+             id = \"fixture\"\n\
+             display_name = \"Fixture\"\n\
+             \n\
+             [probe]\n\
+             any_of = [\"~/.fixture\"]\n\
+             \n\
+             [[resource]]\n\
+             kind = \"memory\"\n\
+             scope = \"global\"\n\
+             path = \"~/.fixture/memories.sqlite\"\n\
+             mapper = \"stats-only\"\n",
         );
-        let index_path = home.join(".agent-duster").join("index.db");
-        crate::scan::scan(&crate::scan::ScanOptions {
-            home: Some(home.to_path_buf()),
-            index_path: Some(index_path.clone()),
-            full: true,
-        })
-        .unwrap();
 
-        let mut o = opts(home);
-        o.index_path = Some(index_path);
-        o.ping = true;
-        let r = doctor(&o).unwrap();
+        // 文件头是 SQLite 魔数、内容是垃圾：is_sqlite 认它，open 读不出来。
+        let db_file = home.join(".fixture/memories.sqlite");
+        std::fs::create_dir_all(db_file.parent().unwrap()).unwrap();
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.extend(std::iter::repeat_n(0xABu8, 8192));
+        std::fs::write(&db_file, &bytes).unwrap();
 
-        assert!(r.checks_run.contains(&CHECK_MCP.to_string()));
+        let index = home.join(".agent-duster").join("index.db");
+        let r = self_check(Some(&index)).unwrap();
+
+        assert!(r.checks_run.contains(&CHECK_SQLITE.to_string()));
         let f = r
             .findings
             .iter()
-            .find(|f| f.check == CHECK_MCP)
-            .expect("起不来的 server 应报出来");
-        assert!(f.subject.starts_with("ghost "), "{}", f.subject);
-        assert_eq!(f.severity, Severity::Warn);
+            .find(|f| f.check == CHECK_SQLITE)
+            .expect("写坏的库应报出来");
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(f.subject, db_file.display().to_string());
+        assert!(f.detail.contains("corrupted"), "{}", f.detail);
+        assert!(f.detail.contains("fixture"), "要点名是哪个 agent: {}", f.detail);
+        assert!(f.detail.contains("sessions/memory will be unreadable"), "{}", f.detail);
+        assert!(f.fix.is_some());
+
+        // 自检绝不建库：这个 home 里除了我们亲手写的清单与坏库，什么都没有。
+        assert!(!index.exists());
     }
+
 }

@@ -207,11 +207,17 @@ pub fn display_width(s: &str) -> usize {
 
 /// 按显示宽度截断，超长时尾部替换成 `…`（本身占 1 列）。
 ///
-/// 结果宽度不超过 `max.max(1)`——`max == 0` 是调用方笔误，退化为只剩省略号。
+/// 结果宽度不超过 `max`——`max == 0` 时返回空串（省略号本身宽 1，放了
+/// 就顶破预算）。
 /// 只在纯文本上调用——先截断、后着色，别反过来，否则会剪断 ANSI 序列。
 pub fn truncate_width(s: &str, max: usize) -> String {
     if display_width(s) <= max {
         return s.to_string();
+    }
+    if max == 0 {
+        // 0 列连省略号都放不下:省略号本身宽 1,放了就把「不越过预算」
+        // 的不变量顶破一列。空串让这一列只剩列间空隙。
+        return String::new();
     }
     let budget = max.saturating_sub(1); // 给省略号留一列
     let mut out = String::with_capacity(budget + 3);
@@ -231,7 +237,9 @@ pub fn truncate_width(s: &str, max: usize) -> String {
 /// 人类模式的列表格：列宽自适应，CJK 按显示宽度 2 对齐。
 ///
 /// 渲染成「表头一行 + 一条 `─` 横线 + 数据行若干」，整体缩进两格，
-/// 列间两个空格，行尾不留补齐空格。
+/// 列间两个空格，行尾不留补齐空格。同一个 Table 还能喂给交互控件
+/// （[`Table::rows`]）——两个出口共用同一套宽度算法，不再让 interactive
+/// 的手写 row builder 各算各的账。
 ///
 /// 单元格一律存**无样式**的纯文本，颜色在 render 时按列附加——宽度计算
 /// 因此永远看不见 ANSI 字节，对齐不会被着色带偏。
@@ -243,7 +251,51 @@ pub struct Table {
     /// 该列数据行的前景色；表头恒为 bold。
     color: Vec<Option<Style>>,
     /// flex 列的列号：它在 stdout 是 TTY 时吃掉终端余量（见 [`Table::flex_col`]）。
+    ///
+    /// **没有「最小宽度」这个旋钮,余量就是硬上限。** 早先有过一个 `flex_min`
+    /// （调用方给 16/8/4/4 的可读性下限），实现是 `flex_w.min(avail.max(floor))`
+    /// ——余量比地板窄时按地板截，**整行越过预算**。那不是取舍,是把承重不变量
+    /// 交给了一个配置旋钮:行宽碰到终端宽就折成两个物理行,而交互控件按逻辑行
+    /// 计数、按物理行擦,折一行残影每按一次翻一倍(正是 [`Prefix`] 那段注释
+    /// 记着的病史)。
+    ///
+    /// 而地板一旦夹回余量内就恒等于无操作——单 flex 列 + 固定其余列的布局里,
+    /// 想真正满足地板只能去压缩别的列,那是另一套算法,这张表从来没有过。
+    /// 所以不留它:余量不够时 flex 列截到认不出内容,也好过整屏残影。
     flex: Option<usize>,
+}
+
+/// 交互控件画在每行左边的前缀。行宽预算必须把它算进去——交互区按逻辑行
+/// 计数、按物理行擦，行宽碰到终端宽就折行，残影每按一次翻一倍，所以前缀
+/// 宽度由每个变体自己给，不许调用方手数（interactive.rs 旧版把 `❯ [x] `
+/// 按 4 列算，少的 2 列全进了路径列，行宽恰好 = 终端宽 + 1，每一行都折，
+/// 这就是交互式 clean 残影翻倍的根源）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prefix {
+    /// 纯表格，无控件前缀，预算不扣。
+    ///
+    /// 生产代码不构造它——命令行表格走 [`Table::render`]，交互控件走
+    /// `Cursor` / `Checkbox`。它存在是为了给「两个出口同一真相」那条测试
+    /// 一个零前缀的对照点：没有它，`rows_at` 与 `render_at` 就没法在同一
+    /// 个宽度口径下逐字比对。
+    #[allow(dead_code)]
+    None,
+    /// prompt_pick 的 `❯ `：`❯` 1 列 + 空格 1 列 = 2 列。
+    Cursor,
+    /// prompt_checklist 的 `❯ [x] `：`❯` 1 + 空格 1 + `[x]` 3 + 空格 1 = 6 列。
+    Checkbox,
+}
+
+impl Prefix {
+    /// 前缀占用的显示列数。宽度是这套行宽预算里唯一的承重点，数值钉死在
+    /// 这里（变体注释里逐项算过账），测试逐值断言。
+    pub fn width(self) -> usize {
+        match self {
+            Prefix::None => 0,
+            Prefix::Cursor => 2,
+            Prefix::Checkbox => 6,
+        }
+    }
 }
 
 /// 表格缩进：给终端留出呼吸感，也把表格和摘要行区分开。
@@ -286,6 +338,8 @@ impl Table {
     ///
     /// 只在 stdout 是 TTY 时生效——重定向到文件时截掉路径会毁掉逐行核对，
     /// 而「人类模式的表格能完整落进文件」是文档化契约。越界下标忽略。
+    /// 余量不够时这一列会被截到很窄甚至只剩省略号——不给「最小宽度」这种
+    /// 旋钮,理由见 [`Table`] 的 `flex` 字段注释。
     pub fn flex_col(&mut self, col: usize) {
         self.flex = Some(col);
     }
@@ -310,7 +364,7 @@ impl Table {
     /// 按给定终端宽度渲染。`None` = 拿不到宽度（管道 / 非 TTY），flex 列
     /// 不收缩，表格维持旧的全宽行为。
     fn render_at(&self, total: Option<usize>) -> String {
-        let widths = self.widths_for(total);
+        let widths = self.widths_for(total, display_width(INDENT));
         let bold = Style::new().bold();
         let dim = muted();
 
@@ -318,7 +372,7 @@ impl Table {
         let head_styles: Vec<Option<&Style>> = vec![Some(&bold); widths.len()];
         let row_styles: Vec<Option<&Style>> = self.color.iter().map(Option::as_ref).collect();
 
-        self.render_line(&mut out, &self.header, &widths, &head_styles);
+        self.render_line(&mut out, &self.header, &widths, &head_styles, INDENT, false);
         // 一条贯穿的横线：总宽 = 各列宽之和 + 列间两空格。
         let rule: usize = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
         out.push('\n');
@@ -326,7 +380,7 @@ impl Table {
         out.push_str(&dim.apply_to("─".repeat(rule)).to_string());
         for row in &self.rows {
             out.push('\n');
-            self.render_line(&mut out, row, &widths, &row_styles);
+            self.render_line(&mut out, row, &widths, &row_styles, INDENT, false);
         }
         out
     }
@@ -344,7 +398,17 @@ impl Table {
 
     /// 渲染列宽：拿到终端宽度且设了 flex 列时，把它截到余量（可能为 0，
     /// 这时该列渲染成省略号），其余列保持内容宽；拿不到宽度就原样返回。
-    fn widths_for(&self, total: Option<usize>) -> Vec<usize> {
+    ///
+    /// `indent` 同 [`flex_avail`]：命令行表格 2（[`INDENT`]），交互行 0
+    /// （前缀已经算进预算了）。**余量是上限,没有任何东西能顶破它**——整行
+    /// 不越过预算是防残影的承重不变量,见 [`Table`] 的 `flex` 字段注释。
+    ///
+    /// flex 列截到 0 之后固定列仍可能合计超预算（窄终端 + 宽内容,如 60 列
+    /// 下的会话表:ID/AGENT/PROJECT/TURNS/SIZE 自己就把预算吃穿),这时从
+    /// 最宽的列开始逐列削,地板是各自表头宽——表头削了列就没名字,而任何
+    /// 一列都不该为别列的内容让出自己的名字。全列到地板还不够就只能超,
+    /// 但那是终端窄过表头之和的极端,正常 60 列起步到不了。
+    fn widths_for(&self, total: Option<usize>, indent: usize) -> Vec<usize> {
         let widths = self.widths();
         let (Some(flex), Some(total)) = (self.flex, total) else {
             return widths;
@@ -353,38 +417,62 @@ impl Table {
             return widths; // 越界下标当没设过。
         };
         let mut widths = widths;
-        widths[flex] = flex_w.min(flex_avail(&widths, flex, total));
+        widths[flex] = flex_w.min(flex_avail(&widths, flex, total, indent));
+        // 固定列超预算的兜底:削最宽列到表头宽为止。
+        let floors: Vec<usize> = self.header.iter().map(|h| display_width(h)).collect();
+        let gaps = 2 * widths.len().saturating_sub(1);
+        let budget = total.saturating_sub(indent + gaps);
+        while widths.iter().sum::<usize>() > budget {
+            let Some((i, _)) = widths
+                .iter()
+                .enumerate()
+                .filter(|(i, w)| **w > floors[*i])
+                .max_by_key(|(_, w)| **w)
+            else {
+                break; // 全列到地板,预算实在装不下。
+            };
+            widths[i] -= 1;
+        }
         widths
     }
 
     /// 渲染单行：先按纯文本算补白，再给单元格套色，行尾不补空格。
+    ///
+    /// `indent` 由调用方给（命令行表格 [`INDENT`]，交互行 `""`）；`plain`
+    /// 为 true 时整个行不着色——交互控件的选中态自己上色，表格再上色会
+    /// 打架，占位横杠也一样（见 [`Table::rows_at`]）。
     fn render_line(
         &self,
         out: &mut String,
         cells: &[String],
         widths: &[usize],
         styles: &[Option<&Style>],
+        indent: &str,
+        plain: bool,
     ) {
         let dim = muted();
         let last = widths.len().saturating_sub(1);
-        out.push_str(INDENT);
+        out.push_str(indent);
         for (i, width) in widths.iter().enumerate() {
             if i > 0 {
                 out.push_str("  ");
             }
             let raw = cells.get(i).map(String::as_str).unwrap_or("");
-            // flex 列按余量截断；其余列内容即宽，截了也是原样。先截断后着色，
-            // 否则会剪断 ANSI 序列。
+            // 任何列都按最终列宽截断——列宽平时就是内容宽,截了也是原样;
+            // 只有 flex 收缩或固定列被削(widths_for 的预算兜底)时才真会截。
+            // 先截断后着色,否则会剪断 ANSI 序列。
             let truncated;
-            let cell = if self.flex == Some(i) {
+            let cell = if display_width(raw) > *width {
                 truncated = truncate_width(raw, *width);
                 truncated.as_str()
             } else {
                 raw
             };
             let pad = width.saturating_sub(display_width(cell));
-            // 占位横杠一律置灰，让真实数字自己跳出来。
-            let style = if cell == DASH {
+            // 占位横杠一律置灰，让真实数字自己跳出来；plain 模式整个行不着色。
+            let style = if plain {
+                None
+            } else if cell == DASH {
                 Some(&dim)
             } else {
                 styles.get(i).copied().flatten()
@@ -403,13 +491,49 @@ impl Table {
             }
         }
     }
+
+    /// 渲染成 `(表头行, 数据行)`，喂给交互控件（菜单、勾选表）。`cols` 是
+    /// 终端列数，由调用方给——交互区的菜单画在 **stderr** 上，宽度必须从那里
+    /// 量（`interactive::term_width`），而 [`Table::render`] 量的是 stdout；
+    /// 两者在管道下会分道扬镳，所以这里不提供「自己去问终端」的重载，免得
+    /// 有人顺手用错那一头。测试直接喂 60 / 80 / 200，也不必 mock 终端。
+    ///
+    /// 与 [`Table::render`] 的差异只有三点，其余口径（列宽、对齐、截断）
+    /// 逐字一致，保证同一份数据两个出口渲染出同一张表：
+    /// - 不加 [`INDENT`] 两格缩进——控件自己画前缀（[`Prefix`]），行宽
+    ///   预算里已经给它留了位置；
+    /// - 不画 `─` 横线；
+    /// - 不着色——选中态由控件自己上色，表格再上色会打架，占位横杠也一样。
+    ///
+    /// 行宽预算 = `cols` - `prefix.width()` - 1：末尾 1 列是余量，行宽碰到
+    /// 终端宽就会被折成两个物理行，而控件按逻辑行计数、按物理行擦，折一行
+    /// 残影每按一次翻一倍。
+    pub(crate) fn rows_at(&self, prefix: Prefix, cols: usize) -> (String, Vec<String>) {
+        let budget = cols.saturating_sub(prefix.width() + 1);
+        let widths = self.widths_for(Some(budget), 0);
+        let mut header = String::new();
+        self.render_line(&mut header, &self.header, &widths, &[], "", true);
+        let body = self
+            .rows
+            .iter()
+            .map(|row| {
+                let mut line = String::new();
+                self.render_line(&mut line, row, &widths, &[], "", true);
+                line
+            })
+            .collect();
+        (header, body)
+    }
 }
 
-/// flex 列能拿到的宽度：终端总宽 - 缩进 - 其余列的内容宽 - 列间空隙。
+/// flex 列能拿到的宽度：总预算 - 行首缩进 - 其余列的内容宽 - 列间空隙。
 ///
-/// 可能为 0（终端比固定列还窄），这时 flex 列渲染成省略号而不是撑破屏幕；
-/// 只要余量 ≥ 1，「横线 + 缩进 ≤ 终端宽」就恒成立（见 [`Table::flex_col`]）。
-fn flex_avail(widths: &[usize], flex: usize, total: usize) -> usize {
+/// `indent` 由调用方按出口给：命令行表格是 [`INDENT`]（2 列），交互行是 0
+/// （前缀已经算进预算了）。可能为 0（预算比固定列还窄），这时 flex 列渲染
+/// 成省略号而不是撑破屏幕；只要余量 ≥ 1，整行就不会越过预算——命令行表格
+/// 的「横线 + 缩进 ≤ 终端宽」与交互行的「行宽 + 前缀 < 终端宽」都靠这条
+/// 成立。
+fn flex_avail(widths: &[usize], flex: usize, total: usize, indent: usize) -> usize {
     let other: usize = widths
         .iter()
         .enumerate()
@@ -417,7 +541,7 @@ fn flex_avail(widths: &[usize], flex: usize, total: usize) -> usize {
         .map(|(_, w)| *w)
         .sum();
     let gaps = 2 * widths.len().saturating_sub(1);
-    total.saturating_sub(display_width(INDENT) + other + gaps)
+    total.saturating_sub(indent + other + gaps)
 }
 
 /// stdout 的终端列数；非 TTY 或取不到尺寸时返回 None。
@@ -579,7 +703,7 @@ mod tests {
         assert!(display_width(&cut) <= 5);
         // 边界：上限 1 只剩省略号，上限 0 直接空。
         assert_eq!(truncate_width("一二", 1), "…");
-        assert_eq!(truncate_width("一二", 0), "…");
+        assert_eq!(truncate_width("一二", 0), "");
     }
 
     /// flex 列在窄终端下：最后一列被截断、横线不超出给定宽度。这是「表格
@@ -700,6 +824,160 @@ mod tests {
                     "worse 必须可交换: a={a}, b={b}"
                 );
             }
+        }
+    }
+
+    /// 前缀宽度是行宽预算里唯一的承重点,数值由变体自己给——interactive 的
+    /// 旧 row builder 手数错过一次(把 6 算成 4)就让每行宽 = 终端宽 + 1,
+    /// 交互式 clean 残影翻倍。三个值逐字钉死。
+    #[test]
+    fn prefix_width_数值钉死() {
+        assert_eq!(Prefix::None.width(), 0);
+        assert_eq!(Prefix::Cursor.width(), 2); // `❯` 1 + 空格 1
+        assert_eq!(Prefix::Checkbox.width(), 6); // `❯` 1 + 空格 1 + `[x]` 3 + 空格 1
+    }
+
+    /// 防残影核心不变量:rows_at 的每一行(含表头)加上前缀后必须严格小于
+    /// 终端宽——行宽碰到终端宽就被折成两个物理行,而控件按逻辑行计数、按
+    /// 物理行擦,折一行残影每按一次翻一倍。60 / 80 / 200 三种宽度 × 三种
+    /// 前缀,逐行断言,不是抽查。用超长路径逼 flex 列截断,让它真的吃满
+    /// 预算(只截到预算内的情形断言不了什么)。
+    #[test]
+    fn rows_at_每行加前缀严格小于终端宽() {
+        let long = "~/.cache/codex/sessions/2026-08-13/1e2d3c4b5a-this-path-is-long-enough-to-overflow-any-narrow-terminal";
+        for cols in [60usize, 80, 200] {
+            for prefix in [Prefix::None, Prefix::Cursor, Prefix::Checkbox] {
+                let mut t = Table::new(vec!["AGENT", "SIZE", "PATH"]);
+                t.right_align(&[1]);
+                t.push_row(vec!["codex", "1.2 GB", long]);
+                t.push_row(vec!["gemini-cli", "3.1 MB", "~/.gemini"]);
+                t.flex_col(2);
+
+                let (header, rows) = t.rows_at(prefix, cols);
+                let all = std::iter::once(&header).chain(rows.iter());
+                for line in all {
+                    let w = prefix.width() + display_width(line);
+                    assert!(
+                        w < cols,
+                        "{cols} 列终端、前缀 {prefix:?}:行宽 {w} 超限: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 两个出口不许是两个真相:同一张表,`rows_at(Prefix::None, T-1)` 的表头
+    /// 与数据行,在剥掉 render 的缩进 / 横线 / 颜色之后与 `render_at(Some(T))`
+    /// 逐字一致。
+    ///
+    /// 为什么是 `T-1`:render 留 2 列缩进、rows 留前缀 + 1 列余量,预算口径
+    /// 差 1 列,所以两者的 flex 余量恰好相等。两段都走 `_at`,不碰真实终端
+    /// ——`rows()` 与 `render()` 的宽度兜底本就不同(前者 100、后者不收缩),
+    /// 拿它们对齐只在内容短到不触顶时碰巧成立,那不是契约。
+    #[test]
+    fn rows_与_render_同一真相() {
+        // 内容不触顶:两个出口直接对齐。
+        let mut t = Table::new(vec!["AGENT", "SIZE", "PATH"]);
+        t.right_align(&[1]);
+        t.push_row(vec!["codex", "1.2 GB", "~/.codex"]);
+        t.push_row(vec!["gemini-cli", "3.1 MB", "~/.gemini"]);
+        t.flex_col(2);
+
+        let (h1, r1) = t.rows_at(Prefix::None, 79);
+        let rendered = t.render_at(Some(80));
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 4, "表头 + 横线 + 两行数据");
+        let strip = |l: &str| {
+            console::strip_ansi_codes(l.strip_prefix(INDENT).unwrap_or(l)).to_string()
+        };
+        assert_eq!(strip(lines[0]), h1, "表头不一致");
+        let rows_expected: Vec<String> = lines[2..].iter().map(|l| strip(l)).collect();
+        assert_eq!(r1, rows_expected, "数据行不一致");
+
+        // 截断路径:长路径把 flex 列真的截短。
+        let mut u = Table::new(vec!["AGENT", "SIZE", "PATH"]);
+        u.right_align(&[1]);
+        u.push_row(vec![
+            "codex",
+            "1.2 GB",
+            "~/.codex/skills/a-very-long-skill-name-that-overflows",
+        ]);
+        u.push_row(vec!["gemini-cli", "3.1 MB", "~/.gemini"]);
+        u.flex_col(2);
+
+        let (h2, r2) = u.rows_at(Prefix::None, 39);
+        let rendered2 = u.render_at(Some(40));
+        let lines2: Vec<&str> = rendered2.lines().collect();
+        assert_eq!(strip(lines2[0]), h2, "截断路径表头不一致");
+        let rows2_expected: Vec<String> = lines2[2..].iter().map(|l| strip(l)).collect();
+        assert_eq!(r2, rows2_expected, "截断路径数据行不一致");
+        assert!(r2[0].contains('…'), "长路径应被截断: {}", r2[0]);
+    }
+
+    /// CJK 场景:宽字符按显示宽度 2 对齐,rows 的第二列不能顶歪;行宽加前缀
+    /// 同样不越终端。
+    #[test]
+    fn rows_cjk_宽字符不顶歪下一列() {
+        let mut t = Table::new(vec!["名称", "size"]);
+        t.push_row(vec!["中文技能包", "12"]);
+        t.push_row(vec!["ascii", "3456"]);
+        t.flex_col(1);
+
+        let (header, rows) = t.rows_at(Prefix::Checkbox, 60);
+        let all = std::iter::once(&header).chain(rows.iter());
+        // 每行第二列起始处的显示列必须一致(中文列不错位)。
+        let col_starts: Vec<usize> = [
+            (&header, "size"),
+            (&rows[0], "12"),
+            (&rows[1], "3456"),
+        ]
+        .iter()
+        .map(|(line, needle)| {
+            let idx = line.rfind(needle).unwrap();
+            display_width(&line[..idx])
+        })
+        .collect();
+        assert!(
+            col_starts.windows(2).all(|w| w[0] == w[1]),
+            "第二列起始显示列不一致: {col_starts:?}"
+        );
+        // 行宽 + 前缀不越终端。
+        for line in all {
+            let w = Prefix::Checkbox.width() + display_width(line);
+            assert!(w < 60, "行宽 {w} 超限: {line}");
+        }
+    }
+
+    /// 余量比内容窄时 flex 列被截,而**整行绝不越过预算**——这条不变量不许
+    /// 任何配置旋钮顶破(旧版的 flex_min 地板就会,那是被删掉的原因)。
+    /// 内容本身比余量短时不强制补白,行保持内容宽。
+    #[test]
+    fn flex列按余量截断且整行不越预算() {
+        let long = "~/.codex/skills/a-very-long-skill-name-that-overflows-any-terminal";
+        let mut t = Table::new(vec!["AGENT", "SIZE", "PATH"]);
+        t.right_align(&[1]);
+        t.push_row(vec!["codex", "1.2 GB", long]);
+        t.push_row(vec!["gemini-cli", "3.1 MB", "~/.gemini"]);
+        t.flex_col(2);
+
+        // 窄到 36 列:路径按余量截,整行严格窄于终端宽(留 1 列余量不折行)。
+        let (header, rows) = t.rows_at(Prefix::None, 36);
+        for line in std::iter::once(&header).chain(rows.iter()) {
+            assert!(
+                display_width(line) < 36,
+                "行宽 {} 越过预算: {line}",
+                display_width(line)
+            );
+        }
+        assert!(rows[0].contains('…'), "长路径应被截断: {}", rows[0]);
+        // 短内容:不强制补白,行尾就是内容本身。
+        assert!(rows[1].ends_with("~/.gemini"), "{}", rows[1]);
+
+        // 极窄终端:flex 列压到 0 也不许越界,退化成省略号而不是撑破屏幕。
+        let (_, tiny) = t.rows_at(Prefix::Checkbox, 30);
+        for line in &tiny {
+            let w = Prefix::Checkbox.width() + display_width(line);
+            assert!(w < 30, "行宽 {w} 越过预算: {line}");
         }
     }
 }

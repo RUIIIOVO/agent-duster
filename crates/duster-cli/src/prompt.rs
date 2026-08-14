@@ -29,6 +29,9 @@
 //!   整页跳、Home / End 贴边;勾选表另有 `空格` 切一行、`a` 切全表。
 //!   Enter 提交,`Esc` 取消。两张表的移动键**必须一模一样**——同一个菜单里
 //!   两张表按同一个键做不同的事,比少一个键更糟。
+//! - [`prompt_browse`]:上面两张表的合体(浏览 + 勾选同屏)。移动与勾选键
+//!   同上,另认 `/`(把「过滤」交回调用方);Enter 无勾选 = 打开光标行,
+//!   有勾选 = 对勾选集合动手(见 [`BrowseEvent`])。
 //!
 //! 提交与取消的区分是铁律:`Ok(Some(_))` = 提交了内容,`Ok(None)` = 用户取消,
 //! 调用方原样回菜单,什么都没发生。Ctrl-C 仍由终端送 SIGINT(与 dialoguer
@@ -208,7 +211,9 @@ pub fn prompt_checklist(
     let page = body_page(list.page, list.header.is_some(), list.items.len());
     let mut st = ChecklistState::new(list.checked.clone(), page, list.select_all);
     let _guard = CursorGuard::hide(&term)?;
-    let mut drawn = render_checklist(&term, theme, &list, &st, 0)?;
+    let mut drawn = render_marked(
+        &term, theme, list.prompt, list.header, list.items, &st.checked, &st.view, 0,
+    )?;
     let submitted = loop {
         match checklist_key(&mut st, term.read_key()?) {
             ChecklistAction::Redraw => {}
@@ -216,7 +221,9 @@ pub fn prompt_checklist(
             ChecklistAction::Cancel => break false,
             ChecklistAction::Ignore => continue,
         }
-        drawn = render_checklist(&term, theme, &list, &st, drawn)?;
+        drawn = render_marked(
+            &term, theme, list.prompt, list.header, list.items, &st.checked, &st.view, drawn,
+        )?;
     };
     term.clear_last_lines(drawn)?;
     if !submitted {
@@ -552,6 +559,133 @@ pub fn prompt_pick(theme: &ColorfulTheme, list: Picker<'_>) -> io::Result<Option
     Ok(picked)
 }
 
+/// browse 列表的一次交互收场。Enter 的去向由勾选状态决定:一行都没勾时
+/// 是「打开光标行」,勾了就是「对勾选集合动手」——下钻与批量不再是两张表。
+#[derive(Debug, PartialEq, Eq)]
+pub enum BrowseEvent {
+    /// Enter 且一行都没勾:打开光标行(下钻详情)。
+    Open(usize),
+    /// Enter 且有勾选:对勾选的行动手(下标升序)。
+    Act(Vec<usize>),
+    /// `/`:调用方去问过滤词。控件不做行编辑——过滤词归 [`prompt_line`],
+    /// 过滤集合归调用方(只有它认识行文本与原始下标的映射)。
+    Filter,
+    /// Esc。「过滤态先清过滤再退屏」也由调用方决定:控件不知道自己看到
+    /// 的行是不是被滤过的。
+    Cancel,
+}
+
+/// 一张可勾选的浏览表。与 [`Picker`] 只差 `checked`:勾选位归调用方所有,
+/// 控件原地改——过滤与下钻的来回之间勾选要保得住,状态就不能锁在控件的
+/// 栈帧里。
+pub struct Browser<'a> {
+    /// 问句正文(键位提示由调用方写进来,与其他问句一致)。
+    pub prompt: &'a str,
+    /// 表头:多列条目的列名,缩进与条目正文对齐。
+    pub header: Option<&'a str>,
+    /// 每行正文(调用方已对齐)。
+    pub items: &'a [String],
+    /// 一屏最多几行条目(不含问句、表头与翻页提示)。
+    pub page: usize,
+    /// 初始光标停在第几行。越界按 0 算。
+    pub start: usize,
+    /// 勾选位,长度必须与 `items` 一致。
+    pub checked: &'a mut [bool],
+}
+
+/// 跑一张浏览表。移动键与 [`prompt_pick`] 一模一样,勾选键(`空格` / `a`)
+/// 与 [`prompt_checklist`] 一模一样——同一个菜单里两张表按同一个键做不同
+/// 的事,比少一个键更糟,这条铁律在合体控件上同样成立。
+///
+/// 与两位亲戚一样退场时擦干净自己画的每一行:回显归调用方。
+pub fn prompt_browse(theme: &ColorfulTheme, list: Browser<'_>) -> io::Result<BrowseEvent> {
+    let term = Term::stderr();
+    if !term.is_term() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "not a terminal",
+        ));
+    }
+    debug_assert_eq!(list.checked.len(), list.items.len());
+    if list.items.is_empty() {
+        return Ok(BrowseEvent::Cancel);
+    }
+    let page = body_page(list.page, list.header.is_some(), list.items.len());
+    let mut view = Viewport::new(list.items.len(), page);
+    view.cursor = if list.start < list.items.len() {
+        list.start
+    } else {
+        0
+    };
+    view.scroll_into_view();
+    let _guard = CursorGuard::hide(&term)?;
+    let mut drawn = render_marked(
+        &term, theme, list.prompt, list.header, list.items, list.checked, &view, 0,
+    )?;
+    let event = loop {
+        let key = term.read_key()?;
+        if view.nav(&key) {
+            drawn = render_marked(
+                &term, theme, list.prompt, list.header, list.items, list.checked, &view, drawn,
+            )?;
+            continue;
+        }
+        match browse_key(list.checked, view.cursor, key) {
+            BrowseAction::Redraw => {
+                drawn = render_marked(
+                    &term, theme, list.prompt, list.header, list.items, list.checked, &view,
+                    drawn,
+                )?;
+            }
+            BrowseAction::Done(ev) => break ev,
+            BrowseAction::Ignore => {}
+        }
+    };
+    term.clear_last_lines(drawn)?;
+    Ok(event)
+}
+
+/// browse 的一键结果(移动键在进这里之前已被 [`Viewport::nav`] 吃掉)。
+enum BrowseAction {
+    Redraw,
+    Done(BrowseEvent),
+    Ignore,
+}
+
+/// browse 的键 → 状态机。与 [`checklist_key`] 只差两处:`/` 交出过滤请求,
+/// Enter 按「有没有勾选」分流——这正是这个控件存在的理由。抽成纯函数,
+/// 键序列可以直接断言,不必 mock 终端。
+fn browse_key(checked: &mut [bool], cursor: usize, key: Key) -> BrowseAction {
+    match key {
+        Key::Char(' ') => {
+            checked[cursor] = !checked[cursor];
+            BrowseAction::Redraw
+        }
+        // `a` 是「全都要 / 全不要」:有一行没勾就全勾,已勾满就全清。
+        Key::Char('a' | 'A') => {
+            let v = !checked.iter().all(|&c| c);
+            checked.iter_mut().for_each(|c| *c = v);
+            BrowseAction::Redraw
+        }
+        Key::Char('/') => BrowseAction::Done(BrowseEvent::Filter),
+        Key::Enter => {
+            let sel: Vec<usize> = checked
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c)
+                .map(|(i, _)| i)
+                .collect();
+            BrowseAction::Done(if sel.is_empty() {
+                BrowseEvent::Open(cursor)
+            } else {
+                BrowseEvent::Act(sel)
+            })
+        }
+        Key::Escape => BrowseAction::Done(BrowseEvent::Cancel),
+        _ => BrowseAction::Ignore,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 渲染
 // ---------------------------------------------------------------------------
@@ -576,7 +710,9 @@ fn render_confirm(
     term.flush()
 }
 
-/// 重绘整张勾选表,返回这一版画了几行(下一版据此擦干净)。
+/// 重绘一张带勾选框的表,返回这一版画了几行(下一版据此擦干净)。
+/// 勾选表([`prompt_checklist`])与浏览表([`prompt_browse`])共用这一份:
+/// 两者的屏上形状一模一样,分开写就是两处漂移。
 ///
 /// 每行的形状是 `❯ [x] 正文`:**位置标记与勾选状态分开两个字符位**。
 /// 光标只用颜色表示是不够的——一屏十几行长得一样,而颜色在复制粘贴、
@@ -584,11 +720,15 @@ fn render_confirm(
 ///
 /// 条目多于一页时最后补一行「第几到第几 / 共几行」:不写这一行,用户
 /// 无法知道自己看的是全部还是一角。
-fn render_checklist(
+#[allow(clippy::too_many_arguments)]
+fn render_marked(
     term: &Term,
     theme: &ColorfulTheme,
-    list: &Checklist<'_>,
-    st: &ChecklistState,
+    prompt: &str,
+    header: Option<&str>,
+    items: &[String],
+    checked: &[bool],
+    view: &Viewport,
     drawn: usize,
 ) -> io::Result<usize> {
     if drawn > 0 {
@@ -597,28 +737,28 @@ fn render_checklist(
     let mut lines = 0;
     let mut buf = String::new();
     theme
-        .format_prompt(&mut buf, list.prompt)
+        .format_prompt(&mut buf, prompt)
         .expect("writing to a String cannot fail");
     term.write_line(&buf)?;
     lines += 1;
     // 表头缩进 6 列:与条目正文(`❯ [x] `)对齐。
-    if let Some(header) = list.header {
+    if let Some(header) = header {
         term.write_line(&format!(
             "      {}",
             Style::new().for_stderr().bold().apply_to(header)
         ))?;
         lines += 1;
     }
-    for i in st.view.visible() {
-        let mark = if st.checked[i] {
+    for i in view.visible() {
+        let mark = if checked[i] {
             Style::new().for_stderr().green().apply_to("[x]")
         } else {
             Style::new().for_stderr().dim().apply_to("[ ]")
         };
-        write_row(term, &list.items[i], i == st.view.cursor, Some(mark))?;
+        write_row(term, &items[i], i == view.cursor, Some(mark))?;
         lines += 1;
     }
-    lines += write_footer(term, &st.view)?;
+    lines += write_footer(term, view)?;
     term.flush()?;
     Ok(lines)
 }
@@ -942,5 +1082,51 @@ mod tests {
         // 非移动键一律不认,由调用方去分辨 Enter / Esc
         assert!(!all.nav(&Key::Enter));
         assert!(!all.nav(&Key::Char('x')));
+    }
+
+    /// browse 键序列:空格切光标行、`a` 全勾/全清、`/` 交出过滤请求、
+    /// Enter 按「有没有勾选」分流、Esc 取消。这是合体控件的全部新逻辑,
+    /// 移动键已由 [`Viewport::nav`] 的测试守着。
+    #[test]
+    fn browse_键序列_勾选分流与过滤请求() {
+        let mut checked = vec![false; 4];
+
+        // 无勾选时 Enter = 打开光标行
+        assert!(matches!(
+            browse_key(&mut checked, 2, Key::Enter),
+            BrowseAction::Done(BrowseEvent::Open(2))
+        ));
+
+        // 空格切光标行,Enter 变成对勾选集合动手(下标升序)
+        assert!(matches!(
+            browse_key(&mut checked, 1, Key::Char(' ')),
+            BrowseAction::Redraw
+        ));
+        assert_eq!(checked, vec![false, true, false, false]);
+        let _ = browse_key(&mut checked, 3, Key::Char(' '));
+        match browse_key(&mut checked, 0, Key::Enter) {
+            BrowseAction::Done(BrowseEvent::Act(sel)) => assert_eq!(sel, vec![1, 3]),
+            _ => panic!("有勾选时 Enter 必须交出勾选集合"),
+        }
+
+        // `a`:有一行没勾就全勾,已勾满就全清
+        let _ = browse_key(&mut checked, 0, Key::Char('a'));
+        assert_eq!(checked, vec![true; 4], "有未勾的行时 a 应勾满");
+        let _ = browse_key(&mut checked, 0, Key::Char('a'));
+        assert_eq!(checked, vec![false; 4], "已勾满时 a 应清空");
+
+        // `/` 与 Esc 原样交回;无关键不动
+        assert!(matches!(
+            browse_key(&mut checked, 0, Key::Char('/')),
+            BrowseAction::Done(BrowseEvent::Filter)
+        ));
+        assert!(matches!(
+            browse_key(&mut checked, 0, Key::Escape),
+            BrowseAction::Done(BrowseEvent::Cancel)
+        ));
+        assert!(matches!(
+            browse_key(&mut checked, 0, Key::Char('z')),
+            BrowseAction::Ignore
+        ));
     }
 }

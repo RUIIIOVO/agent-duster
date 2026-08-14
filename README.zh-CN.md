@@ -33,10 +33,10 @@ Agent Duster 用一个 CLI 让你看清、搜到、管住这一切。
 ## 特性
 
 - 🔍 **统一检索** — 一条命令跨所有 agent 搜会话正文，`open` 读出完整那一轮，中文可搜。
-- 🧬 **重复与漂移检测** — `skill copies` 找出逐字节相同的副本和同名但内容已分叉的 skill（同一个 agent 里的两份也算）；`skill link` 把它们收敛为一份链接引用的唯一来源。
+- 🧬 **重复与漂移检测** — `skill list` 列出你有的全部 skill，并标出哪几个装在多处——同一个 agent 里的两份也算——以及那几份里哪些已经漂移；`skill link` 把它们收敛为一份链接引用的唯一来源。
 - 🧹 **分档清理** — `clean` 收可再生垃圾、`prune` 收陈旧资源、`uninstall` 整体卸载。三个动词按"删错了要付什么代价"划分，每一项都解释清楚。
 - 🔁 **一处声明，多家生效** — `mcp sync` 把一个 MCP server 复制进别的 agent 并改写成各家的格式；`skill link` 让多家共用磁盘上的同一份。转换会丢字段的目标一律拒写，绝不静默截断。
-- 🩺 **体检** — 一趟六项：明文凭据（只显示掩码，绝不完整打印）、MCP 可达性、skill 元数据、配置语法、失效引用、SQLite 完整性。
+- 🩺 **自检** — 检查 duster 自己，像 `brew doctor` 检查 brew：索引库、adapter 清单、目录权限、版本，外加每个 agent 的 SQLite 库（opencode.db、memories_1.sqlite、cc-switch.db…）读不读得动——库坏了，会话与记忆就读不出来了。
 - 🔒 **默认安全** — 默认 dry-run；删除前一定逐条列清单说明；**删除即永久**，不可再生的内容会先压缩归档到你看得见的地方。完全离线、零遥测、零账号。
 
 ## 快速开始
@@ -46,29 +46,33 @@ Agent Duster 用一个 CLI 让你看清、搜到、管住这一切。
 
 ```bash
 duster                          # 终端里不带参数：从菜单里挑
-duster scan                     # 发现 agent 并建立索引
-duster status                   # 总览：agent / 体积 / 问题数
+duster status                   # 总览：agent / 体积 / 各家存了什么
 duster search "鉴权中间件"
-duster mcp list                 # 每个 MCP server 一行，合并所有声明它的 agent
+duster mcp list                 # 每条 MCP 声明一行，带跨 agent 的合并状态
 duster session list             # 按项目、时间、体积浏览会话
 duster clean                    # 清缓存与日志，默认 dry-run
 duster prune --older-than 90d   # 清陈旧 skill / 会话，逐条确认
 ```
+
+没有「先建索引」这一步。凡是读索引的命令，进门时自己就把索引建好或刷新好
+（增量 0.5 秒，从零 4 秒），菜单则扔后台线程去做，从不让你等。`duster scan`
+仍在，但它留下来是为了它打印的那份报告——发现了什么、哪些路径没人认领；
+`duster scan --full` 则是「search 结果看着不对」时把每个文件重读一遍的逃生门。
 
 ## 命令一览
 
 | 命令 | 作用 |
 |---|---|
 | `duster` | 在终端里不带参数：进菜单。挑一条命令，缺什么它当场问，然后走的是和旗标完全相同的那条代码路径。管道里或带 `--json`：改为打印帮助。 |
-| `duster scan` | 探测已安装 agent，索引 MCP / skills / 记忆 / 会话。默认增量；不认识的路径只上报、不触碰。 |
-| `duster status` | 每个 agent 的磁盘占用、资源数量、上次扫描时间。 |
+| `duster scan` | 探测已安装 agent，索引 MCP / skills / 记忆 / 会话，并打印发现了什么——包括认领目录内没有任何清单声明的路径。**你不需要为了让别的命令能跑而先跑它**：那些命令自己会刷新索引。默认增量；不认识的路径只上报、不触碰。`--full` 重读每个文件。 |
+| `duster status` | 每个 agent 的磁盘占用、资源数量、上次扫描时间。成功退出码 0，只有失败才非零。 |
 | `duster search <query>` | 跨 agent 全文检索会话正文，`--agent` 缩范围（逗号分隔可给多个）、`--limit` 定条数。摘要给的是抽取后的对话正文，不是原始那行 JSONL。`duster open <id>` 打印命中所在的那一整轮；喂给它一个会话 id 也认，会说明一句再打印整场对话。 |
-| `duster session list \| show \| export \| prune` | 跨 agent 浏览会话，最近用过的在前；支持 `--agent` / `--project` / `--older-than` / `--min-bytes` 过滤。`show` 把一整场对话印成散文：工具输出各折叠成一行（`## tool · read · 4.3 KB`），过长正文停在 40 行——你来这儿是读对话，不是给 `read()` 的返回值做回放；要全文加 `--full`。`export` 导出 Markdown 或 JSON，永远是全量。`prune --older-than 90d` 原地压成 `.zst`，解压后 BLAKE3 与原文件逐字节一致才删原件——之后 search 和 open 照样读得出来。 |
-| `duster memory list \| show` | 只读的统一记忆视图：`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`、Qoder 的分项目记忆树、SQLite 里的记忆库一视同仁。`list` 给 key，`show` 打印那一条。 |
-| `duster mcp list \| show \| diff \| sync \| ping` | 一个 server 一行，合并所有声明它的 agent，并标出各家的方言。`show` 打印全文，env 值与 header 一律掩码。`diff --from A --to B` 比对同一个 server 在两家的声明。`sync <name> --to codex,opencode` 把一条声明复制进别的 agent 并转换格式；默认只出计划，写之前对每个文件做整文件快照，目标格式装不下的字段一律**拒写**。`ping` 把每个 server 起一次，说一句 `initialize` 就挂断。 |
-| `duster skill copies \| link` | 跨 agent skill 管理。`copies` 列出存在于多处的 skill——同一个 agent 里的两份也算——以及哪些副本已经漂移；`link` 把重复项收敛到磁盘上的同一份——一处修改，全局生效。 |
+| `duster session list \| show \| export \| migrate \| prune \| rm` | 跨 agent 浏览会话，最近用过的在前；支持 `--agent` / `--project` / `--older-than` / `--min-bytes` 过滤。`show` 把一整场对话印成散文：工具输出各折叠成一行（`## tool · read · 4.3 KB`），过长正文停在 40 行——你来这儿是读对话，不是给 `read()` 的返回值做回放；要全文加 `--full`。`export` 导出 Markdown 或 JSON，永远是全量。`migrate <id> --to <agent>` 把一场会话的**纯文本副本**种进 claude-code / codex / omp——**有意有损**：只带 user / assistant 的散文，thinking 与工具活动一律丢弃，连续被丢的一段压成一行 `[tool activity omitted]`，首条消息顶端并入一行出处说明。三家的工具记录互不兼容，duster 拒绝伪造——写完用与 `scan` 同一份解析器回读校验后才报成功（`--dry-run` 只预览；其余 agent 一律报 `sessions are stats-only, cannot migrate`）。`prune --older-than 90d` 原地压成 `.zst`，解压后 BLAKE3 与原文件逐字节一致才删原件——之后 search 和 open 照样读得出来。`rm <id>` 永久删除一场会话——先往 `~/agent-duster-exports/` 归档一份可读副本（脚本可用 `--no-archive` 关掉）；正文住在 agent 自己的 SQLite 库（opencode / omp）里的会话，按行从库里删掉那一场，写库之前先留整文件快照。 |
+| `duster memory list \| show \| migrate \| rm` | 统一记忆视图：`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`、Qoder 的分项目记忆树、SQLite 里的记忆库一视同仁。`list` 给 key，`show` 打印那一条。`migrate --from <A> --to <B>` 把那条记忆的文本复制进目标 agent 的记忆文件，包在一个带标记的块里（`<!-- duster:begin from=… -->`）；重跑是**整块替换**而不是越堆越多，块外你自己写的内容一个字节不碰，`--dry-run` 只打印将写入的块、不落盘。`rm <key> [--from <A>]` 精确切掉 from=A 的那一块——块外每个字节原样不动；`--whole-file` 改为删整份文件；文件里只剩 duster 自己的块（目录型目标里的 `from-<agent>-*.md`，或删完只剩块的文件）则整份一起删。删除前一律先归档进 `~/agent-duster-exports/`（脚本可用 `--no-archive` 关掉）。**你自己手写的文件**（没有 duster 块，或 `--whole-file` 指名整删）走两道确认：那是你自己的字、不是 duster 放的，所以 `--no-archive` 在这一支上**拒绝生效**——没有退路就不删你的手写内容——菜单问两道，亮出路径、字节与归档去处。文件里同时有好几块而你没给 `--from`：拒绝执行，把 from= 名单和两条出路（`--from <agent>` 切一块 / `--whole-file` 整删）一并报出来。「记忆」其实是配置文件或数据库（stats-only）的 agent，当源、当目标都会被明确拒绝。 |
+- - | `duster mcp list \| show \| sync \| rm \| ping` | 每条声明一行，STATE 列说清跨 agent 的合并结论：所有声明者一致 = `identical`、不一致 = `drifted`、只有一家声明 = `only copy`——差异直接摆在表里，不再需要单独的 diff 命令。`show` 打印全文，env 值与 header 一律掩码。`sync <name> --to codex,opencode` 把一条声明复制进别的 agent 并转换格式；默认只出计划，写之前对每个文件做整文件快照，目标格式装不下的字段一律**拒写**。`rm <name> --agent <A>` 从**那个 agent 自己的主配置文件**（`~/.claude.json`、`~/.codex/config.toml`、`~/.gemini/settings.json` …）里摘掉这一条声明——那是**你自己的主配置**，不是 duster 的：文件的形状漂移时由同一道 schema_guard 拒写，只动那一个键（文件里其余内容逐字节不变），删前**整份配置文件先打包进 `~/agent-duster-exports/`**，`tar -xf` 即可整份还原；`--no-archive` 供脚本显式关掉，`--dry-run` 打印哪个文件的哪个键会没，`--all-agents` 删除该名字的每一条声明。`ping` 把每个 server 起一次，说一句 `initialize` 就挂断。 |
+| `duster skill list \| link \| rm` | 跨 agent skill 管理。`list` 列出你有的全部 skill，并标出哪几个装在多处——同一个 agent 里的两份也算——以及那几份里哪些已经漂移；`link` 把重复项收敛到磁盘上的同一份——一处修改，全局生效。`rm <name> --agent <A> [--path <P>]` 精确删除一份副本——同名多家时 `--agent` 必选，同一家装了多份（目录不同）时 `--path` 再必选，duster 绝不替你默认删全部；真实目录先归档进 `~/agent-duster-exports/` 再删，软链副本只 unlink 链接本身（指向的内容原样留在别处）。 |
 | `duster diff <a> <b>` | 逐行比较两个文件或两个目录。`--no-line-level` 只说哪些条目不同，`--include-same` 把相同的也列出来。 |
-| `duster doctor` | 一趟六项检查：`secrets`（需要 `--secrets`）、`skill-metadata`、`config-syntax`、`dangling-reference`、`sqlite-integrity`、`mcp-reachability`（需要 `--ping`）。`--check <name>` 只跑点名的那几项。每一项在报告里都占一行——没跑的那几项会说自己没跑，以及要加哪个旗标才跑。 |
+| `duster doctor` | 检查 **duster 自己**，就像 `brew doctor` 检查 brew：索引库、adapter 清单、home 目录权限、版本，外加每个 agent 的 SQLite 库（opencode.db、memories_1.sqlite、cc-switch.db…）读不读得动——库坏了意味着会话与记忆读不出来。不收任何旗标。每一项都占一行，包括什么都没发现的那些：「还没查过」和「查过了没问题」是两件不同的事。 |
 | `duster clean` | 清**可再生垃圾**：SQLite 空闲页、孤儿 WAL/SHM、缓存、日志、临时残留。默认 dry-run，`--yes` 执行，**真删不留副本**。执行完会报出另外两桶（陈旧资源 / 软件本体）的体量与去处。**永不卸载已安装的软件**。 |
 | `duster prune --older-than 30d` | 清**陈旧的用户资源**：N 天没改过、也没有任何**调用记录**的 skill（名字在正文里被提到一句不算证据，见下），过期的备份与归档；N 天以上的会话改为压缩存档（不删内容）。加 `--keep-generations` 还会清掉数据库备份这类「一代一份」资源的超编副本——它们冗余是因为份数多，不是因为旧。一定先逐条列出「是什么 / 为何判定陈旧 / 删了什么后果」，确认后永久删除；不可再生的内容会先打包到 `~/agent-duster-exports/`。 |
 | `duster uninstall <agent>` | **整体卸载一个 agent**，分三块：清单声明为它独占的目录与文件；它写在**别人家**配置文件里的键（外科式摘除，改之前先做整文件快照）；以及软件本体当初是怎么装的——那条卸载命令只打印、**绝不代跑**，除非你自己加 `--run-package-manager`。`--data-only` 是这后两块的退出开关，并会报出跳过了几条改键与几条安装提示。要求逐字输入 agent id 确认；`--export-first`（默认开）先导出会话与记忆，`--keep sessions,memory` 保留原地。 |
@@ -76,9 +80,8 @@ duster prune --older-than 90d   # 清陈旧 skill / 会话，逐条确认
 ### 还没做的
 
 - `duster migrate --from <A> --to <B>` — 两个 agent 之间整体搬家，一次出计划、幂等执行。
-- `duster mcp remove` 与 `duster skill unlink \| remove` — 现在删一条声明还得自己改文件，或者整体 `uninstall` 那个 agent。
-- `duster memory merge \| export` — 今天的记忆视图是只读的。
-- 清理陈旧的 MCP 声明。`prune` 管的是文件；从别人还在用的配置文件里摘掉一条 server，走的是和 `mcp sync` 同一套机器，与它同批落地。
+- `duster memory merge \| export` — 比 `memory migrate` 的标记块复制更进一步：合并与按目标投影，需要能力矩阵才知道哪些转换是有损的。
+- 按陈旧度清理 MCP 声明。摘掉某一条具体的 server 是 `duster mcp rm <name> --agent <A>`；但「把 N 天没碰过的 server 都摘掉」还需要 `prune` 那套陈旧判定与同一条机器来驱动。
 - 对记忆、skill、MCP 配置的检索。今天 `search` 只搜会话正文。
 
 ### 三个动词，按"删错了要付什么代价"分
@@ -102,7 +105,7 @@ prune 必须逐项过目。肌肉记忆是按命令建立的，不是按旗标�
 命令行路径（`--dry-run`），那份报告照旧可以重定向成文件逐条核对。
 
 菜单里其余的列表视图一律是**浏览器**而不是转储：`session list`、`memory list`、
-`mcp list`、`skill copies`、`search` 都按终端高度翻页（↑/↓ 移动、←/→ 翻页、
+`mcp list`、`skill list`、`search` 都按终端高度翻页（↑/↓ 移动、←/→ 翻页、
 Enter 打开、Esc 退回），Enter 直接对选中那一行跑详情命令——不用再手抄一个 key
 去敲第二条命令。凡是能按 `--agent` 缩范围的地方，问的都是一张 agent 勾选表，
 每行带该 agent 的总量与可回收量，**默认全勾**——把不想动的那几个取消掉就行。
@@ -153,7 +156,7 @@ duster 不做回收站。一个清理工具跑完 `df` 没变化，是它能犯�
   还装着二十条别的东西的文件——这种操作前会做整文件快照。
 
 `--json` 是全局的，任何命令都能改成打印一行 JSON。其余旗标属于有它的那条命令：
-`--yes` 在 `clean` / `prune` / `session prune` / `mcp sync` 上，`--dry-run` 在前三条上
+`--yes` 在 `clean` / `prune` / `session prune` / `mcp sync` 上，`--dry-run` 在前三条加 `session migrate` 上
 （`mcp sync` 没有这个旗标，因为不给 `--yes` 时它做的就是只出计划），`--confirm <agent>`
 在 `uninstall` 上，`--full` 在 `session show` 与 `open` 上，`--agent <id>[,<id>]`
 在一切需要缩范围的地方。`--json` 模式下破坏性动作

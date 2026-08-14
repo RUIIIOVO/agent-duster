@@ -5,9 +5,9 @@
 //!
 //! # 渲染归这里，且只有这一份
 //!
-//! [`render_diff`] 是**全 CLI 唯一**的 diff 渲染器，`duster mcp diff` 直接调它。
-//! 写第二遍的代价不是多几十行，是两处的 `-`/`+` 语义慢慢走散——用户在
-//! `duster diff` 里学会的读法到 `mcp diff` 那边不成立。
+//! [`render_diff`] 是**全 CLI 唯一**的 diff 渲染器。`duster mcp diff` 曾直接
+//! 调它；那条命令随铺平表撤下后，只剩顶层 `duster diff` 一个入口——`-`/`+`
+//! 的读法全 CLI 只有这一种。
 //!
 //! # 正文顶格，摘要缩进
 //!
@@ -174,7 +174,7 @@ const KEY_PAD_MAX: usize = 44;
 /// hunk 挂在条目下时的缩进。
 const HUNK_INDENT: &str = "  ";
 
-/// 渲染一次比较。`duster diff` 与 `duster mcp diff` 共用这一份。
+/// 渲染一次比较。顶层 `duster diff` 唯一入口。
 ///
 /// 顶格打 unified diff 正文，最后一行摘要回到两格缩进（见模块文档）。
 /// warnings 由这里统一落 stderr，调用方不要再打一遍。

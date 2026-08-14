@@ -1,4 +1,4 @@
-//! `duster mcp` 外壳：把 [`duster_core::mcp`] 的五个用例渲染成人话或一行 JSON。
+//! `duster mcp` 外壳：把 [`duster_core::mcp`] 的四个用例渲染成人话或一行 JSON。
 //!
 //! 本模块零业务逻辑：解析参数 → 调 core → 按 `output.rs` 的契约排版 → 映射退出码。
 //! 合并规则（同名 + 同内容哈希 = 一行）、冲突判定、闸门拒写、ping 的边界
@@ -24,20 +24,21 @@
 //! spawn 进程得让用户有权说不。本模块只在用户**敲了 `ping` 这个动词**时
 //! 才把它置 true：那句命令本身就是那份同意，除此之外没有任何默认开启的路径。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use console::style;
 
 use duster_core::doctor::mask;
 use duster_core::mcp::{
-    self, Declaration, McpList, MergedServer, PingOptions, PingResult, SyncOptions, SyncOutcome,
+    self, Declaration, McpList, MergedServer, PingOptions, PingResult, RemoveReport, SyncOptions,
+    SyncOutcome,
 };
 use duster_model::{McpServerSpec, McpTransport};
 
 use crate::output::{
-    EXIT_CONFIRM_DENIED, EXIT_OK, EXIT_PARTIAL, OutputMode, Table, accent, display_width,
-    emit_json, err_mark, human_ms, muted, ok_mark, truncate_width, warn_mark,
+    EXIT_CONFIRM_DENIED, EXIT_OK, EXIT_PARTIAL, OutputMode, Prefix, Table, accent, display_width,
+    emit_json, err_mark, human_bytes, human_ms, muted, ok_mark, truncate_width, warn_mark,
 };
 use crate::{fail, plural, render_warnings};
 
@@ -47,23 +48,12 @@ pub(crate) const DEFAULT_PING_TIMEOUT_MS: u64 = 3_000;
 /// `duster mcp` 的动词表。
 #[derive(Subcommand, Clone)]
 pub enum McpCmd {
-    /// List every MCP server you have, merged across agents
+    /// List every MCP server declaration, one row per agent that declares it
     List,
     /// Show one server in full, with credentials masked
     Show {
         /// Server name, as `duster mcp list` prints it
         name: String,
-    },
-    /// Compare the same server as two agents declare it
-    Diff {
-        /// Server name, as `duster mcp list` prints it
-        name: String,
-        /// Agent on the left-hand side
-        #[arg(long, value_name = "AGENT")]
-        from: String,
-        /// Agent on the right-hand side
-        #[arg(long, value_name = "AGENT")]
-        to: String,
     },
     /// Copy one server's declaration into other agents
     Sync {
@@ -79,6 +69,26 @@ pub enum McpCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Remove one server's declaration from an agent's own config file
+    Rm {
+        /// Server name, as `duster mcp list` prints it
+        name: String,
+        /// Agent whose declaration to remove. Needed when more than one
+        /// agent declares it; pass --all-agents to remove every declaration
+        #[arg(long, value_name = "AGENT", conflicts_with = "all_agents")]
+        agent: Option<String>,
+        /// Remove the declaration from every agent that has it
+        #[arg(long)]
+        all_agents: bool,
+        /// Delete without packing the whole config file into
+        /// ~/agent-duster-exports first
+        #[arg(long)]
+        no_archive: bool,
+        /// Print what would change — which key disappears from which file —
+        /// and stop without touching anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Start each server once, say hello, and hang up
     Ping {
         /// Only this server. Leave it out to try all of them
@@ -93,13 +103,27 @@ pub fn run(mode: OutputMode, index: Option<&Path>, action: McpCmd) -> i32 {
     match action {
         McpCmd::List => cmd_list(mode, index),
         McpCmd::Show { name } => cmd_show(mode, index, &name),
-        McpCmd::Diff { name, from, to } => cmd_diff(mode, index, &name, &from, &to),
         McpCmd::Sync {
             name,
             from,
             to,
             yes,
         } => cmd_sync(mode, index, name, from, to, yes),
+        McpCmd::Rm {
+            name,
+            agent,
+            all_agents,
+            no_archive,
+            dry_run,
+        } => cmd_rm(
+            mode,
+            index,
+            name,
+            agent,
+            all_agents,
+            no_archive,
+            dry_run,
+        ),
         McpCmd::Ping { name, timeout_ms } => cmd_ping(mode, index, name.as_deref(), timeout_ms),
     }
 }
@@ -108,13 +132,21 @@ pub fn run(mode: OutputMode, index: Option<&Path>, action: McpCmd) -> i32 {
 /// 而这一列只用来认人；要看全的走 `duster mcp show`。
 const COMMAND_WIDTH: usize = 44;
 
-/// PATH 列的截断宽度，与 `skill copies` 表的 PATH 列曾经同宽
-/// （那张表现在走 flex_col，这里仍按内容宽度截断）。
+/// PATH 列的截断宽度。铺平表的 PATH 列按内容宽度截断（交互菜单那版
+/// 走 flex_col，见 [`browse_rows_at`]）；命令行表格没有终端余量可吃，
+/// 路径截到 44 足够认人，要看全的走 `duster mcp show`。
 const PATH_WIDTH: usize = 44;
 
 /// INFO 列的截断宽度。ping 失败时这一栏装的是一整句报错，
 /// 截断的是句尾，句首（"哪一步失败了"）永远看得见。
 const INFO_WIDTH: usize = 56;
+
+/// 这一屏只在 TTY 下出现,取不到宽度是异常而不是常态。
+fn terminal_cols() -> usize {
+    console::Term::stderr()
+        .size_checked()
+        .map_or(100, |(_, cols)| cols as usize)
+}
 
 // ---------------------------------------------------------------------------
 // list
@@ -148,7 +180,12 @@ fn cmd_list(mode: OutputMode, index: Option<&Path>) -> i32 {
 const EMPTY_LIST: &str =
     "No MCP server is indexed. Run `duster scan` first — if you just added one, run it again.";
 
-/// `list` 的人类视图：合并表 + 冲突块 + 一行小结。
+/// `list` 的人类视图：铺平表 + 冲突块 + 一行小结。
+///
+/// 铺平口径与 `skill list` 同构：**一行一条声明**，组名只印在首行
+/// （视觉上把一组连成一块），STATE 列给这组声明的合并结论。想知道的
+/// 「几家声明一样吗」直接读 STATE 列——这正是 `mcp diff` 曾回答的问题，
+/// 现在不需要第二条命令。
 fn render_list(list: &McpList) -> String {
     if list.servers.is_empty() {
         return format!("  {}", muted().apply_to(EMPTY_LIST));
@@ -156,16 +193,23 @@ fn render_list(list: &McpList) -> String {
 
     let mut blocks: Vec<String> = Vec::new();
 
-    let mut t = Table::new(vec!["SERVER", "AGENTS", "TRANSPORT", "COMMAND"]);
+    let mut t = Table::new(vec![
+        "SERVER", "STATE", "AGENT", "TRANSPORT", "COMMAND / URL", "PATH",
+    ]);
     t.color_col(0, accent());
-    t.color_col(3, muted());
+    t.color_col(5, muted());
     for s in &list.servers {
-        t.push_row(vec![
-            s.name.clone(),
-            agents_with_dialect(&s.declared_in),
-            transport_name(&s.spec.transport).to_string(),
-            truncate_width(&command_cell(&s.spec), COMMAND_WIDTH),
-        ]);
+        for (i, d) in s.declared_in.iter().enumerate() {
+            t.push_row(vec![
+                // 组名只在首行写——与 `render_skill_groups` 同一口径。
+                if i == 0 { s.name.clone() } else { String::new() },
+                crate::dup_state_label(d.state).to_string(),
+                d.agent_id.clone(),
+                transport_name(&s.spec.transport).to_string(),
+                truncate_width(&command_cell(&s.spec), COMMAND_WIDTH),
+                truncate_width(&d.path.display().to_string(), PATH_WIDTH),
+            ]);
+        }
     }
     blocks.push(t.render());
 
@@ -174,66 +218,68 @@ fn render_list(list: &McpList) -> String {
     }
 
     let declarations: usize = list.servers.iter().map(|s| s.declared_in.len()).sum();
-    let conflicts = if list.conflicts.is_empty() {
-        "every name means the same thing everywhere".to_string()
-    } else {
-        format!(
-            "{} declared differently in different agents",
+    // 两个数必须一起报：表里装的是**全部** server，只印「N servers」丢掉了
+    // 「一共几条声明」——那是铺平表的第一眼答案；drifted 组在行上有 STATE
+    // 标着，这里再点一句名，读者不用回头去数。
+    //
+    // drifted 按**名字**数（冲突表的口径）：同一个名字拆成两组声明时是
+    // 一个走散的名字，不是两个。
+    let mut tail = format!("from {declarations} declarations");
+    if !list.conflicts.is_empty() {
+        tail.push_str(&format!(
+            " · {} declared differently in different agents",
             plural(list.conflicts.len(), "name")
-        )
-    };
+        ));
+    }
     blocks.push(format!(
         "  {} {} {}",
         muted().apply_to("Total"),
         style(plural(list.servers.len(), "server")).bold(),
-        muted().apply_to(format!("from {declarations} declarations · {conflicts}"))
+        muted().apply_to(tail)
     ));
 
     blocks.join("\n\n")
 }
 
-/// 给交互菜单的逐条浏览:表头 + 对齐行,列与 [`render_list`] 的合并表一致
-/// (SERVER / AGENTS / TRANSPORT / COMMAND)。行文本是纯文本,宽度按
-/// [`display_width`] 算好,宽字符不顶歪;COMMAND 照旧按 [`COMMAND_WIDTH`]
-/// 截——认人靠 SERVER 列,命令只看个大概。返回的行直接喂 `browse` 原语。
+/// 给交互菜单的逐条浏览:表头 + 对齐行,列与 [`render_list`] 的铺平表一致
+/// (SERVER / STATE / AGENT / TRANSPORT / COMMAND / PATH),一行一条声明,
+/// 组名只印首行。行文本是纯文本,宽度按 [`display_width`] 算好,宽字符不
+/// 顶歪;COMMAND 照旧按 [`COMMAND_WIDTH`] 截——认人靠 SERVER 列,命令只看
+/// 个大概。PATH 列吃余量([`Table::flex_col`]),窄终端里截断给出,重定向成
+/// 文件时整条留下。返回的行直接喂 `browse` 原语。
 pub(crate) fn browse_rows(list: &McpList) -> (String, Vec<String>) {
-    const HEAD: [&str; 4] = ["SERVER", "AGENTS", "TRANSPORT", "COMMAND"];
-    let cells: Vec<[String; 4]> = list
-        .servers
-        .iter()
-        .map(|s| {
-            [
+    browse_rows_at(list, terminal_cols())
+}
+
+/// 宽度算法本体;`cols` 由测试直接给(60 / 80 / 200),不必 mock 终端。
+/// 前缀预算是 [`Prefix::Checkbox`]:统一列表流的浏览表每行画 `❯ [x] `。
+pub(crate) fn browse_rows_at(list: &McpList, cols: usize) -> (String, Vec<String>) {
+    let mut t = Table::new(vec![
+        "SERVER", "STATE", "AGENT", "TRANSPORT", "COMMAND / URL", "PATH",
+    ]);
+    // PATH 吃余量:声明路径天然就长(~/Library/Application Support/…),
+    // 不设总宽上限的话,没有人算过整行,COMMAND 截到 44 也只是把问题
+    // 挪到别处。
+    t.flex_col(5);
+    for s in &list.servers {
+        for d in &s.declared_in {
+            t.push_row(vec![
+                // 名字**每行都印**,不是只印首行。交互表会翻页,一组的几条
+                // 声明可能被切到下一页;而每一行都是可勾选的删除目标,
+                // 空名字的行既认不出属于谁、又能被选中删掉。首行留白只在
+                // 「整组恒在同屏」的打印表里成立(见 `render_list`)。
                 s.name.clone(),
-                agents_with_dialect(&s.declared_in),
+                crate::dup_state_label(d.state).to_string(),
+                d.agent_id.clone(),
                 transport_name(&s.spec.transport).to_string(),
                 truncate_width(&command_cell(&s.spec), COMMAND_WIDTH),
-            ]
-        })
-        .collect();
-    let mut w = [0usize; 4];
-    for (c, width) in w.iter_mut().enumerate() {
-        *width = cells
-            .iter()
-            .map(|r| display_width(&r[c]))
-            .chain(std::iter::once(HEAD[c].len()))
-            .max()
-            .unwrap_or(0);
+                // PATH 折 `~`:声明住在 home 下,`/Users/<你>/` 那 13 列对
+                // 用户零信息量,而这一列是最宽的那一列(与 `memory list` 同口径)。
+                duster_fs::path::display_tilde(&d.path),
+            ]);
+        }
     }
-    let line = |r: &[String; 4]| {
-        format!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}",
-            r[0],
-            r[1],
-            r[2],
-            r[3],
-            w0 = w[0],
-            w1 = w[1],
-            w2 = w[2],
-            w3 = w[3],
-        )
-    };
-    let header = line(&HEAD.map(str::to_string));
-    (header, cells.iter().map(line).collect())
+    t.rows_at(Prefix::Checkbox, cols)
 }
 
 /// 一个冲突名字的说明块。
@@ -261,12 +307,8 @@ fn conflict_block(list: &McpList, name: &str, hashes: &[String]) -> String {
             .unwrap_or_else(|| "(this declaration could not be re-read)".to_string());
         s.push_str(&format!("    {}  {who}\n", muted().apply_to(short_hash(h))));
     }
-    let (a, b) = conflict_pair(list, name);
-    s.push_str(&format!(
-        "    {} {}",
-        muted().apply_to("See what differs:"),
-        style(format!("duster mcp diff {name} --from {a} --to {b}")).green()
-    ));
+    // 不再给 diff 命令:差异本身就在上面的铺平表里(STATE=drifted 的那几行),
+    // 各家的命令 / url / 路径并排一眼可见,再指一条命令是画蛇添足。
     s
 }
 
@@ -274,22 +316,6 @@ fn group_of<'a>(list: &'a McpList, name: &str, hash: &str) -> Option<&'a MergedS
     list.servers
         .iter()
         .find(|s| s.name == name && s.content_hash == hash)
-}
-
-/// 冲突提示里那两个 agent：各取一组的第一处声明。
-///
-/// 拿不到两个（某一组的声明没能回读）就留占位符——编一个 agent 名会得到
-/// 一条跑起来必然报错的命令，比让用户自己从上面那几行里挑一个更糟。
-fn conflict_pair(list: &McpList, name: &str) -> (String, String) {
-    let mut agents = list
-        .servers
-        .iter()
-        .filter(|s| s.name == name)
-        .filter_map(|s| s.declared_in.first())
-        .map(|d| d.agent_id.clone());
-    let a = agents.next().unwrap_or_else(|| "<agent>".to_string());
-    let b = agents.next().unwrap_or_else(|| "<other-agent>".to_string());
-    (a, b)
 }
 
 /// 哈希的展示形态：前 12 位够区分，整串 64 位会把行挤爆。
@@ -379,7 +405,12 @@ const LABEL_WIDTH: usize = 14;
 /// 也没有理由在详情页上赌一次。
 const EXTRA_NOTE: &str = "present (dialect-specific fields duster does not model; not printed — they may hold credentials)";
 
-/// `show` 的人类视图：字段清单 + DECLARED IN 表。
+/// `show` 的人类视图：字段清单。
+///
+/// 只讲「这一条声明长什么样」：transport / command / args / url / env /
+/// headers 与掩码。DECLARED IN 小表已随铺平表一起撤掉——出处（agent /
+/// 方言 / 路径）现在一行一行摆在 `duster mcp list` 里，这里再印一遍
+/// 只会让两个入口各说一半的谎。
 fn render_show(s: &MergedServer) -> String {
     // 先攒成 (标签, 值)，再按本屏最长标签对齐：`env STITCH_TOKEN` 与
     // `transport` 差一倍长度，写死列宽必然有一屏是歪的。
@@ -418,24 +449,7 @@ fn render_show(s: &MergedServer) -> String {
             )
         ));
     }
-
-    let mut t = Table::new(vec!["AGENT", "DIALECT", "PATH"]);
-    t.color_col(0, accent());
-    t.color_col(2, muted());
-    for d in &s.declared_in {
-        t.push_row(vec![
-            d.agent_id.clone(),
-            d.dialect.clone(),
-            truncate_width(&d.path.display().to_string(), PATH_WIDTH),
-        ]);
-    }
-
-    format!(
-        "{}\n\n  {}\n{}",
-        fields.trim_end(),
-        style("DECLARED IN").bold(),
-        t.render()
-    )
+    fields
 }
 
 /// 字段清单：标签置灰、按最长标签左对齐，值原样。
@@ -459,32 +473,6 @@ fn render_fields(rows: &[(String, String)]) -> String {
         ));
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// diff
-// ---------------------------------------------------------------------------
-
-fn cmd_diff(mode: OutputMode, index: Option<&Path>, name: &str, from: &str, to: &str) -> i32 {
-    let d = match mcp::diff(index, name, from, to) {
-        Ok(d) => d,
-        Err(e) => return fail(mode, "mcp-diff", &e),
-    };
-    match mode {
-        OutputMode::Json => emit_json("mcp-diff", &d, &d.warnings),
-        OutputMode::Human => {
-            println!();
-            println!(
-                "  {} {}",
-                accent().bold().apply_to(name),
-                muted().apply_to("as these two agents declare it")
-            );
-            // 渲染器只有一份（顶层 `duster diff` 与这里共用）：`-`/`+`/`~`
-            // 的读法在两条命令里必须一字不差。标签与 warnings 由它自己打印。
-            crate::cmd::diff::render_diff(&d);
-        }
-    }
-    EXIT_OK
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +670,194 @@ pub(crate) fn render_sync(outcomes: &[SyncOutcome], dry_run: bool) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// rm
+// ---------------------------------------------------------------------------
+
+/// `duster mcp rm`：从指定 agent 的**自己的主配置文件**里摘掉一条声明。
+///
+/// 这是全项目最危险的写入——改的是 `~/.claude.json`、`~/.codex/config.toml`、
+/// `~/.gemini/settings.json` 这种别人家的主配置，同文件里全是用户其他设置。
+/// 所以这里走 `duster_core::mcp::remove`，它的每一道工序（schema_guard 降只读、
+/// 整文件快照、只删那一个键、删前归档）在 core 那一侧，外壳只负责把话说清。
+///
+/// 目标即同意：`--agent a` / `--all-agents` 就是那份授权，与 `uninstall` 的
+/// `--confirm` 同一个思路——删哪一家必须由用户说死，`--dry-run` 是预览。
+fn cmd_rm(
+    mode: OutputMode,
+    index: Option<&Path>,
+    name: String,
+    agent: Option<String>,
+    all_agents: bool,
+    no_archive: bool,
+    dry_run: bool,
+) -> i32 {
+    let report = match mcp::remove(&mcp::RemoveOptions {
+        index_path: index.map(Path::to_path_buf),
+        home: None,
+        archive: !no_archive,
+        dry_run,
+        name,
+        agent,
+        all_agents,
+    }) {
+        Ok(r) => r,
+        Err(e) => return fail(mode, "mcp-rm", &e),
+    };
+    match mode {
+        // `--json` 出四组共用的 DeleteReport（Contract 1）：机器可读的删除
+        // 报告只有一种形状，脚本不必为每个名词学一套。
+        OutputMode::Json => {
+            let rep = duster_core::delete::DeleteReport {
+                archived: report.archive.clone(),
+                removed: report
+                    .outcomes
+                    .iter()
+                    .filter(|o| o.action == "removed")
+                    .map(|o| PathBuf::from(&o.path))
+                    .collect(),
+                freed_bytes: report.freed_bytes,
+                warnings: report.warnings.clone(),
+            };
+            emit_json("mcp-rm", &rep, &rep.warnings)
+        }
+        OutputMode::Human => {
+            println!();
+            println!("{}", render_rm(&report, dry_run, !no_archive));
+            render_warnings(&report.warnings);
+        }
+    }
+    rm_exit(&report, dry_run)
+}
+
+/// `rm` 的退出码。
+///
+/// 预览优先：dry-run 一个字节都没写，那是「什么都没做」（4）。执行过后任何
+/// 一条目标被拒（guard 降只读、清单读不动、文件不存在）都算部分成功（3）——
+/// 用户要求的是「这条声明没了」，还有一条挂着就不算全做完。
+/// `absent`（文件里本来就没有这条声明）不算失败：那是事实陈述，不是 duster
+/// 没干成。
+fn rm_exit(report: &RemoveReport, dry_run: bool) -> i32 {
+    if dry_run {
+        return EXIT_CONFIRM_DENIED;
+    }
+    if report.outcomes.iter().any(|o| o.action == "refused") {
+        EXIT_PARTIAL
+    } else {
+        EXIT_OK
+    }
+}
+
+/// `rm` 的人类视图：一条目标一块。
+///
+/// 每块必须说清**哪个文件的哪个键**——摘键这种事，用户要能逐条核对
+/// 落点，而不是相信一句「已删除」。拒写的原因是一整句话（还带着两个
+/// 指纹），挤进表格必然被截断，所以照 `render_sync` 的块式排版。
+pub(crate) fn render_rm(report: &RemoveReport, dry_run: bool, archive: bool) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    blocks.push(format!(
+        "  {}",
+        muted().apply_to(if dry_run {
+            "Plan only — not one byte has been written."
+        } else {
+            "Removed. Each line below says what actually happened."
+        })
+    ));
+
+    for o in &report.outcomes {
+        let mut b = match o.action.as_str() {
+            // 拒写是这条命令最重要的一句话：红色 + 标记 + 大写。
+            "refused" => format!(
+                "  {} {}  {}  {}",
+                err_mark(),
+                style("REFUSED").red().bold(),
+                accent().apply_to(&o.agent_id),
+                muted().apply_to(&o.path)
+            ),
+            "absent" => format!(
+                "  {} {}  {}  {}",
+                warn_mark(),
+                style("absent").yellow(),
+                accent().apply_to(&o.agent_id),
+                muted().apply_to(&o.path)
+            ),
+            _ => format!(
+                "  {} {}  {}  {}",
+                ok_mark(),
+                style("removed").green(),
+                accent().apply_to(&o.agent_id),
+                muted().apply_to(&o.path)
+            ),
+        };
+        if !o.key.is_empty() {
+            b.push_str(&format!(
+                "\n      {} {}",
+                muted().apply_to("key removed:"),
+                o.key
+            ));
+        }
+        if let Some(e) = &o.error {
+            b.push_str(&format!("\n      {e}"));
+        }
+        match o.action.as_str() {
+            "refused" => b.push_str(&format!(
+                "\n      {}",
+                muted().apply_to("nothing was written to this file")
+            )),
+            "absent" => b.push_str(&format!(
+                "\n      {}",
+                muted().apply_to("the file already lacks this declaration; its index entry is dropped")
+            )),
+            _ if dry_run => b.push_str(&format!(
+                "\n      {}",
+                muted().apply_to("nothing written yet")
+            )),
+            _ => {}
+        }
+        blocks.push(b);
+    }
+
+    // 收尾：归档去向与释放字节。归档是摘错后的唯一退路，必须原样出现。
+    let mut footer: Vec<String> = Vec::new();
+    match (&report.archive, dry_run) {
+        (Some(p), false) => footer.push(format!(
+            "  {} {}",
+            muted().apply_to("archive of the original files:"),
+            p.display()
+        )),
+        (None, false) => footer.push(format!(
+            "  {}",
+            muted().apply_to(
+                "--no-archive: the original files were deleted without packing a copy."
+            )
+        )),
+        (_, true) if archive => footer.push(format!(
+            "  {}",
+            muted().apply_to(
+                "A real run would pack the whole config file into ~/agent-duster-exports first."
+            )
+        )),
+        (_, true) => footer.push(format!(
+            "  {}",
+            muted().apply_to(
+                "A real run would delete the key without packing a copy (--no-archive)."
+            )
+        )),
+    }
+    footer.push(format!(
+        "  {} {} {}",
+        muted().apply_to("Freed"),
+        style(human_bytes(report.freed_bytes)).bold(),
+        muted().apply_to(if dry_run {
+            "estimated"
+        } else {
+            "on disk"
+        })
+    ));
+    blocks.push(footer.join("\n"));
+    blocks.join("\n\n")
+}
+
+// ---------------------------------------------------------------------------
 // ping
 // ---------------------------------------------------------------------------
 
@@ -776,6 +952,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use duster_core::skill_ops::DupState;
+
     /// 断言一律看剥掉 ANSI 之后的文本：着色由 console 按 tty 决定，
     /// 测试要守的是措辞与结构，不是转义字节。
     fn plain(s: &str) -> String {
@@ -803,6 +981,7 @@ mod tests {
             agent_id: agent.to_string(),
             path: PathBuf::from(format!("/home/u/.{agent}/mcp.json")),
             dialect: dialect.to_string(),
+            state: DupState::Identical,
         }
     }
 
@@ -815,10 +994,10 @@ mod tests {
         }
     }
 
-    /// 合并成一行、出处带方言，且冲突块必须点名两个 agent 并给出可照抄的
-    /// diff 命令——用户读完这一屏要能立刻动手，而不是再猜一次参数。
+    /// 铺平表:一行一条声明,组名只印首行,STATE 列说清合并结论;冲突块
+    /// 点名两侧,小结同时报出组数与声明数,drifted 组在尾行点一句名。
     #[test]
-    fn list_冲突块点名两侧并给出可照抄的命令() {
+    fn list_铺平成声明行且状态与冲突块齐全() {
         let list = McpList {
             servers: vec![
                 merged(
@@ -832,12 +1011,18 @@ mod tests {
                 merged(
                     "bbbbbbbbbbbbbbbb2222",
                     stdio("echo", "echo", &["hi"], &[]),
-                    vec![decl("a1", "mcp/standard-json")],
+                    vec![Declaration {
+                        state: DupState::Drifted,
+                        ..decl("a1", "mcp/standard-json")
+                    }],
                 ),
                 merged(
                     "cccccccccccccccc3333",
                     stdio("echo", "echo", &["bye"], &[]),
-                    vec![decl("a2", "mcp/codex-toml")],
+                    vec![Declaration {
+                        state: DupState::Drifted,
+                        ..decl("a2", "mcp/codex-toml")
+                    }],
                 ),
             ],
             conflicts: BTreeMap::from([(
@@ -852,22 +1037,38 @@ mod tests {
 
         let got = plain(&render_list(&list));
 
-        // 一行一个合并组：两处相同声明的 stitch 只出现在一行里，
-        // 而那一行同时报出它的两个出处与各自方言。
-        let stitch: Vec<&str> = got
+        // 铺平:每条声明一行。stitch 两组声明 → 两行;SERVER 列只在首行
+        // 出现,第二行以空列开头(COMMAND 里的 `@stitch/mcp` 不算组名)。
+        let stitch: Vec<&str> = got.lines().filter(|l| l.contains("stitch")).collect();
+        assert_eq!(stitch.len(), 2, "两条声明应当占两行:\n{got}");
+        // 表行带两格缩进,所以按 trim 后的行首认 SERVER 列。
+        let stitch_names: Vec<&str> = got
             .lines()
-            .filter(|l| l.contains("stitch") && !l.contains("duster mcp"))
+            .filter(|l| l.trim_start().starts_with("stitch"))
             .collect();
-        assert_eq!(stitch.len(), 1, "合并组必须只占一行:\n{got}");
+        assert_eq!(stitch_names.len(), 1, "组名只印在首行:\n{got}");
+        // 两处声明等价 → 每行 STATE 都是 identical。
         assert!(
-            stitch[0].contains("claude-code (mcp/standard-json), codex (mcp/codex-toml)"),
-            "AGENTS 列要带方言:\n{got}"
+            stitch.iter().all(|l| l.contains("identical")),
+            "等价组每行都标 identical:\n{got}"
         );
-        assert!(stitch[0].contains("stdio"), "{got}");
+        assert!(stitch[0].contains("claude-code"), "{got}");
+        // 方言不单列一列(铺平表按任务口径:AGENT / TRANSPORT / COMMAND / PATH
+        // 足够认人,方言跟着 PATH 走),但冲突块里它随声明一起报出来。
+        assert!(stitch[1].contains("codex"), "{got}");
         assert!(stitch[0].contains("npx -y @stitch/mcp"), "{got}");
 
-        // 冲突块:说清"同名不同义",两组各自的哈希与归属都在,
-        // 并给出一条能直接粘贴的命令。
+        // 走散组:两行声明都标 drifted。同名不同内容的两组各占一块,组名在
+        // 各自的首行各印一次(冲突块的 `conflict echo` 是块标题,不算)。
+        assert_eq!(got.matches("drifted").count(), 2, "走散组每行都标 drifted:\n{got}");
+        let echo_names: Vec<&str> = got
+            .lines()
+            .filter(|l| l.trim_start().starts_with("echo"))
+            .collect();
+        assert_eq!(echo_names.len(), 2, "同名两组的组名各印一次:\n{got}");
+
+        // 冲突块:说清"同名不同义",两组各自的哈希与归属都在;不再给
+        // diff 命令——差异就在上面的铺平表里。
         assert!(got.contains("conflict"), "{got}");
         assert!(
             got.contains("`echo` does not mean the same thing in every agent"),
@@ -878,10 +1079,7 @@ mod tests {
             "{got}"
         );
         assert!(got.contains("cccccccccccc…  a2 (mcp/codex-toml)"), "{got}");
-        assert!(
-            got.contains("duster mcp diff echo --from a1 --to a2"),
-            "冲突提示必须给出两侧都填好的 diff 命令:\n{got}"
-        );
+        assert!(!got.contains("mcp diff"), "diff 命令已随 mcp diff 删除:\n{got}");
 
         // 小结:3 组、4 处声明、1 个名字走散。
         assert!(got.contains("Total 3 servers"), "{got}");
@@ -898,6 +1096,74 @@ mod tests {
             warnings: vec![],
         };
         assert!(plain(&render_list(&empty)).contains("No MCP server is indexed"));
+    }
+
+    /// 单家声明 → 只有一行,STATE 是 only copy。
+    #[test]
+    fn list_单家声明标_only_copy() {
+        let list = McpList {
+            servers: vec![merged(
+                "dddddddddddddddd4444",
+                stdio("solo", "echo", &["hi"], &[]),
+                vec![Declaration {
+                    state: DupState::Single,
+                    ..decl("a1", "mcp/standard-json")
+                }],
+            )],
+            conflicts: BTreeMap::new(),
+            warnings: vec![],
+        };
+        let got = plain(&render_list(&list));
+        assert!(got.contains("only copy"), "{got}");
+        assert!(!got.contains("identical"), "{got}");
+        assert_eq!(got.matches("solo").count(), 1, "组名只印一次:\n{got}");
+        // 没有走散组时尾行不带 drifted 提醒。
+        assert!(!got.contains("declared differently"), "{got}");
+    }
+
+    /// 铺平后的浏览表每一行(含表头)加上控件前缀 `❯ [x] `(6 列)后,显示
+    /// 宽度必须严格小于终端宽度——行宽碰到终端宽就会折成两个物理行,而控件
+    /// 按逻辑行计数、`clear_last_lines` 按物理行擦,残影每按一次翻一倍。
+    /// 数据把 COMMAND / PATH 两列顶满(PATH 是 flex 列),60 列档恰好把它
+    /// 逼到地板。
+    #[test]
+    fn browse_rows_行宽不超终端() {
+        let long = "~/Library/Application Support/Claude/claude_desktop_config.json";
+        let decl_at = |agent: &str, path: &str| Declaration {
+            path: PathBuf::from(path),
+            ..decl(agent, "mcp/standard-json")
+        };
+        let list = McpList {
+            servers: vec![
+                merged(
+                    "aaaaaaaaaaaaaaaa1111",
+                    stdio(
+                        "stitch",
+                        "npx",
+                        &["-y", "@stitch/mcp", "--with-a-very-long-flag"],
+                        &[],
+                    ),
+                    vec![decl_at("claude-code", long), decl_at("codex", long)],
+                ),
+                merged(
+                    "bbbbbbbbbbbbbbbb2222",
+                    stdio("echo", "echo", &["hi"], &[]),
+                    vec![decl_at("a1", long)],
+                ),
+            ],
+            conflicts: BTreeMap::new(),
+            warnings: vec![],
+        };
+        for cols in [60usize, 80, 200] {
+            let (header, lines) = browse_rows_at(&list, cols);
+            for line in std::iter::once(&header).chain(lines.iter()) {
+                let w = Prefix::Checkbox.width() + display_width(line);
+                assert!(
+                    w < cols,
+                    "{cols} 列终端:行宽 {w} 超限: {line}"
+                );
+            }
+        }
     }
 
     /// `show` 的硬约束：env 与 headers 的原文一个字都不许上屏。
@@ -938,10 +1204,11 @@ mod tests {
         // 非秘密字段照常展示。
         assert!(got.contains("npx"), "{got}");
         assert!(got.contains("-y @stitch/mcp"), "{got}");
-        // 出处表在,方言与路径都在。
-        assert!(got.contains("DECLARED IN"), "{got}");
-        assert!(got.contains("claude-code"), "{got}");
-        assert!(got.contains("mcp/standard-json"), "{got}");
+        // 出处(agent / 方言 / 路径)已随铺平表撤下:详情只讲这一条声明
+        // 长什么样,不在两个入口各说一半的谎。
+        assert!(!got.contains("DECLARED IN"), "{got}");
+        assert!(!got.contains("claude-code"), "{got}");
+        assert!(!got.contains("mcp/standard-json"), "{got}");
     }
 
     // ---------------------- sync 的 dry-run ----------------------
@@ -1081,5 +1348,98 @@ mapper = "mcp/standard-json"
         assert!(shown.contains("skipped"), "{shown}");
         assert!(shown.contains("not selected"), "{shown}");
         assert!(!shown.contains("✔"), "skipped 不该带成功标记: {shown}");
+    }
+
+    // ---------------------- rm ----------------------
+
+    fn rm_outcome(action: &str, key: &str, error: Option<&str>) -> duster_core::mcp::RemoveOutcome {
+        duster_core::mcp::RemoveOutcome {
+            agent_id: "codex".to_string(),
+            path: "/home/u/.codex/config.toml".to_string(),
+            key: key.to_string(),
+            action: action.to_string(),
+            error: error.map(|s| s.to_string()),
+            freed: 128,
+        }
+    }
+
+    fn rm_report(outcomes: Vec<duster_core::mcp::RemoveOutcome>) -> RemoveReport {
+        RemoveReport {
+            freed_bytes: outcomes.iter().map(|o| o.freed).sum(),
+            outcomes,
+            archive: Some(PathBuf::from("/home/u/agent-duster-exports/mcp-rm-stitch-codex-20260814-090000.tar.zst")),
+            warnings: vec![],
+        }
+    }
+
+    /// 退出码三档：dry-run 什么都没做（4）；执行后有任何一条被拒算部分成功（3）；
+    /// absent 不是失败——那是「本来就没有」的事实陈述。
+    #[test]
+    fn rm_exit_三档退出码() {
+        assert_eq!(
+            rm_exit(&rm_report(vec![rm_outcome("removed", "/mcpServers/stitch", None)]), true),
+            EXIT_CONFIRM_DENIED,
+            "dry-run 一个字节没写,按「什么都没做」落 4"
+        );
+
+        let ok = rm_report(vec![
+            rm_outcome("removed", "/mcpServers/stitch", None),
+            rm_outcome("absent", "", None),
+        ]);
+        assert_eq!(rm_exit(&ok, false), EXIT_OK, "absent 不是失败");
+
+        let partial = rm_report(vec![
+            rm_outcome("removed", "/mcpServers/stitch", None),
+            rm_outcome(
+                "refused",
+                "",
+                Some("structure changed (fingerprint aaa -> bbb)"),
+            ),
+        ]);
+        assert_eq!(rm_exit(&partial, false), EXIT_PARTIAL);
+    }
+
+    /// 人类视图必须说清「哪个文件的哪个键会没」：每块带 agent、路径、键，
+    /// dry-run 加「一个字节没写」的明说，收尾给归档去向与释放字节。
+    #[test]
+    fn render_rm_报出文件_键_归档与释放字节() {
+        let dry = rm_report(vec![rm_outcome("removed", "mcp_servers.stitch", None)]);
+        let shown = plain(&render_rm(&dry, true, true));
+        assert!(shown.contains("not one byte has been written"), "{shown}");
+        assert!(shown.contains("removed"), "{shown}");
+        assert!(shown.contains("codex"), "{shown}");
+        assert!(shown.contains(".codex/config.toml"), "{shown}");
+        assert!(shown.contains("mcp_servers.stitch"), "必须说出哪个键会没: {shown}");
+        assert!(shown.contains("nothing written yet"), "{shown}");
+        assert!(shown.contains("A real run would pack the whole config file"), "{shown}");
+        assert!(shown.contains("128 B"), "释放字节要出现: {shown}");
+
+        // 拒写：REFUSED 红块 + 指纹 + 「没写」的明说。
+        let refused = rm_report(vec![rm_outcome(
+            "refused",
+            "",
+            Some("structure changed (fingerprint aaa -> bbb)"),
+        )]);
+        let shown = plain(&render_rm(&refused, false, true));
+        assert!(shown.contains("REFUSED"), "{shown}");
+        assert!(shown.contains("fingerprint aaa -> bbb"), "{shown}");
+        assert!(shown.contains("nothing was written to this file"), "{shown}");
+        assert!(
+            shown.contains("archive of the original files:"),
+            "归档去向必须出现: {shown}"
+        );
+
+        // --no-archive 执行后：说清没打包。报告里 archive 恒为 None——
+        // 渲染器按报告说话，旗标只影响 dry-run 那一句。
+        let no_archive = RemoveReport {
+            archive: None,
+            ..rm_report(vec![rm_outcome("removed", "/mcpServers/stitch", None)])
+        };
+        let shown = plain(&render_rm(&no_archive, false, false));
+        assert!(
+            shown.contains("deleted without packing a copy"),
+            "--no-archive 要明说: {shown}"
+        );
+        assert!(!shown.contains("archive of the original files"), "{shown}");
     }
 }

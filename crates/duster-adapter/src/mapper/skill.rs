@@ -66,6 +66,13 @@ pub fn parse_skill_md(skill_root: &Path) -> anyhow::Result<SkillMeta> {
 /// 遍历 `dir` 的一级子目录，含 SKILL.md 的都算 skill。
 ///
 /// `dir` 不存在视为空（很多 agent 根本没装过 skill），结果按 name 排序保证稳定。
+///
+/// **悬空软链也会产出**：条目本身是软链但目标 resolve 失败时，没有 SKILL.md
+/// 可读（frontmatter 无从谈起），按目录项名产出一条字段全空的占位元数据。
+/// 为什么索引一个"目标已不存在"的 skill——它是 claude 启动时当真会去加载
+/// 却失败的一项，用户必须能在 `skill list` 里看见它（status 体检已删，
+/// 那里是唯一出口）；"坏没坏"由 `skill_ops::list` 当场看文件系统判定，
+/// 索引里只负责保证这一行存在。
 pub fn discover_skills(dir: &Path) -> anyhow::Result<Vec<SkillMeta>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -77,8 +84,30 @@ pub fn discover_skills(dir: &Path) -> anyhow::Result<Vec<SkillMeta>> {
     for entry in entries {
         let entry = entry.with_context(|| format!("failed to traverse {}", dir.display()))?;
         let path = entry.path();
+        // 真目录与有效软链走同一条判定：is_dir()/is_file() 跟随软链，
+        // 「目标目录里有 SKILL.md」才算 skill。行为与旧版一字不差
+        // （docx/pdf 那些有效链继续正常报 linked）。
         if path.is_dir() && path.join("SKILL.md").is_file() {
             skills.push(parse_skill_md(&path)?);
+            continue;
+        }
+        // 悬空软链：is_dir() 跟随失败，上面的判定恒 false，旧版被静默丢弃。
+        // file_type() 是 symlink_metadata 语义（不跟随）；metadata() 跟随，
+        // 报错即目标 resolve 不了——正是「claude 加载它必然失败」的那一种。
+        // 其余条目（无 SKILL.md 的真目录、普通文件、有效软链指向文件等）
+        // 照旧跳过。
+        if entry.file_type().is_ok_and(|ft| ft.is_symlink())
+            && std::fs::metadata(&path).is_err()
+        {
+            skills.push(SkillMeta {
+                // 读不到 SKILL.md，没有 frontmatter 可解，目录项名是唯一
+                // 诚实的名字；其余字段给空值（description 空 / None）。
+                name: entry.file_name().to_string_lossy().into_owned(),
+                description: None,
+                root: path,
+                tree_hash: None,
+                extra: None,
+            });
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -220,5 +249,44 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// 真目录 skill、指向有效目录的软链 skill、悬空软链 skill 三者都要返回。
+    ///
+    /// 悬空软链没有 SKILL.md 可读(目标都没了),按**目录项名**产出占位
+    /// 元数据——`skill list` 靠这一行把状态判成 broken,没有这一行用户
+    /// 永远看不见它。
+    #[test]
+    fn discover_keeps_dangling_symlinks_with_dir_name() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+
+        // 1. 真目录 skill。
+        make_skill(&skills, "a-real", "---\nname: a-real\n---\n");
+        // 2. 指向有效目录的软链 skill(目标在 skills 之外)。
+        let target = tmp.path().join("target-skill");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("SKILL.md"), "---\nname: b-linked\n---\n").unwrap();
+        symlink(&target, skills.join("b-linked")).unwrap();
+        // 3. 悬空软链:目标从未存在。
+        symlink(tmp.path().join("gone"), skills.join("z-broken")).unwrap();
+
+        let found = discover_skills(&skills).unwrap();
+        let names: Vec<_> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a-real", "b-linked", "z-broken"]);
+
+        // 真目录与有效软链照旧解析出 frontmatter。
+        assert_eq!(found[0].root, skills.join("a-real"));
+        assert_eq!(found[1].description, None);
+        // 悬空那个:名字 = 目录项名,root = 软链自身,其余字段诚实为空。
+        let broken = &found[2];
+        assert_eq!(broken.name, "z-broken");
+        assert_eq!(broken.root, skills.join("z-broken"));
+        assert!(broken.description.is_none());
+        assert!(broken.tree_hash.is_none());
+        assert!(broken.extra.is_none());
     }
 }

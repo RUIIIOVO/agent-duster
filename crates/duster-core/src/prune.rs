@@ -587,6 +587,7 @@ mod tests {
             clean_level: None,
             reclaimable: None,
             install_bytes: None,
+            mapper: None,
         }
     }
 

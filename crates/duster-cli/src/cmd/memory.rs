@@ -1,7 +1,8 @@
-//! `duster memory list/show`：把各家的「记忆」摆成一张表，再读其中一条。
+//! `duster memory list/show/migrate`：把各家的「记忆」摆成一张表、读其中
+//! 一条，或把一条的文本复制进另一个 agent 的记忆文件（哨兵块）。
 //!
-//! 引擎在 `duster_core::memory`（**只读**视图；合并与投影导出排 M3）。
-//! 这里只做外壳：过滤、排版、把 key 递回去。
+//! 引擎在 `duster_core::memory`（list/show 只读；migrate 只写哨兵块，
+//! 合并与投影导出排 M3）。这里只做外壳：过滤、排版、把 key 递回去。
 //!
 //! # key 就是 PATH 列;TTY 上截断,重定向不截
 //!
@@ -29,11 +30,13 @@ use std::path::Path;
 use clap::Subcommand;
 use console::style;
 
-use duster_core::memory::{self, MemoryEntry, MemoryStore};
+use duster_core::memory::{
+    self, MemoryEntry, MemoryStore, MigrateAction, MigrateReport, RemoveKind, RemoveReport,
+};
 
 use crate::output::{
-    EXIT_OK, EXIT_PARTIAL, OutputMode, Table, accent, display_width, emit_json, human_bytes, muted,
-    truncate_width,
+    EXIT_CONFIRM_DENIED, EXIT_OK, EXIT_PARTIAL, OutputMode, Table, accent, display_width,
+    emit_json, human_bytes, muted, truncate_width,
 };
 use crate::{fail, render_warnings};
 
@@ -51,12 +54,62 @@ pub enum MemoryCmd {
         #[arg(value_name = "KEY")]
         key: String,
     },
+    /// Copy one memory into another agent's memory file, wrapped in a marked block
+    Migrate {
+        /// Source agent id, e.g. --from claude-code
+        #[arg(long, value_name = "AGENT")]
+        from: String,
+        /// Target agent id, e.g. --to codex
+        #[arg(long, value_name = "AGENT")]
+        to: String,
+        /// Which memory to copy when the source agent keeps several
+        /// (the PATH column of `duster memory list`)
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+        /// Print the block that would be written without touching anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete a memory: cut one duster block, delete a duster-created file,
+    /// or delete a whole file you wrote yourself
+    Rm {
+        /// Key exactly as `duster memory list` prints it
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Cut the block migrated from this agent (e.g. --from codex)
+        #[arg(long, value_name = "AGENT")]
+        from: Option<String>,
+        /// Delete the whole file instead of cutting a block (two confirmations
+        /// in the menu; the file is archived first)
+        #[arg(long)]
+        whole_file: bool,
+        /// Delete without packing an archive first. Refused for files you
+        /// wrote yourself — duster never deletes those without a way back.
+        #[arg(long)]
+        no_archive: bool,
+        /// Show what would be deleted without touching anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn run(mode: OutputMode, index: Option<&Path>, action: &MemoryCmd) -> i32 {
     match action {
         MemoryCmd::List { agents } => list(mode, index, agents),
         MemoryCmd::Show { key } => show(mode, index, key),
+        MemoryCmd::Migrate {
+            from,
+            to,
+            key,
+            dry_run,
+        } => migrate(mode, index, from, to, key.as_deref(), *dry_run),
+        MemoryCmd::Rm {
+            key,
+            from,
+            whole_file,
+            no_archive,
+            dry_run,
+        } => rm(mode, index, key, from.as_deref(), *whole_file, *no_archive, *dry_run),
     }
 }
 
@@ -258,8 +311,10 @@ pub(crate) fn browse_rows(entries: &[&MemoryEntry]) -> (String, Vec<String>, Vec
             .max()
             .unwrap_or(0);
     }
-    // 缩进两格 + 五列间各两空格 + 尾部留一列,余下的全给 PATH。
-    let fixed: usize = 2 + w.iter().sum::<usize>() + 2 * 5 + 1;
+    // 控件前缀(`❯ [x] `,浏览表带勾选)+ 五列间各两空格 + 尾部留一列,
+    // 余下的全给 PATH。
+    let fixed: usize =
+        crate::output::Prefix::Checkbox.width() + w.iter().sum::<usize>() + 2 * 5 + 1;
     let path_w = terminal_cols().saturating_sub(fixed).max(16);
     let line = |r: &[String; 6]| {
         format!(
@@ -324,6 +379,267 @@ fn ensure_newline(body: &str) -> String {
         body.to_string()
     } else {
         format!("{body}\n")
+    }
+}
+
+/// 把 `--from <agent> [--key]` 解析成唯一的源 key，再执行迁移。
+///
+/// 解析要一张列表打底，所以先跑 `memory::list`；真正的归属判定在 core
+/// （哨兵块的 from= 是索引反查的结果），这里的校验只为把错误提早说清。
+fn migrate(
+    mode: OutputMode,
+    index: Option<&Path>,
+    from: &str,
+    to: &str,
+    key: Option<&str>,
+    dry_run: bool,
+) -> i32 {
+    let all = match memory::list(index, None) {
+        Ok(l) => l,
+        Err(e) => return fail(mode, "memory-migrate", &e),
+    };
+    let expanded = key.map(expand_home);
+    let key = match resolve_source(&all.entries, from, expanded.as_deref()) {
+        Ok(k) => k,
+        Err(msg) => return fail(mode, "memory-migrate", &anyhow::anyhow!(msg)),
+    };
+    migrate_execute(mode, index, &key, to, dry_run)
+}
+
+/// 从 `--from <agent> [--key <k>]` 定出唯一的源 key。
+///
+/// 恰好一条时 `--key` 可省；多条必须点名，候选直接列进错误里——一句
+/// 光秃秃的「请加 --key」等于把用户赶回去再跑一遍 list。`--key` 顺手做
+/// 归属校验：拿别家的 key 配 `--from`，报出来的是「不是 <from> 的记忆」，
+/// 而不是迁完才发现哨兵里的 from= 不是想要的那个。
+fn resolve_source(
+    entries: &[MemoryEntry],
+    from: &str,
+    key: Option<&str>,
+) -> Result<String, String> {
+    let mine: Vec<&MemoryEntry> = entries.iter().filter(|e| e.agent_id == from).collect();
+    if mine.is_empty() {
+        // agent 拼错和 agent 没记忆在这张列表上分不出来（list 只有有记忆
+        // 的 agent）；把有记忆的列出来，两种情况都够用户自查。
+        let mut who: Vec<&str> = entries.iter().map(|e| e.agent_id.as_str()).collect();
+        who.sort_unstable();
+        who.dedup();
+        return Err(if who.is_empty() {
+            format!("{from} has no migratable memory (no agent has any)")
+        } else {
+            format!(
+                "{from} has no migratable memory. Agents that do: {}",
+                who.join(", ")
+            )
+        });
+    }
+    let keys = || {
+        mine.iter()
+            .map(|e| format!("  {}", fold_home(&e.path.display().to_string())))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match key {
+        None if mine.len() == 1 => Ok(mine[0].path.display().to_string()),
+        None => Err(format!(
+            "{from} keeps {} memories; pick one with --key:\n{}",
+            mine.len(),
+            keys()
+        )),
+        Some(k) => mine
+            .iter()
+            .find(|e| e.path.display().to_string() == k)
+            .map(|e| e.path.display().to_string())
+            .ok_or_else(|| {
+                format!("--key does not match any {from} memory. Its keys:\n{}", keys())
+            }),
+    }
+}
+
+/// 执行迁移并渲染报告。交互菜单选完目标后也走这里：同一份报告只有
+/// 一种长相。dry-run 与 clean/prune 的仅预览同一档退出码（4）。
+pub(crate) fn migrate_execute(
+    mode: OutputMode,
+    index: Option<&Path>,
+    key: &str,
+    to: &str,
+    dry_run: bool,
+) -> i32 {
+    let report = match memory::migrate(index, None, key, to, dry_run) {
+        Ok(r) => r,
+        Err(e) => {
+            let e = if is_unknown_key(&e) {
+                with_suggestions(index, key, e)
+            } else {
+                e
+            };
+            return fail(mode, "memory-migrate", &e);
+        }
+    };
+    let warnings: Vec<String> = report.refresh_hint.clone().into_iter().collect();
+    match mode {
+        OutputMode::Json => emit_json("memory-migrate", &report, &warnings),
+        OutputMode::Human => {
+            render_migrate(&report);
+            render_warnings(&warnings);
+        }
+    }
+    if report.dry_run {
+        EXIT_CONFIRM_DENIED
+    } else if warnings.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_PARTIAL
+    }
+}
+
+/// 迁移报告的人话。dry-run 把将写入的块原样落 stdout——它就是结果本身，
+/// 加缩进会让「复制出来自己贴」不再成立。
+fn render_migrate(r: &MigrateReport) {
+    let target = fold_home(&r.target.display().to_string());
+    if r.dry_run {
+        let verb = match r.action {
+            MigrateAction::Replaced => format!("replace the from={} block in", r.from_agent),
+            MigrateAction::Appended => "append to".to_string(),
+            MigrateAction::Created => "create".to_string(),
+        };
+        println!("Would {verb} {target}:");
+        println!();
+        print!("{}", r.block);
+        return;
+    }
+    println!(
+        "Migrated {} ({}) -> {} [{}]",
+        fold_home(&r.source),
+        r.from_agent,
+        accent().apply_to(target),
+        r.action.as_str()
+    );
+}
+
+/// 执行 `duster memory rm` 并渲染报告。交互菜单的删除动作也走这里：
+/// 同一份报告只有一种长相。dry-run 与 clean/prune 的仅预览同一档退出码（4）。
+pub(crate) fn rm_execute(
+    mode: OutputMode,
+    index: Option<&Path>,
+    key: &str,
+    from: Option<&str>,
+    whole_file: bool,
+    archive: bool,
+    dry_run: bool,
+) -> i32 {
+    let report = match memory::remove(index, None, key, from, whole_file, archive, dry_run) {
+        Ok(r) => r,
+        Err(e) => {
+            let e = if is_unknown_key(&e) {
+                with_suggestions(index, key, e)
+            } else {
+                e
+            };
+            return fail(mode, "memory-rm", &e);
+        }
+    };
+    let warnings = report.warnings.clone();
+    match mode {
+        OutputMode::Json => emit_json("memory-rm", &report, &warnings),
+        OutputMode::Human => {
+            render_remove(&report);
+            render_warnings(&warnings);
+        }
+    }
+    if report.dry_run {
+        EXIT_CONFIRM_DENIED
+    } else if warnings.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_PARTIAL
+    }
+}
+
+/// `rm` 命令入口：key 折叠展开后直接执行。命令本身没有交互确认——
+/// 敲下这条命令就是确认；两道 y/N 的门在菜单里（见 interactive.rs）。
+fn rm(
+    mode: OutputMode,
+    index: Option<&Path>,
+    key: &str,
+    from: Option<&str>,
+    whole_file: bool,
+    no_archive: bool,
+    dry_run: bool,
+) -> i32 {
+    let expanded = expand_home(key);
+    rm_execute(mode, index, &expanded, from, whole_file, !no_archive, dry_run)
+}
+
+/// 删除报告的人话。三类目标各说各的：切块亮出 from= 与块所在文件，
+/// 整删亮出被删的文件；归档包单独一行报出来（dry-run 报"将归档到哪"）。
+pub(crate) fn render_remove(r: &RemoveReport) {
+    render_remove_line(r);
+    render_remove_archive(r);
+}
+
+/// 每份报告那一行：删了什么、释放了多少。
+pub(crate) fn render_remove_line(r: &RemoveReport) {
+    let verb = if r.dry_run { "Would delete" } else { "Deleted" };
+    let where_ = if r.removed.is_empty() {
+        r.modified.first().cloned().unwrap_or_default()
+    } else {
+        r.removed[0].clone()
+    };
+    let shown = fold_home(&where_.display().to_string());
+    match r.kind {
+        RemoveKind::DusterBlock => {
+            let from = r.from_agent.as_deref().unwrap_or("?");
+            println!(
+                "{} the from={} duster block in {} ({} freed)",
+                verb,
+                from,
+                accent().apply_to(shown),
+                human_bytes(r.freed_bytes),
+            );
+        }
+        RemoveKind::DusterFile => {
+            println!(
+                "{} the duster-created memory file {} ({} freed)",
+                verb,
+                accent().apply_to(shown),
+                human_bytes(r.freed_bytes),
+            );
+        }
+        RemoveKind::UserFile => {
+            println!(
+                "{} your memory file {} ({} freed)",
+                verb,
+                accent().apply_to(shown),
+                human_bytes(r.freed_bytes),
+            );
+        }
+    }
+}
+
+/// 归档那一行：真跑了报实际落点，dry-run 报"将归档到哪"（没落盘，但
+/// 用户该知道真跑时会去哪）。
+fn render_remove_archive(r: &RemoveReport) {
+    match &r.archived {
+        Some(a) => println!(
+            "  {}",
+            muted().apply_to(format!(
+                "archived to {}",
+                fold_home(&a.display().to_string())
+            ))
+        ),
+        None if r.dry_run => {
+            if let Ok(dest) = memory::remove_archive_dest(None) {
+                println!(
+                    "  {}",
+                    muted().apply_to(format!(
+                        "would archive to {}",
+                        fold_home(&dest.display().to_string())
+                    ))
+                );
+            }
+        }
+        None => {}
     }
 }
 
@@ -560,5 +876,55 @@ mod tests {
         assert_eq!(plural_memories(1), "1 memory");
         assert_eq!(plural_memories(0), "0 memories");
         assert_eq!(plural_memories(12), "12 memories");
+    }
+
+    /// `--from` 只有一条记忆时 `--key` 可省；多条时错误里列全候选。
+    #[test]
+    fn migrate_源解析_单条免_key_多条点名() {
+        let entries = vec![
+            entry("claude-code", "/h/.claude/CLAUDE.md"),
+            entry("qoder", "/h/.qoder/memories/a.md"),
+            entry("qoder", "/h/.qoder/memories/b.md"),
+        ];
+        assert_eq!(
+            resolve_source(&entries, "claude-code", None).unwrap(),
+            "/h/.claude/CLAUDE.md"
+        );
+        let err = resolve_source(&entries, "qoder", None).unwrap_err();
+        assert!(err.contains("pick one with --key"), "{err}");
+        assert!(err.contains("a.md") && err.contains("b.md"), "{err}");
+        assert_eq!(
+            resolve_source(&entries, "qoder", Some("/h/.qoder/memories/b.md")).unwrap(),
+            "/h/.qoder/memories/b.md"
+        );
+    }
+
+    /// 拿别家的 key 配 `--from` 要被拦下（归属校验）；没记忆的 agent
+    /// 报错里列出真有记忆的那些。
+    #[test]
+    fn migrate_源解析_归属与存在性都要对() {
+        let entries = vec![
+            entry("claude-code", "/h/.claude/CLAUDE.md"),
+            entry("codex", "/h/.codex/AGENTS.md"),
+        ];
+        let err = resolve_source(&entries, "codex", Some("/h/.claude/CLAUDE.md")).unwrap_err();
+        assert!(err.contains("does not match any codex memory"), "{err}");
+        let err = resolve_source(&entries, "gemini-cli", None).unwrap_err();
+        assert!(err.contains("gemini-cli has no migratable memory"), "{err}");
+        assert!(err.contains("claude-code") && err.contains("codex"), "{err}");
+    }
+
+    /// resolve_source 的夹具行：只有归属和 key 参与判定，其余字段填零值。
+    fn entry(agent: &str, path: &str) -> MemoryEntry {
+        MemoryEntry {
+            agent_id: agent.to_string(),
+            project: None,
+            title: path.to_string(),
+            category: None,
+            store: MemoryStore::Markdown,
+            path: std::path::PathBuf::from(path),
+            bytes: 0,
+            mtime_ms: 0,
+        }
     }
 }

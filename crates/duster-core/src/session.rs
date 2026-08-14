@@ -33,6 +33,8 @@
 //!
 //! 第 2 条不是可选的优化：少了它，`prune` 就成了变相删除。
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,8 +42,12 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use duster_index::db::Index;
-use duster_index::query::{self, ResourceFilter, TurnRow};
+use duster_index::foreign;
+use duster_index::query::{self, ResourceFilter, ResourceRecord, TurnRow};
 use duster_model::TurnBody;
+
+use crate::delete::{self, DeleteOptions, DeleteReport};
+use crate::freshness;
 
 /// 列表里的一行。
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +124,15 @@ const UNKNOWN: &str = "unknown";
 // list
 // ---------------------------------------------------------------------------
 
+/// 列表结果：行 + 一路攒下的 warnings。
+#[derive(Debug, Default)]
+pub struct SessionList {
+    pub rows: Vec<SessionRow>,
+    /// 打不开的**源库**（opencode.db / history.db 这类）在这里明说，
+    /// 不许静默跳过。列表照常展示能读的，退出码由调用方按它抬档。
+    pub warnings: Vec<String>,
+}
+
 /// 列出会话。读索引 + `turn` 表聚合。
 ///
 /// 唯一碰源文件的地方是 cwd：会话的工作目录只存在于**内容**里，索引没有这一列
@@ -125,9 +140,13 @@ const UNKNOWN: &str = "unknown";
 /// 而这个字段会被用户拿去 `--project` 过滤）。所以每行会回读**第一条轮次**
 /// 那一小段字节去找 `cwd`，找不到就留 None——**绝不猜**。
 ///
+/// 库型会话（正文住在 agent 的 SQLite 库里，`byte_len == 0` 哨兵）没有 cwd 可
+/// 还原，但它们的源库打不开是**环境事实**，列表不该静默带过——逐库只读探一次，
+/// 打不开的进 [`SessionList::warnings`]（见 [`probe_db_sources`]）。
+///
 /// 顺序：最后使用时间倒序，时间相同再按 `(agent_id, key)`。同一份库跑两次
 /// 逐字节一致，`--json` 的输出才能进 diff。
-pub fn list(index_path: Option<&Path>, filter: &SessionFilter) -> Result<Vec<SessionRow>> {
+pub fn list(index_path: Option<&Path>, filter: &SessionFilter) -> Result<SessionList> {
     let idx = open_index(index_path)?;
     let conn = idx.conn();
     let now = filter.now_ms.unwrap_or_else(system_now_ms);
@@ -175,11 +194,24 @@ pub fn list(index_path: Option<&Path>, filter: &SessionFilter) -> Result<Vec<Ses
             .then_with(|| a.key.cmp(&b.key))
     });
 
+    // 库型会话的源库 → 归属 agent。一个库装几百场会话，按路径去重、探一次
+    // 就够；BTreeMap 顺便让 warnings 的输出顺序可复现（排序稳定可 diff）。
+    let mut db_sources: BTreeMap<String, String> = BTreeMap::new();
     for row in &mut rows {
         if let Some(first) = query::first_turn(conn, row.rid)? {
-            row.cwd = recover_cwd(&row.path, &first);
+            if first.byte_len == 0 {
+                // 库型会话：cwd 在库里的 session 行上，索引不存这一列，取不到；
+                // 但源库读不读得动要探，探不动就进 warnings。
+                db_sources
+                    .entry(row.path.clone())
+                    .or_insert_with(|| row.agent_id.clone());
+            } else {
+                row.cwd = recover_cwd(&row.path, &first);
+            }
         }
     }
+    let warnings = probe_db_sources(&db_sources);
+
     if let Some(project) = &filter.project {
         // cwd 取不到的会话在项目过滤下会消失：不知道它属于哪个项目，
         // 就不能声称它属于这一个。宁可漏，不可错报。
@@ -192,7 +224,28 @@ pub fn list(index_path: Option<&Path>, filter: &SessionFilter) -> Result<Vec<Ses
     if filter.limit > 0 {
         rows.truncate(filter.limit);
     }
-    Ok(rows)
+    Ok(SessionList { rows, warnings })
+}
+
+/// 库型会话的源库逐个只读探一次。
+///
+/// `foreign::open` 的口径是「打不开不是错误，是这一项读不到」（被独占、
+/// 加密、损坏——`Ok(None)`/`Err` 都是），与 memory 那边同一个语义。能读的
+/// 静默；打不开的进 warnings，格式 `<agent>: cannot read <path>: <err>`，
+/// 好让用户知道「谁的会话读不出来了」。列表本身不因此失败——正文要等
+/// `show` 才回读，这一趟的差事只是把环境事实摆出来。
+fn probe_db_sources(sources: &BTreeMap<String, String>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (path, agent) in sources {
+        match foreign::open(Path::new(path)) {
+            Ok(Some(_)) => {}
+            Ok(None) => warnings.push(format!(
+                "{agent}: cannot read {path}: not readable (locked, encrypted, or damaged)"
+            )),
+            Err(e) => warnings.push(format!("{agent}: cannot read {path}: {e:#}")),
+        }
+    }
+    warnings
 }
 
 // ---------------------------------------------------------------------------
@@ -228,9 +281,9 @@ pub fn show(index_path: Option<&Path>, rid: i64) -> Result<SessionDetail> {
     for t in &turn_rows {
         let body = read_turn_body(&rec.agent_id, &rec.path, t).with_context(|| {
             format!(
-                "failed to read back turn {} of session {} from {} (the source may have been \
-                 deleted, truncated, or rewritten; the index is derived data — rerun \
-                 `duster scan` to repair)",
+                "failed to read back turn {} of session {} from {} (the source was \
+                 deleted, truncated, or rewritten outside duster; re-scanning cannot \
+                 bring the text back — check that file)",
                 t.seq, rec.key, rec.path
             )
         })?;
@@ -578,28 +631,303 @@ fn export_file_name(agent: &str, key: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// rm
+// ---------------------------------------------------------------------------
+
+/// 一次 `session rm` 的目标。两种源形态（文件 / 库行）删除方式完全不同，
+/// 但报告、归档、索引收尾是同一份。
+struct RemoveTarget {
+    rid: i64,
+    /// 文件型会话（jsonl / zst）还是库型会话（源库里的行）。
+    kind: SourceKind,
+    /// 文件型：源文件路径；库型：源库路径。
+    path: PathBuf,
+    /// 库型的会话 id（opencode 的 `session.id` / omp 的 `history.session_id`）。
+    key: String,
+    agent: String,
+}
+
+/// 会话正文住在哪。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    /// 正文在文件里（jsonl / zst），删文件。
+    File,
+    /// 正文在 agent 的 SQLite 库里（`byte_len == 0` 哨兵），删库里那一行。
+    Db,
+}
+
+/// `duster session rm`：归档后删除一场会话（文件型删 jsonl / zst，
+/// 库型删源库里那一行），删完清索引。一次调用可以删多场（TUI 勾选批量），
+/// 整个批次打一个归档包。
+///
+/// # 顺序铁律：先归档后删
+///
+/// 会话是聊天记录，删了就没了——所以删除之前必须有一条退路。`opts.archive`
+/// 为 true（默认）时，先把本批次全部会话的**可读正文**导出成 Markdown、
+/// 连同文件型会话的源文件一起打包进 `~/agent-duster-exports/`，打包成功
+/// 才动手删；打包失败整体中止，一个字节都不删。`--no-archive` 是唯一的
+/// 关闭方式，只该由脚本显式关上。
+///
+/// # 库型会话怎么删
+///
+/// 索引里 `byte_len == 0` 的轮次，`byte_off` 是源库里的行 id（见模块文档）。
+/// 删除走 `duster_adapter::native::{opencode,omp}_session::delete_session`：
+/// 写之前适配器先验表/列形状（schema_guard 的库形态），三条 DELETE 包在
+/// 一个事务里（原子写）；这边还先留整文件快照（`~/.agent-duster/snapshots/`，
+/// 与 uninstall 写别人家文件同一套规矩）——用户同意的是删一场会话，
+/// 写坏了丢的是整库。库被 agent 锁住（busy_timeout 等不到）→ 这一条进
+/// `warnings`，其余会话照删。
+///
+/// # 归档内容必须是可读的对话
+///
+/// 文件型会话的源文件（jsonl）本来就是对话，照归档；库型会话的"原文"是
+/// 二进制库行，归档它等于归了一堆谁也读不了的东西。所以两类都先用
+/// [`export_to_file`] 导出一份 Markdown（落点与 prune `--export-first`
+/// 相同：`<home>/agent-duster-exports/<agent>-<key>.md`），归档里、
+/// 导出目录里都有人读的副本。
+///
+/// # dry-run
+///
+/// 不导出、不归档、不删、不动索引；`removed` 列出"将删的路径"，`freed_bytes`
+/// 是预估释放量。预览与真跑走同一段目标解析，预览说的就是真跑会做的。
+pub fn remove(opts: &DeleteOptions, rids: &[i64]) -> Result<DeleteReport> {
+    let home = resolve_home(opts.home.as_deref())?;
+    let index_path = match &opts.index_path {
+        Some(p) => p.clone(),
+        None => crate::scan::default_index_path(&home),
+    };
+    // 写句柄：删完要清索引行（Contract 3：不留幽灵行）。
+    let idx = Index::open(&index_path)
+        .with_context(|| format!("failed to open index for writing: {}", index_path.display()))?;
+    let conn = idx.conn();
+
+    let mut report = DeleteReport::default();
+    let mut targets: Vec<RemoveTarget> = Vec::new();
+    let mut to_archive: Vec<PathBuf> = Vec::new();
+    let export_dir = home.join("agent-duster-exports");
+
+    // 第一遍：解析目标 + 导出归档内容。导出失败只作废那一条（warnings），
+    // 其余照常——半份导出比没有导出更糟，但一条读不出来的会话不该连累
+    // 一整批的删除。
+    for &rid in rids {
+        let rec = match lookup_session(&idx, rid) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                report.warnings.push(format!(
+                    "session {rid} does not exist (already deleted?); skipped"
+                ));
+                continue;
+            }
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("session {rid}: {e:#}; skipped"));
+                continue;
+            }
+        };
+        let first = query::first_turn(conn, rid)?;
+        let is_db = first.as_ref().is_some_and(|t| t.byte_len == 0);
+        let path = PathBuf::from(&rec.path);
+        let target = RemoveTarget {
+            rid,
+            kind: if is_db {
+                SourceKind::Db
+            } else {
+                SourceKind::File
+            },
+            path: path.clone(),
+            key: rec.key.clone(),
+            agent: rec.agent_id.clone(),
+        };
+        if opts.archive && !opts.dry_run {
+            match export_for_archive(&index_path, rid, &export_dir) {
+                Ok(exported) => {
+                    to_archive.push(exported);
+                    if !is_db {
+                        to_archive.push(path.clone());
+                    }
+                }
+                Err(e) => {
+                    report.warnings.push(format!(
+                        "session {rid}: {e:#}; skipped (nothing was removed)"
+                    ));
+                    continue;
+                }
+            }
+        }
+        targets.push(target);
+    }
+
+    if targets.is_empty() {
+        return Ok(report);
+    }
+
+    // 先归档后删：归档失败整体中止。库型会话也照常走到这里——
+    // `to_archive` 里装的是导出的 Markdown，不是二进制库行。
+    let archived = if opts.archive && !opts.dry_run {
+        Some(delete::archive_before_delete(&to_archive, "session-rm", &home)?)
+    } else {
+        None
+    };
+
+    // 干跑：只报将删什么，一个字节都不动。
+    if opts.dry_run {
+        report.removed = targets.iter().map(|t| t.path.clone()).collect();
+        report.freed_bytes = targets.iter().map(|t| t.removable_bytes()).sum();
+        return Ok(report);
+    }
+
+    // 第二遍：真删。每条的失败只作废它自己——库锁住、文件被外力挪走，
+    // 都不该让别的会话陪葬。
+    let op_id = duster_fs::snapshot::new_op_id(SystemTime::now());
+    let mut snapshotted_dbs: Vec<PathBuf> = Vec::new();
+    for t in &targets {
+        match delete_one(&home, &op_id, &mut snapshotted_dbs, t) {
+            Ok(freed) => {
+                report.removed.push(t.path.clone());
+                report.freed_bytes += freed;
+                match query::delete_resource(conn, t.rid) {
+                    Ok(()) => {}
+                    Err(e) => report.warnings.push(format!(
+                        "session {} was deleted but the index entry could not be \
+                         removed: {e:#} (a rescan will clean it up)",
+                        t.rid
+                    )),
+                }
+            }
+            Err(e) => report
+                .warnings
+                .push(format!("session {}: {e:#}; kept", t.rid)),
+        }
+    }
+    report.archived = archived;
+    Ok(report)
+}
+
+impl RemoveTarget {
+    /// 这场会话删掉后释放的磁盘字节。
+    ///
+    /// 文件型 = 源文件体积（目录/压缩包按实测）；库型 = 0——SQLite 删行
+    /// 只把页送进 freelist，文件不缩，报"释放了 X"是拿用户当傻子。
+    fn removable_bytes(&self) -> u64 {
+        match self.kind {
+            SourceKind::File => fs::metadata(&self.path)
+                .map(|m| m.len())
+                .unwrap_or(0),
+            SourceKind::Db => 0,
+        }
+    }
+}
+
+/// 按 rid 找资源行。只认 `kind == "session"`：别的资源类型不该混进
+/// `session rm` 的删除面。
+fn lookup_session(idx: &Index, rid: i64) -> Result<Option<ResourceRecord>> {
+    Ok(query::list_resources(
+        idx.conn(),
+        &ResourceFilter {
+            agents: Vec::new(),
+            kinds: vec!["session".to_string()],
+            clean_levels: Vec::new(),
+        },
+    )?
+    .into_iter()
+    .find(|r| r.rid == rid))
+}
+
+/// 把一场会话导出成 Markdown 落到导出目录，返回落盘路径。
+///
+/// 归档内容必须是**可读的对话**：文件型会话的原文（jsonl）虽然也是对话，
+/// 但库型会话的"原文"是二进制库行，直接归档等于归了一堆谁也读不了的东西。
+/// 所以一律先 [`export_to_file`] 导出——落点与 prune `--export-first`
+/// 相同（`<home>/agent-duster-exports/<agent>-<key>.md`），归档里、导出
+/// 目录里都留一份人读的副本。
+fn export_for_archive(index_path: &Path, rid: i64, export_dir: &Path) -> Result<PathBuf> {
+    let detail = show(Some(index_path), rid)?;
+    let file = export_dir.join(export_file_name(&detail.row.agent_id, &detail.row.key));
+    export_to_file(&detail, ExportFormat::Markdown, &file)?;
+    Ok(file)
+}
+
+/// 真删一个目标。
+///
+/// - **文件型**：删源文件。文件已经被外力挪走 → 视为已删（索引行照清）。
+/// - **库型**：先留整文件快照（同批次同库只快照一次），再走适配器的
+///   `delete_session`（schema_guard + 事务都在那边）。库里已经没有这一场
+///   （agent 自己删过）→ 返回 Ok(0)，索引行照清。
+fn delete_one(
+    home: &Path,
+    op_id: &str,
+    snapshotted_dbs: &mut Vec<PathBuf>,
+    t: &RemoveTarget,
+) -> Result<u64> {
+    match t.kind {
+        SourceKind::File => {
+            let size = t.removable_bytes();
+            match fs::remove_file(&t.path) {
+                Ok(()) => Ok(size),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(e) => Err(e).with_context(|| {
+                    format!("failed to remove session file: {}", t.path.display())
+                }),
+            }
+        }
+        SourceKind::Db => {
+            // 写别人家的库之前先留整文件快照（与 uninstall 写共享配置同一套
+            // 规矩）：用户同意的是删一场会话，写坏了丢的是整库。快照失败即
+            // 拒绝动手——写不出退路就不写。
+            if !snapshotted_dbs.iter().any(|p| p == &t.path) {
+                let root = home.join(".agent-duster").join("snapshots");
+                duster_fs::snapshot::snapshot_file(&root, op_id, &t.path, home).with_context(
+                    || {
+                        format!(
+                            "refusing to delete a session from {} without a snapshot",
+                            t.path.display()
+                        )
+                    },
+                )?;
+                // WAL 帧不在主文件里：一并快照（尽力而为，读不到就算了——
+                // 快照是防 duster 自己写坏文件结构的兜底，不是完整备份）。
+                let wal = PathBuf::from(format!("{}.wal", t.path.display()));
+                if wal.is_file() {
+                    let _ = duster_fs::snapshot::snapshot_file(&root, op_id, &wal, home);
+                }
+                snapshotted_dbs.push(t.path.clone());
+            }
+            let deleted = match t.agent.as_str() {
+                "opencode" => {
+                    duster_adapter::native::opencode_session::delete_session(&t.path, &t.key)?
+                }
+                "omp" => duster_adapter::native::omp_session::delete_session(&t.path, &t.key)?,
+                other => {
+                    bail!(
+                        "sessions of agent `{other}` live in a database duster cannot write"
+                    )
+                }
+            };
+            // 0 行 = 库里本来就没有这一场（agent 自己删过）；不是失败，索引
+            // 行由调用方照清。释放字节按 0 计（见 [`RemoveTarget::removable_bytes`]）。
+            let _ = deleted;
+            Ok(0)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 共用小工具
 // ---------------------------------------------------------------------------
 
-/// 解析索引库路径并只读打开。缺库提示与 [`crate::search`] 逐字一致：
-/// 用户下一步该干什么，整个程序里只能有一种说法。
+/// 解析索引库路径并只读打开；库还没建过就先建一次，与 [`crate::search`]
+/// 共用 [`crate::freshness::ensure_exists`]——「库在不在、谁负责让它在」
+/// 整个程序里只能有一种说法。
 fn open_index(index_path: Option<&Path>) -> Result<Index> {
-    let path: PathBuf = match index_path {
-        Some(p) => p.to_path_buf(),
-        None => duster_fs::path::expand_tilde("~/.agent-duster/index.db"),
-    };
-    if !path.is_file() {
-        bail!(
-            "index database not found: {}. Run `duster scan` first to build it.",
-            path.display()
-        );
-    }
+    let path = freshness::ensure_exists(index_path)?;
     Index::open_readonly(&path)
         .with_context(|| format!("failed to open index read-only: {}", path.display()))
 }
 
 /// 确定 home：优先注入值，否则真实用户主目录。
-fn resolve_home(injected: Option<&Path>) -> Result<PathBuf> {
+/// pub(crate)：`session_migrate` 的目标端落盘也要定位 home，同一个判据只有一份。
+pub(crate) fn resolve_home(injected: Option<&Path>) -> Result<PathBuf> {
     if let Some(h) = injected {
         return Ok(h.to_path_buf());
     }
@@ -610,7 +938,7 @@ fn resolve_home(injected: Option<&Path>) -> Result<PathBuf> {
     Ok(h)
 }
 
-fn system_now_ms() -> i64 {
+pub(crate) fn system_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -619,13 +947,14 @@ fn system_now_ms() -> i64 {
 
 /// Unix 毫秒 -> UTC `YYYYMMDD-HHMMSS`。日历算术复用 `duster_fs::zst::stamp`，
 /// 不在这里再抄一份闰年规则，也不引时区依赖——导出文件跨机器可比。
-fn stamp_of(ms: i64) -> String {
+/// pub(crate)：`session_migrate` 的时间戳/文件名同源于这一份日历算术。
+pub(crate) fn stamp_of(ms: i64) -> String {
     let secs = ms.div_euclid(1_000).max(0) as u64;
     duster_fs::zst::stamp(UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// Unix 毫秒 -> `YYYY-MM-DD`（UTC）。
-fn render_date(ms: i64) -> String {
+pub(crate) fn render_date(ms: i64) -> String {
     let s = stamp_of(ms);
     format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8])
 }
@@ -699,6 +1028,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();
@@ -767,7 +1097,7 @@ mod tests {
         add_session(&idx, h, "codex", "new.jsonl", NOW_MS - 60_000, 100);
         drop(idx);
 
-        let all = list(Some(&db), &filter(NOW_MS)).unwrap();
+        let all = list(Some(&db), &filter(NOW_MS)).unwrap().rows;
         assert_eq!(all.len(), 2);
         // 最近用过的排前面。
         assert_eq!(all[0].agent_id, "codex");
@@ -786,7 +1116,7 @@ mod tests {
                 ..filter(NOW_MS)
             },
         )
-        .unwrap();
+        .unwrap().rows;
         assert_eq!(by_agent.len(), 1);
         assert_eq!(by_agent[0].key, "new.jsonl");
 
@@ -797,7 +1127,7 @@ mod tests {
                 ..filter(NOW_MS)
             },
         )
-        .unwrap();
+        .unwrap().rows;
         assert_eq!(stale.len(), 1, "只有 2020 那场超过 30 天");
         assert_eq!(stale[0].key, "old.jsonl");
 
@@ -808,7 +1138,7 @@ mod tests {
                 ..filter(NOW_MS)
             },
         )
-        .unwrap();
+        .unwrap().rows;
         assert_eq!(big.len(), 1);
         assert_eq!(big[0].key, "new.jsonl");
 
@@ -819,8 +1149,66 @@ mod tests {
                 ..filter(NOW_MS)
             },
         )
-        .unwrap();
+        .unwrap().rows;
         assert_eq!(one.len(), 1);
+    }
+
+    /// 库型会话的源库打不开时:不 panic、不静默跳过——行照常展示,
+    /// `<agent>: cannot read <path>: …` 进 warnings,调用方据此抬退出码。
+    #[test]
+    fn list_源库打不开时_warning_且行照常展示() {
+        let (home, db) = seed_home();
+        let h = home.path();
+        // 文件头是 SQLite 魔数、内容是垃圾:is_sqlite 认它,open 读不出来。
+        let db_file = h.join(".opencode/opencode.db");
+        std::fs::create_dir_all(db_file.parent().unwrap()).unwrap();
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.extend(std::iter::repeat_n(0xCDu8, 4096));
+        std::fs::write(&db_file, &bytes).unwrap();
+
+        let idx = Index::open(&db).unwrap();
+        let out = upsert::upsert_resource(
+            idx.conn(),
+            &ResourceRow {
+                agent_id: "opencode".into(),
+                kind: "session".into(),
+                scope: "user".into(),
+                key: "s1".into(),
+                path: db_file.to_string_lossy().into_owned(),
+                size: bytes.len() as u64,
+                mtime_ns: NOW_MS * 1_000_000,
+                hash_content: None,
+                cheap_print: None,
+                clean_level: None,
+                reclaimable: None,
+                install_bytes: None,
+                mapper: None,
+            },
+        )
+        .unwrap();
+        // byte_len == 0 哨兵:byte_off 是源库里的行 id,不是文件偏移。
+        upsert::replace_turns(
+            idx.conn(),
+            out.rid,
+            &[TurnRecord {
+                seq: 0,
+                role: Role::User,
+                ts_ms: Some(NOW_MS),
+                byte_off: 7,
+                byte_len: 0,
+                text: String::new(),
+            }],
+        )
+        .unwrap();
+        drop(idx);
+
+        let list = list(Some(&db), &filter(NOW_MS)).unwrap();
+        assert_eq!(list.rows.len(), 1, "会话照常展示");
+        assert_eq!(list.rows[0].cwd, None, "库型会话没有 cwd 可还原");
+        assert_eq!(list.warnings.len(), 1, "{:?}", list.warnings);
+        let w = &list.warnings[0];
+        assert!(w.starts_with("opencode: cannot read "), "{w}");
+        assert!(w.contains(&db_file.display().to_string()), "{w}");
     }
 
     /// prune 把会话压成 `.zst` 之后必须照常读得出全文——否则
@@ -882,6 +1270,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();
@@ -1083,6 +1472,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: Some(1024),
+                mapper: None,
             },
         )
         .unwrap();
@@ -1199,6 +1589,7 @@ mod tests {
                 clean_level: None,
                 reclaimable: None,
                 install_bytes: None,
+                mapper: None,
             },
         )
         .unwrap();
@@ -1259,6 +1650,7 @@ mod tests {
                     clean_level: None,
                     reclaimable: None,
                     install_bytes: None,
+                    mapper: None,
                 },
             )
             .unwrap();
@@ -1284,6 +1676,7 @@ mod tests {
                 },
             )
             .unwrap()
+            .rows
             .into_iter()
             .find(|r| r.rid == out.rid)
             .unwrap()
@@ -1300,5 +1693,281 @@ mod tests {
         // 没有头部区、轮次里也没有 cwd：仍然是"不知道"，不许编一个出来。
         assert_eq!(cwd_of(&idx, h, "headless.jsonl", "").as_deref(), None);
         drop(idx);
+    }
+
+    // -----------------------------------------------------------------------
+    // rm
+    // -----------------------------------------------------------------------
+
+    fn rm_opts(db: &Path, home: &Path, archive: bool, dry_run: bool) -> DeleteOptions {
+        DeleteOptions {
+            index_path: Some(db.to_path_buf()),
+            home: Some(home.to_path_buf()),
+            archive,
+            dry_run,
+        }
+    }
+
+    /// 文件型会话：归档后源文件没了、归档包里是可读对话（markdown）+ 源文件、
+    /// 索引无幽灵行。
+    #[test]
+    fn rm_文件型会话归档后删除_归档里是可读对话() {
+        let (home, db) = seed_home();
+        let h = home.path();
+        let idx = Index::open(&db).unwrap();
+        let (rid, src) = add_session(&idx, h, "claude", "gone.jsonl", OLD_MS, 0);
+        drop(idx);
+
+        let report = remove(&rm_opts(&db, h, true, false), &[rid]).unwrap();
+
+        assert!(!src.exists(), "源文件应已删除");
+        assert!(report.removed.contains(&src), "{:?}", report.removed);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        let archive_path = report.archived.expect("归档开启必有归档包");
+        assert!(archive_path.is_file(), "{}", archive_path.display());
+
+        // 归档里必须是可读的对话：解出来的 markdown 带轮次正文，源文件也在。
+        let dest = h.join("restore");
+        duster_fs::archive::extract_to(&archive_path, &dest).unwrap();
+        let md = dest.join("agent-duster-exports/claude-gone.jsonl.md");
+        assert!(md.is_file(), "归档里缺 markdown: {md:?}");
+        let body = std::fs::read_to_string(&md).unwrap();
+        assert!(body.contains("第一句") && body.contains("第二句"), "{body}");
+        assert!(
+            dest.join(".claude/projects/gone.jsonl").is_file(),
+            "源文件也必须进归档（tar -xf 即原位还原）"
+        );
+
+        // 索引无幽灵行：删完 list 不再列它。
+        let after = list(Some(&db), &filter(NOW_MS)).unwrap();
+        assert!(after.rows.iter().all(|r| r.rid != rid), "{:?}", after.rows);
+    }
+
+    /// 库型会话：删的是源库里的那一行，同库其他会话分毫不动；归档里是
+    /// 导出的 markdown（可读对话），不是二进制库行。
+    #[test]
+    fn rm_库型会话删库里一行_同库其他行完好() {
+        let (home, db) = seed_home();
+        let src = home.path().join("opencode.db");
+        // 会话 A（要被删）：fixture 造库 + 两条轮次。
+        let ids = duster_adapter::native::opencode_session::fixture_db(
+            &src,
+            "ses_a",
+            &[("user", "会话A第一句"), ("assistant", "会话A第二句")],
+        )
+        .unwrap();
+        // 会话 B（同库，要完好）：直接 INSERT。
+        {
+            let conn = rusqlite::Connection::open(&src).unwrap();
+            conn.execute_batch(
+                "INSERT INTO \"session\"(\"id\",\"title\",\"directory\") \
+                   VALUES ('ses_b','t','/tmp');\n\
+                 INSERT INTO \"message\"(\"id\",\"session_id\",\"time_created\",\"data\") \
+                   VALUES ('m_b','ses_b',1,'{\"role\":\"user\"}');\n\
+                 INSERT INTO \"part\"(\"id\",\"message_id\",\"session_id\",\"data\") \
+                   VALUES ('p_b','m_b','ses_b','{\"type\":\"text\",\"text\":\"会话B第一句\"}');",
+            )
+            .unwrap();
+            let rowid_b: i64 = conn
+                .query_row("SELECT rowid FROM \"message\" WHERE \"id\"='m_b'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(rowid_b > 0);
+        }
+
+        let idx = Index::open(&db).unwrap();
+        let mk = |key: &str| {
+            upsert::upsert_resource(
+                idx.conn(),
+                &ResourceRow {
+                    agent_id: "opencode".into(),
+                    kind: "session".into(),
+                    scope: "user".into(),
+                    key: key.into(),
+                    path: src.to_string_lossy().into_owned(),
+                    size: 4096,
+                    mtime_ns: OLD_MS * 1_000_000,
+                    hash_content: None,
+                    cheap_print: None,
+                    clean_level: None,
+                    reclaimable: None,
+                    install_bytes: None,
+                    mapper: None,
+                },
+            )
+            .unwrap()
+        };
+        let out_a = mk("ses_a");
+        upsert::replace_turns(
+            idx.conn(),
+            out_a.rid,
+            &[
+                TurnRecord {
+                    seq: 0,
+                    role: Role::User,
+                    ts_ms: Some(OLD_MS),
+                    byte_off: ids[0] as u64,
+                    byte_len: 0,
+                    text: "会话A第一句".into(),
+                },
+                TurnRecord {
+                    seq: 1,
+                    role: Role::Assistant,
+                    ts_ms: Some(OLD_MS + 1_000),
+                    byte_off: ids[1] as u64,
+                    byte_len: 0,
+                    text: "会话A第二句".into(),
+                },
+            ],
+        )
+        .unwrap();
+        // B 只需要资源行（这场 rm 的目标是 A，B 留作"同库其他行"的见证）。
+        let out_b = mk("ses_b");
+        drop(idx);
+
+        let report = remove(&rm_opts(&db, home.path(), true, false), &[out_a.rid]).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // 库里：A 的行全没了，B 的行全在。
+        let conn = rusqlite::Connection::open(&src).unwrap();
+        let count = |sql: &str| -> i64 {
+            conn.query_row(sql, [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM \"session\" WHERE \"id\"='ses_a'"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM \"message\" WHERE \"session_id\"='ses_a'"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM \"part\" WHERE \"session_id\"='ses_a'"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM \"session\" WHERE \"id\"='ses_b'"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM \"message\" WHERE \"session_id\"='ses_b'"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM \"part\" WHERE \"session_id\"='ses_b'"), 1);
+        drop(conn);
+
+        // 归档里是可读对话（导出的 markdown），不是二进制库行。
+        let dest = home.path().join("restore");
+        let archive = report.archived.unwrap();
+        duster_fs::archive::extract_to(&archive, &dest).unwrap();
+        let md = dest.join("agent-duster-exports/opencode-ses_a.md");
+        assert!(md.is_file(), "库型会话归档里必须有 markdown: {md:?}");
+        assert!(
+            std::fs::read_to_string(&md).unwrap().contains("会话A第一句"),
+            "归档里的 markdown 必须是可读对话"
+        );
+
+        // 索引：A 无幽灵行，B 还在。
+        let after = list(Some(&db), &filter(NOW_MS)).unwrap();
+        assert!(after.rows.iter().all(|r| r.rid != out_a.rid), "{:?}", after.rows);
+        assert!(after.rows.iter().any(|r| r.rid == out_b.rid), "B 不该被误删");
+    }
+
+    /// 库被锁住（agent 正在写）时这一条进 warnings，不中断删除。
+    #[test]
+    fn rm_库锁住进_warnings_不中断() {
+        let (home, db) = seed_home();
+        let src = home.path().join("opencode.db");
+        let ids = duster_adapter::native::opencode_session::fixture_db(
+            &src,
+            "ses_a",
+            &[("user", "第一句")],
+        )
+        .unwrap();
+
+        let idx = Index::open(&db).unwrap();
+        let out = upsert::upsert_resource(
+            idx.conn(),
+            &ResourceRow {
+                agent_id: "opencode".into(),
+                kind: "session".into(),
+                scope: "user".into(),
+                key: "ses_a".into(),
+                path: src.to_string_lossy().into_owned(),
+                size: 4096,
+                mtime_ns: OLD_MS * 1_000_000,
+                hash_content: None,
+                cheap_print: None,
+                clean_level: None,
+                reclaimable: None,
+                install_bytes: None,
+                mapper: None,
+            },
+        )
+        .unwrap();
+        upsert::replace_turns(
+            idx.conn(),
+            out.rid,
+            &[TurnRecord {
+                seq: 0,
+                role: Role::User,
+                ts_ms: Some(OLD_MS),
+                byte_off: ids[0] as u64,
+                byte_len: 0,
+                text: "第一句".into(),
+            }],
+        )
+        .unwrap();
+        drop(idx);
+
+        // 独占写锁模拟 agent 正在写库：busy_timeout 等不到 → 该条失败。
+        // 用 --no-archive 让删除直接撞锁（归档路径要先导出、先读库，读锁
+        // 也会被 EXCLUSIVE 挡住，那不是本测试要验的失败形态）。
+        let lock = rusqlite::Connection::open(&src).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        let report = remove(&rm_opts(&db, home.path(), false, false), &[out.rid]).unwrap();
+        assert_eq!(report.removed.len(), 0, "锁住时不该删掉任何东西");
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("kept"),
+            "锁住是这一条的失败,不是整批的: {:?}",
+            report.warnings
+        );
+        // 索引行保留（没删成,不许清掉——删完才能清）。
+        let after = list(Some(&db), &filter(NOW_MS)).unwrap();
+        assert!(after.rows.iter().any(|r| r.rid == out.rid));
+    }
+
+    /// 干跑：不导出、不归档、不删、不动索引。removed 列出"将删的路径"。
+    #[test]
+    fn rm_干跑不动盘() {
+        let (home, db) = seed_home();
+        let h = home.path();
+        let idx = Index::open(&db).unwrap();
+        let (rid, src) = add_session(&idx, h, "claude", "d.jsonl", OLD_MS, 0);
+        drop(idx);
+
+        let report = remove(&rm_opts(&db, h, true, true), &[rid]).unwrap();
+
+        assert!(src.is_file(), "预览不许动源文件");
+        assert!(report.archived.is_none());
+        assert!(!h.join("agent-duster-exports").exists(), "预览不许写导出目录");
+        assert!(report.removed.contains(&src), "预览要报将删什么");
+        assert_eq!(report.freed_bytes, body(0).len() as u64, "预览要报将释放多少");
+        let after = list(Some(&db), &filter(NOW_MS)).unwrap();
+        assert!(after.rows.iter().any(|r| r.rid == rid), "索引行不许动");
+    }
+
+    /// `--no-archive`：显式接受内容消失，直接删。
+    #[test]
+    fn rm_不归档直接删() {
+        let (home, db) = seed_home();
+        let h = home.path();
+        let idx = Index::open(&db).unwrap();
+        let (rid, src) = add_session(&idx, h, "claude", "na.jsonl", OLD_MS, 0);
+        drop(idx);
+
+        let report = remove(&rm_opts(&db, h, false, false), &[rid]).unwrap();
+        assert!(!src.exists());
+        assert!(report.archived.is_none());
+        assert!(report.removed.contains(&src));
+    }
+
+    /// 找不到的 rid 进 warnings，不 panic。
+    #[test]
+    fn rm_未知rid进_warnings() {
+        let (home, db) = seed_home();
+        let h = home.path();
+        let report = remove(&rm_opts(&db, h, true, false), &[9999]).unwrap();
+        assert!(report.removed.is_empty());
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     }
 }

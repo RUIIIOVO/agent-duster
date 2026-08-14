@@ -1,13 +1,14 @@
-//! 通用 diff 引擎。三处共用，**不许有第二份实现**：
+//! 通用 diff 引擎。两处共用，**不许有第二份实现**：
 //!
-//! - `duster skill copies` 的 DRIFTED 明细（今天在 `skill_ops` 里是手写的
+//! - `duster skill list` 的 DRIFTED 明细（今天在 `skill_ops` 里是手写的
 //!   文件级摘要，落地后换成调这里）；
-//! - `duster mcp diff`（同一个 server 在两个 agent 里声明得不一样）；
 //! - 顶层 `duster diff <a> <b>`（任意两个资源并排看）。
 //!
-//! 三者的差异只在**输入怎么变成可比对的行**，比对与渲染是同一件事。
-//! 写第二遍的代价不是多几百行代码，是三处的 `-`/`+` 语义慢慢走散，
-//! 用户在 skill 里学会的读法到 mcp 那边不成立。
+//! `duster mcp diff` 曾共用这里，随铺平表撤下——「几家声明一样吗」由
+//! `mcp list` 的 STATE 列直接回答，不再需要第二条命令。
+//!
+//! 两处的差异只在**输入怎么变成可比对的行**，比对与渲染是同一件事。
+//! 写第二遍的代价不是多几百行代码，是两处的 `-`/`+` 语义慢慢走散。
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -103,7 +104,7 @@ impl Default for DiffOptions {
     }
 }
 
-/// 比较两棵目录树。`skill copies` 的 DRIFTED 明细走这条。
+/// 比较两棵目录树。`skill list` 的 DRIFTED 明细走这条。
 ///
 /// 按相对路径配对；两侧内容哈希相同即 `Same`，否则 `Changed` 并（在
 /// 阈值内且是有效 UTF-8 时）附行级 hunks。符号链接比链接目标字符串本身，

@@ -40,6 +40,16 @@ pub struct ResourceRow {
     /// `dist` / `bin` / `.git`）。已从 `size` 中扣除，由上层单独归入 install 桶。
     /// 只有清单声明了 `install_paths` 的 skill 行有值（见 schema v4 注释）。
     pub install_bytes: Option<u64>,
+    /// 清单声明的 mapper 名（`stats-only` / `memory/markdown` / `native/*` …），
+    /// 决定 scan 怎么**采集**这一行。随行落库，因为列表/视图是纯读索引的：
+    /// `memory list` 要靠它把 `stats-only` 的假记忆（settings.json /
+    /// cc-switch.db 这类只记体积不记内容的行）挡在视图外，不能回查清单。
+    /// 历史行/手写行恒为 None——NULL = 未知，读方按「不是 stats-only」处理。
+    ///
+    /// 同样不参与 `cheap_print` 短路判断，也不需要：需要看 mapper 的行
+    /// （memory / stats-only）全都不产出 `cheap_print`，每轮都走写路径，
+    /// 清单改了 mapper 下一轮 scan 必然落库。
+    pub mapper: Option<String>,
 }
 
 /// [`upsert_resource`] 的结果:行 id + 本次是否真的写了。
@@ -98,8 +108,8 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
 
     let rid: i64 = conn
         .query_row(
-            "INSERT INTO resource(agent_id, kind, scope, key, path, size, mtime_ns, hash_content, cheap_print, clean_level, reclaimable, install_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO resource(agent_id, kind, scope, key, path, size, mtime_ns, hash_content, cheap_print, clean_level, reclaimable, install_bytes, mapper)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(agent_id, kind, scope, key) DO UPDATE SET
                path = excluded.path,
                size = excluded.size,
@@ -108,7 +118,8 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
                cheap_print = excluded.cheap_print,
                clean_level = excluded.clean_level,
                reclaimable = excluded.reclaimable,
-               install_bytes = excluded.install_bytes
+               install_bytes = excluded.install_bytes,
+               mapper = excluded.mapper
              RETURNING rid",
             params![
                 row.agent_id,
@@ -123,6 +134,7 @@ pub fn upsert_resource(conn: &Connection, row: &ResourceRow) -> Result<UpsertOut
                 row.clean_level.as_deref(),
                 row.reclaimable,
                 row.install_bytes,
+                row.mapper.as_deref(),
             ],
             |r| r.get(0),
         )
@@ -330,6 +342,7 @@ mod tests {
             clean_level: None,
             reclaimable: None,
             install_bytes: None,
+            mapper: None,
         }
     }
 
@@ -413,6 +426,37 @@ mod tests {
             upsert_resource(&conn, &r).unwrap().changed,
             "None 指纹不得判为命中"
         );
+    }
+
+    /// mapper 随行落库：写入与覆盖都生效——memory list 过滤 stats-only
+    /// 假记忆的唯一依据就是这一列，写不进去过滤就是空谈。
+    #[test]
+    fn mapper_persists_across_upserts() {
+        let conn = open();
+        // memory 行没有 cheap_print（与 scan_memory 一致），每轮都走写路径。
+        let mut r = row("mem1", 10, [0u8; 24]);
+        r.kind = "memory".into();
+        r.cheap_print = None;
+        r.mapper = Some("memory/markdown".into());
+        let rid = upsert_resource(&conn, &r).unwrap().rid;
+
+        let got: Option<String> = conn
+            .query_row("SELECT mapper FROM resource WHERE rid = ?1", [rid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("memory/markdown"));
+
+        // 覆盖：改成 stats-only 再 upsert，冲突键命中同一 rid，列跟着更新。
+        r.mapper = Some("stats-only".into());
+        let rid2 = upsert_resource(&conn, &r).unwrap().rid;
+        assert_eq!(rid2, rid, "冲突键命中必须复用 rid");
+        let got: Option<String> = conn
+            .query_row("SELECT mapper FROM resource WHERE rid = ?1", [rid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("stats-only"));
     }
 
     /// replace_turns:新正文可 MATCH,旧正文彻底消失,tid/rowid 对齐。
