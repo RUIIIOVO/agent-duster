@@ -39,6 +39,8 @@
 //! 只比路径，白名单就变成了另一种黑名单。
 
 use std::collections::{BTreeMap, HashSet};
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +56,53 @@ use duster_model::CleanLevel;
 
 use crate::freshness;
 
+/// 该 agent 的可执行文件是不是就住在它自己的 owns 树里。
+///
+/// 卸载范围表把「配置与数据」和「软件本体」分成两格,但 opencode 这类
+/// agent 的二进制就在 owns 树里;勾第一格已经会把它删掉,第二格便是空话。
+/// 清单是唯一事实来源,这里复用同一份 probe.binary 与 owned_roots 推导。
+/// PATH 中找不到二进制不是错误:这只表示界面不能确认重叠,交给调用方保持
+/// 原来的两格文案,不能因为一项展示信息失败而阻断卸载。
+pub fn binary_inside_owns(agent_id: &str) -> Result<bool> {
+    let home = duster_fs::path::expand_tilde("~");
+    let manifests = manifest::load_all(Some(&home.join(".agent-duster").join("adapters")))?;
+    let Some(m) = manifests.iter().find(|m| m.agent.id == agent_id) else {
+        return Ok(false);
+    };
+    let Some(binary) = m.probe.binary.as_deref() else {
+        return Ok(false);
+    };
+    let Some(found) = find_executable_in_path(binary, env::var_os("PATH").as_deref()) else {
+        return Ok(false);
+    };
+    let found = fs::canonicalize(&found).unwrap_or(found);
+    Ok(m.owned_roots().iter().any(|raw| {
+        let root = expand(raw, &home);
+        let canonical = fs::canonicalize(&root).unwrap_or(root);
+        found.starts_with(canonical)
+    }))
+}
+
+fn find_executable_in_path(binary: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path_var = path_var?;
+    for dir in env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(binary);
+        #[cfg(unix)]
+        let executable = candidate.metadata().map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.is_file() && m.permissions().mode() & 0o111 != 0
+        }).unwrap_or(false);
+        #[cfg(not(unix))]
+        let executable = candidate.is_file();
+        if executable {
+            return Some(candidate);
+        }
+    }
+    None
+}
 /// 三个动词。决定计划的取材范围与同意模型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -398,16 +447,18 @@ impl LastUsed {
     };
 }
 
-/// 把行上的 mtime 当证据用。`mtime_ns <= 0` 表示 scan 当时没取到时间戳
-/// （stats-only 采集失败、权限不足等），那是**没有证据**。
+/// 把行上的 mtime 当证据用。「有没有可用时间戳」这条判据在
+/// [`duster_index::query::ResourceRecord::last_used_ms`] 里，与四张列表的
+/// LAST USED 列共用——两处各判一遍，迟早走散成「列表说它上周用过、prune
+/// 说它没有时间戳」。
 fn mtime_evidence(rec: &ResourceRecord, lead: &'static str, source: &'static str) -> LastUsed {
-    if rec.mtime_ns <= 0 {
-        return LastUsed::UNKNOWN;
-    }
-    LastUsed {
-        ms: Some(rec.mtime_ms()),
-        source,
-        lead,
+    match rec.last_used_ms() {
+        None => LastUsed::UNKNOWN,
+        Some(ms) => LastUsed {
+            ms: Some(ms),
+            source,
+            lead,
+        },
     }
 }
 
@@ -577,7 +628,10 @@ fn evidence_why(lu: &LastUsed, now: i64) -> String {
 }
 
 /// 人话体积。计划是给人读的，`812345678` 读不出来。
-fn human_bytes(n: u64) -> String {
+///
+/// `pub(crate)`：doctor 报归档目录体量、uninstall 报打包回执都要同一套读法，
+/// 三份各自实现迟早会在进位或小数位上分家。
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
     let mut i = 0usize;

@@ -62,10 +62,19 @@ clean_level = "l1"
 # 配置键(~/.claude.json 与 ~/.codex/config.toml 的 MCP 表里只有 stitch)。
 # 反过来,~/.gemini/settings.json 里的 mcpServers.stitch 是**它自己**的注册表,
 # 随 ~/.gemini 一起走,不是共享文件。
-# schema 表达不了的残留:~/.cc-switch/cc-switch.db 的 providers 表
-# (app_type = 'gemini')存着 Gemini 的供应商档案。
+# cc-switch 的 providers 表(app_type = 'gemini')存着 Gemini 的供应商档案,
+# 2026-08-18 实测 id = 'gemini-official' 那一行,行级删除已声明化。
 [uninstall]
 owns = ["~/.gemini"]
+
+# cc-switch 按 agent 一行存供应商档案,Gemini CLI 卸载时这一行一起走。
+[[uninstall.residue]]
+kind = "sqlite_row"
+db = "~/.cc-switch/cc-switch.db"
+table = "providers"
+column = "id"
+equals = "gemini-official"
+why = "cc-switch keeps one provider row per agent"
 
 # 本机 2026-08-11 实测:`mise which gemini` →
 #   ~/.local/share/mise/installs/npm-google-gemini-cli/latest/node_modules/.bin/gemini

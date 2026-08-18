@@ -7,9 +7,10 @@
 //! `adapters/claude-code.toml` 文件头注释。
 //!
 //! `[uninstall]` 是唯一一个**描述动作**而不是描述资源的小节：卸载要动
-//! 三种所有权不同的东西——自己独占的树（删）、写在别人文件里的键（改）、
-//! 软件本体的安装方式（只打印命令，绝不代跑）。它仍然不做 IO：路径照样
-//! 留 `~`，`detect` / `command` 照样只是 argv。
+//! 四类所有权不同的东西——自己独占的树（删）、写在别人文件里的键（改）、
+//! 软件本体的安装方式（只打印命令，绝不代跑）、声明化的已知残留（自己删，
+//! 查不到就沉默）。它仍然不做 IO：路径照样留 `~`，`detect` / `command`
+//! 照样只是 argv。
 
 use anyhow::{Context, Result, bail};
 use duster_model::{CleanLevel, ResourceKind};
@@ -132,12 +133,14 @@ pub struct ResourceSection {
     pub install_paths: Vec<String>,
 }
 
-/// `[uninstall]`：卸载这个 agent 要动的三类东西。整节可选。
+/// `[uninstall]`：卸载这个 agent 要动的四类东西。整节可选。
 ///
-/// 三个字段是三种**所有权**，不是三个档位：
+/// 四个字段是四种**所有权**，不是四个档位：
 /// `owns` 是随 agent 一起死的树（整棵删）；`shared` 是它写在**别人**文件里
 /// 的那几个键（只能逐键动刀，永不删文件）；`package` 是软件本体的安装方式
-/// （duster 只打印，永不代跑）。三者互不替代，少一类就卸不干净。
+/// （duster 只打印，永不代跑）；`residue` 是**声明化的已知残留**（以前只记
+/// 在注释里、永远靠用户手动删，现在 duster 自己删）。四者互不替代，少一类
+/// 就卸不干净。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UninstallSection {
@@ -151,6 +154,9 @@ pub struct UninstallSection {
     /// 包管理器线索；TOML 里写作 `[[uninstall.package]]`。
     #[serde(default)]
     pub package: Vec<PackageHint>,
+    /// 声明化的已知残留；TOML 里写作 `[[uninstall.residue]]`。
+    #[serde(default)]
+    pub residue: Vec<ResidueSpec>,
 }
 
 /// `[[uninstall.shared]]`：**别的 agent 也拥有**的那个文件里，属于本 agent
@@ -189,6 +195,55 @@ pub struct PackageHint {
     pub detect: Vec<String>,
     /// 卸载命令（argv）。**永不自动执行**，只打印给用户。不得为空。
     pub command: Vec<String>,
+}
+
+/// `[[uninstall.residue]]`：**声明化的已知残留**。
+///
+/// 为什么需要这个声明段：以前这类残留只写在 adapter 的注释里——它们永远
+/// 进不了卸载报告，也永远只能靠用户自己动手删。声明化之后，新发现的残留
+/// 只需在清单里加几行 TOML，不用改任何代码；卸载时 duster 自己删，删不掉
+/// 就如实报 `Failed`，而不是假装卸干净。
+///
+/// 与 `shared` 的差别：`shared` 是「别人文件里**属于我们的键**」，语义上
+/// 那个文件还有别的主人，必须保留文件本身；`residue` 是「schema 以前表达
+/// 不了、但事实存在的既定残留」——shell rc 里的 PATH 行、别的工具数据库里
+/// 的整行。两者都只做行级手术，绝不删整个文件。`kind` 是封闭词汇表：
+/// 只有 `shell_line` 与 `sqlite_row` 两个值，其余加载即报错。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum ResidueSpec {
+    /// shell rc 里的整行（如安装脚本追加的 PATH 行）。`files` 里**存在**的
+    /// 文件才处理；`match` 是**子串包含**匹配整行；`with_comment_above` 为
+    /// true 时，命中行紧邻的上一行若以 `#` 开头（去空白后）则一并删除——
+    /// 安装脚本常在 PATH 行上方留一行注释。
+    #[serde(rename = "shell_line")]
+    ShellLine {
+        /// 可能含这一行的 rc 文件，一律 `~` 开头、不展开。不存在的文件跳过。
+        files: Vec<String>,
+        /// 匹配整行的子串。TOML 里写作 `match`（Rust 关键字，这里改名存）。
+        #[serde(rename = "match")]
+        match_: String,
+        /// 命中行上方紧邻的 `#` 注释行是否一并删。缺省 false。
+        #[serde(default)]
+        with_comment_above: bool,
+        /// 必填：这一行为什么属于这个 agent，进卸载报告。
+        why: String,
+    },
+    /// 别的工具 SQLite 库里的整行（如 cc-switch 的 providers 供应商行）。
+    /// `equals` 是 `column` 列的**精确等值**；库文件不存在则跳过。
+    #[serde(rename = "sqlite_row")]
+    SqliteRow {
+        /// 库文件路径，`~` 开头、不展开。库不存在则跳过。
+        db: String,
+        /// 表名。
+        table: String,
+        /// 等值匹配的列名。
+        column: String,
+        /// 该列的精确等值，命中即删整行。
+        equals: String,
+        /// 必填：这一行为什么属于这个 agent，进卸载报告。
+        why: String,
+    },
 }
 
 /// 包管理器封闭词汇表。清单里只能写这五个名字，serde 解析即校验。
@@ -524,6 +579,74 @@ impl Manifest {
                         i + 1,
                         p.manager.as_str()
                     );
+                }
+            }
+            // residue 是「duster 自己删的已知残留」：删的是行不是文件，所以
+            // 定位字段一个都不能空——空 files 是无的放矢，空 match / equals
+            // 会匹配到无关行甚至整个文件。路径照样走 ensure_tilde。
+            for (i, r) in u.residue.iter().enumerate() {
+                let at = format!("[{id}] uninstall.residue #{}", i + 1);
+                match r {
+                    ResidueSpec::ShellLine {
+                        files,
+                        match_,
+                        with_comment_above: _,
+                        why,
+                    } => {
+                        if files.is_empty() {
+                            bail!(
+                                "{at}: files must not be empty; a residue that targets no \
+                                 file is dead weight — write the rc files that may contain \
+                                 the line, or drop the entry"
+                            );
+                        }
+                        for f in files {
+                            ensure_tilde(id, "uninstall.residue.files entry", f)?;
+                        }
+                        if match_.trim().is_empty() {
+                            bail!(
+                                "{at}: match must not be empty; an empty substring would \
+                                 match every line. Write the distinctive fragment of the \
+                                 line, e.g. \"/.opencode/bin\""
+                            );
+                        }
+                        if why.trim().is_empty() {
+                            bail!(
+                                "{at}: why must not be empty; it is the reason shown in the \
+                                 uninstall report. Write what this line is and why it \
+                                 belongs to this agent"
+                            );
+                        }
+                    }
+                    ResidueSpec::SqliteRow {
+                        db,
+                        table,
+                        column,
+                        equals,
+                        why,
+                    } => {
+                        ensure_tilde(id, "uninstall.residue.db", db)?;
+                        if table.trim().is_empty() {
+                            bail!("{at}: table must not be empty");
+                        }
+                        if column.trim().is_empty() {
+                            bail!("{at}: column must not be empty");
+                        }
+                        if equals.trim().is_empty() {
+                            bail!(
+                                "{at}: equals must not be empty; an empty value would match \
+                                 every row whose {column} is empty — or nothing at all, \
+                                 silently. Write the exact row id this agent owns"
+                            );
+                        }
+                        if why.trim().is_empty() {
+                            bail!(
+                                "{at}: why must not be empty; it is the reason shown in the \
+                                 uninstall report. Write what this row is and why it \
+                                 belongs to this agent"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1368,6 +1491,221 @@ command = []
         assert!(parse(&bad).unwrap_err().to_string().contains("yarn"));
     }
 
+    /// residue 是「duster 自己删的已知残留」：两种 kind 各给一份最小合法形态，
+    /// 且字段名 `match`（Rust 关键字）要按 serde rename 落回 `match_`。
+    #[test]
+    fn uninstall_residue_两种_kind_都能解析() {
+        let src = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.residue]]
+kind = "shell_line"
+files = ["~/.zshrc", "~/.bashrc"]
+match = "/.demo/bin"
+with_comment_above = true
+why = "PATH entry added by the demo installer"
+
+[[uninstall.residue]]
+kind = "sqlite_row"
+db = "~/.cc-switch/cc-switch.db"
+table = "providers"
+column = "id"
+equals = "demo-official"
+why = "cc-switch keeps one provider row per agent"
+"#,
+        );
+        let m = parse(&src).expect("两种合法 residue 应当能解析");
+        let r = &m.uninstall.as_ref().unwrap().residue;
+        assert_eq!(r.len(), 2);
+        match &r[0] {
+            ResidueSpec::ShellLine {
+                files,
+                match_,
+                with_comment_above,
+                why,
+            } => {
+                assert_eq!(*files, ["~/.zshrc".to_string(), "~/.bashrc".to_string()]);
+                assert_eq!(*match_, "/.demo/bin");
+                assert!(*with_comment_above);
+                assert_eq!(*why, "PATH entry added by the demo installer");
+            }
+            other => panic!("第一条约应是 shell_line, 实际 {other:?}"),
+        }
+        match &r[1] {
+            ResidueSpec::SqliteRow {
+                db,
+                table,
+                column,
+                equals,
+                why,
+            } => {
+                assert_eq!(*db, "~/.cc-switch/cc-switch.db");
+                assert_eq!(*table, "providers");
+                assert_eq!(*column, "id");
+                assert_eq!(*equals, "demo-official");
+                assert_eq!(*why, "cc-switch keeps one provider row per agent");
+            }
+            other => panic!("第二条约应是 sqlite_row, 实际 {other:?}"),
+        }
+
+        // with_comment_above 缺省 false；residue 整段缺省空 Vec。
+        let no_comment = src.replace("with_comment_above = true\n", "");
+        let m = parse(&no_comment).expect("缺省字段应当合法");
+        let r = &m.uninstall.as_ref().unwrap().residue;
+        match &r[0] {
+            ResidueSpec::ShellLine {
+                with_comment_above,
+                ..
+            } => assert!(!with_comment_above),
+            other => panic!("第一条约应是 shell_line, 实际 {other:?}"),
+        }
+        assert!(parse(&minimal("")).unwrap().uninstall.is_none());
+    }
+
+    /// `kind` 是封闭词汇表：词汇表外的名字 serde 解析即拒绝，不留后门。
+    #[test]
+    fn uninstall_residue_的_kind_是封闭词汇表() {
+        let src = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.residue]]
+kind = "file_line"
+files = ["~/.zshrc"]
+match = "/.demo/bin"
+why = "PATH entry added by the demo installer"
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("file_line"), "{err}");
+        assert!(
+            err.contains("shell_line") && err.contains("sqlite_row"),
+            "错误要点名可选值: {err}"
+        );
+
+        // 字段拼写错误同样当场拒绝——静默忽略会让「删行」悄悄失效。
+        let typo = src.replace("files = [\"~/.zshrc\"]", "file = \"~/.zshrc\"");
+        let err = parse(&typo).unwrap_err().to_string();
+        assert!(err.contains("file"), "拼错的字段要被点名: {err}");
+    }
+
+    /// `why` 是进卸载报告的唯一一句话，空着等于又退回「无声残留」。
+    #[test]
+    fn uninstall_residue_的_why_不许为空() {
+        let src = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.residue]]
+kind = "sqlite_row"
+db = "~/.cc-switch/cc-switch.db"
+table = "providers"
+column = "id"
+equals = "demo-official"
+why = "   "
+"#,
+        );
+        let err = parse(&src).unwrap_err().to_string();
+        assert!(err.contains("why"), "{err}");
+    }
+
+    /// residue 的路径字段（`files` / `db`）与别的路径声明同一条规矩：
+    /// 必须 `~` 开头——绝对路径会让「删行」指向系统文件。
+    #[test]
+    fn uninstall_residue_的路径必须是波浪号() {
+        let bad_file = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.residue]]
+kind = "shell_line"
+files = ["/etc/zshrc"]
+match = "/.demo/bin"
+why = "PATH entry added by the demo installer"
+"#,
+        );
+        let err = parse(&bad_file).unwrap_err().to_string();
+        assert!(err.contains("uninstall.residue.files entry"), "{err}");
+        assert!(err.contains("~/"), "错误要说清该写成什么: {err}");
+
+        let bad_db = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.residue]]
+kind = "sqlite_row"
+db = "/var/lib/cc-switch.db"
+table = "providers"
+column = "id"
+equals = "demo-official"
+why = "cc-switch keeps one provider row per agent"
+"#,
+        );
+        let err = parse(&bad_db).unwrap_err().to_string();
+        assert!(err.contains("uninstall.residue.db"), "{err}");
+        assert!(err.contains("~/"), "错误要说清该写成什么: {err}");
+    }
+
+    /// 定位字段空着会让「删行」变成无的放矢或整表误伤——当场拒绝加载。
+    #[test]
+    fn uninstall_residue_的定位字段不许为空() {
+        // files 空：这条残留不指向任何文件，纯死重。
+        let no_files = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.residue]]
+kind = "shell_line"
+files = []
+match = "/.demo/bin"
+why = "PATH entry added by the demo installer"
+"#,
+        );
+        let err = parse(&no_files).unwrap_err().to_string();
+        assert!(err.contains("files"), "{err}");
+
+        // match 空串：子串匹配会命中每一行，等于要改整个 rc 文件。
+        let no_match = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.residue]]
+kind = "shell_line"
+files = ["~/.zshrc"]
+match = ""
+why = "PATH entry added by the demo installer"
+"#,
+        );
+        let err = parse(&no_match).unwrap_err().to_string();
+        assert!(err.contains("match"), "{err}");
+
+        // equals 空串：WHERE id = '' 要么全不命中（静默失败）要么误删。
+        let no_equals = minimal(
+            r#"
+[uninstall]
+owns = ["~/.demo"]
+
+[[uninstall.residue]]
+kind = "sqlite_row"
+db = "~/.cc-switch/cc-switch.db"
+table = "providers"
+column = "id"
+equals = ""
+why = "cc-switch keeps one provider row per agent"
+"#,
+        );
+        let err = parse(&no_equals).unwrap_err().to_string();
+        assert!(err.contains("equals"), "{err}");
+    }
+
     /// 内置清单的 `[uninstall]` 必须**实测填满**，不许空着混过加载校验。
     /// 断言写成本机 2026-08-11 的实测结论：谁归 mise 的 npm 包、谁归 brew cask、
     /// 谁查不到包管理器所以整条不写。清单被水改时这里会当场红。
@@ -1440,6 +1778,60 @@ command = []
             Some("model_catalog_json")
         );
         assert_eq!(ccs.shared[0].json_pointer, None);
+
+        // residue：cc-switch 的 providers 行 ×3 + opencode 的 shell rc PATH 行。
+        // 2026-08-18 实测落库（claude-official / codex-official /
+        // gemini-official 三行都在，opencode 在 providers 里没有行——它只
+        // 有 mcp_servers / skills 两表的 enabled_opencode 布尔列，列级残留
+        // 表达不了，仍记注释）。清单被水改时这里会当场红。
+        let with_residue: Vec<&str> = manifests
+            .iter()
+            .filter(|m| !m.uninstall.as_ref().unwrap().residue.is_empty())
+            .map(|m| m.agent.id.as_str())
+            .collect();
+        assert_eq!(with_residue, ["claude-code", "codex", "gemini-cli", "opencode"]);
+        let provider_ids = [
+            ("claude-code", "claude-official"),
+            ("codex", "codex-official"),
+            ("gemini-cli", "gemini-official"),
+        ];
+        for (id, expected) in provider_ids {
+            let u = get(id);
+            assert_eq!(u.residue.len(), 1, "{id} 应恰好一条 residue");
+            match &u.residue[0] {
+                ResidueSpec::SqliteRow {
+                    db,
+                    table,
+                    column,
+                    equals,
+                    why,
+                } => {
+                    assert_eq!(*db, "~/.cc-switch/cc-switch.db");
+                    assert_eq!(*table, "providers");
+                    assert_eq!(*column, "id");
+                    assert_eq!(*equals, expected);
+                    assert!(!why.trim().is_empty());
+                }
+                other => panic!("{id} 的 residue 应是 sqlite_row, 实际 {other:?}"),
+            }
+        }
+        match &get("opencode").residue[0] {
+            ResidueSpec::ShellLine {
+                files,
+                match_,
+                with_comment_above,
+                why,
+            } => {
+                assert_eq!(
+                    *files,
+                    ["~/.zshrc", "~/.zprofile", "~/.bashrc", "~/.bash_profile"]
+                );
+                assert_eq!(*match_, "/.opencode/bin");
+                assert!(*with_comment_above);
+                assert!(!why.trim().is_empty());
+            }
+            other => panic!("opencode 的 residue 应是 shell_line, 实际 {other:?}"),
+        }
 
         // package：五个 mise 管的 npm 包 + 一个 brew cask，其余五家查不到
         // 包管理器，整条不写（空列表是诚实，猜一条 npm uninstall -g 是危险）。

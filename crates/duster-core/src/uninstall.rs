@@ -26,8 +26,12 @@
 //! - **package**：软件当初是怎么装上的。**duster 永不代跑包管理器**：
 //!   命令原样打出来，跑不跑是用户的事。`--run-package-manager` 是显式的
 //!   例外，而且照样先把 argv 打出来再执行。
+//! - **residue**：**声明化的已知残留**——以前只记在注释里、永远靠用户
+//!   手动删的既定事实（安装脚本追加的 PATH 行、别的工具数据库里的供应商
+//!   行）。声明化之后 duster 自己删：删行不删文件，删不掉就如实报
+//!   `Failed`，绝不假装卸干净。
 //!
-//! 后两个模式全部由清单的 `[uninstall]` 段驱动。没声明就没有——
+//! 后三个模式全部由清单的 `[uninstall]` 段驱动。没声明就没有——
 //! duster 不去猜别人家的配置里哪个键是它的。
 
 use std::collections::BTreeMap;
@@ -39,7 +43,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use duster_adapter::manifest::{self, PackageHint, SharedEdit};
+use duster_adapter::manifest::{self, PackageHint, ResidueSpec, SharedEdit};
 use duster_adapter::{codec, guard};
 use duster_fs::archive::{self, ArchiveReceipt};
 use duster_fs::lockprobe::{self, LockStatus};
@@ -48,7 +52,7 @@ use duster_index::db::Index;
 use duster_index::meta;
 use duster_index::query::{self, ResourceFilter};
 
-use crate::plan::Plan;
+use crate::plan::{Plan, human_bytes};
 
 /// uninstall 的输入。
 #[derive(Debug, Clone, Default)]
@@ -58,9 +62,10 @@ pub struct UninstallOptions {
     /// 目标 agent id。
     pub agent: String,
     /// 只动 agent 独占的目录与文件，跳过清单 `[uninstall]` 段里的 `shared`
-    /// （别人家文件里指向本 agent 的键）与 `package`（安装方式提示）。
+    /// （别人家文件里指向本 agent 的键）、`package`（安装方式提示）与
+    /// `residue`（声明化的已知残留）。
     ///
-    /// 默认 false，也就是三个模式全做：留着一条指向已删程序的 MCP 声明
+    /// 默认 false，也就是四个模式全做：留着一条指向已删程序的 MCP 声明
     /// 不叫卸载干净，那正是下一个「为什么这个 agent 启动时报错」的来源。
     pub data_only: bool,
     /// 用户逐字输入的确认串，必须与 `agent` 完全相等。
@@ -69,7 +74,9 @@ pub struct UninstallOptions {
     pub export_first: bool,
     /// 保留原地不删的资源类，如 `["sessions", "memory"]`。
     pub keep: Vec<String>,
-    /// 归档决定；语义同 [`crate::prune::PruneOptions::archive`]。
+    /// 归档决定：`None` = 未表态，预估超阈值时拒绝执行（见 [`check_data_escape`]）；
+    /// `Some(true)` 强制打包，`Some(false)` 显式接受永久丢失。prune 已撤掉
+    /// 三态、恒归档，不经过这里。
     pub archive: Option<bool>,
     pub export_dir: Option<PathBuf>,
     /// 允许 duster 代跑清单里的包管理器卸载命令。**默认 false**——
@@ -199,6 +206,38 @@ pub struct PackageOutcome {
     pub output: Option<String>,
 }
 
+/// 一处清单声明的残留（`[[uninstall.residue]]`）的下场。
+#[derive(Debug, Clone, Serialize)]
+pub struct ResidueOutcome {
+    /// 人话：删的是哪一行/哪一行里的什么。
+    pub what: String,
+    /// 被处理的文件。shell_line：rc 文件；sqlite_row：db 文件。
+    pub path: PathBuf,
+    /// 清单里那句理由，一字不改地带给用户——他有权知道 duster 凭什么
+    /// 去动这份文件/这个库。
+    pub why: String,
+    pub action: ResidueAction,
+}
+
+/// 一条残留的下场。
+///
+/// `Planned` 只在 dry-run 里出现（"真跑会删掉它"）；真跑时每一条最终
+/// 都会落在其余三个之一。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResidueAction {
+    /// 已删掉。
+    Removed,
+    /// dry-run：真跑会删掉它。
+    Planned,
+    /// 本来就找不到（文件不在 / 行不在 / 库不在 / 0 行受影响）。
+    /// 这是成功，不是错误——卸载两遍不该报错。
+    NotFound,
+    /// 该删但没删成（快照失败、读不了、表或列不存在……）。
+    /// 那个文件一个字节没动。
+    Failed(String),
+}
+
 /// uninstall 的完整报告。
 #[derive(Debug, Clone, Serialize)]
 pub struct UninstallReport {
@@ -214,6 +253,10 @@ pub struct UninstallReport {
     pub shared: Vec<SharedEditOutcome>,
     /// 包管理器提示，逐条。**这一栏默认只是打印出来的命令。**
     pub packages: Vec<PackageOutcome>,
+    /// 声明化的残留（shell 行 / SQLite 行），逐条。`--data-only` 或清单
+    /// 没声明时为空。`Failed` 与 `leftovers` 同属「没删干净」——
+    /// 残留还在，索引就不该清，agent 继续列在列表里。
+    pub residues: Vec<ResidueOutcome>,
     pub warnings: Vec<String>,
 }
 
@@ -251,21 +294,25 @@ pub fn preflight(opts: &UninstallOptions) -> Result<Vec<PreflightCheck>> {
 }
 
 /// 计划 → 确认校验 → 前置检查 → 导出 →（非 dry-run 时）删除 → 复核残留
-/// → 共享文件改键 → 包管理器提示 → 清索引。
+/// → 共享文件改键 → 残留清理 → 包管理器提示 → 清索引。
 ///
 /// 硬要求：
 /// - `confirm` 与 `agent` 不完全相等即报错，**不接受 `--yes` 替代**；
 /// - `dry_run` 恒返回 `Ok`（`executed = false`），**检查没过也照样返回**——
 ///   预览就是用来看"卡在哪、怎么解"的，那时候给一句 Err 等于把唯一一次
 ///   能看清单的机会也拿掉；真执行时才把未过的检查变成中止；
-/// - 预览必须把 `shared` 与 `packages` **逐条列全**（连同清单里那句 reason），
-///   而且一个字节都不写。确认清单是这个动词唯一的防线，看不见就等于没有；
+/// - 预览必须把 `shared`、`packages` 与 `residues` **逐条列全**（连同清单里
+///   那句 reason / why），而且一个字节都不写。确认清单是这个动词唯一的
+///   防线，看不见就等于没有；
 /// - 删除完成后**逐条复核**：计划里的路径应全部消失，残留写进 `leftovers`；
 /// - 共享改键排在整棵树删除**之后**。反过来的话，树没删成就白改了别人的
 ///   文件；而"引用还在、被指的东西已经没了"是两者之间明显更安全的中间态；
 /// - 单条共享改键失败（指纹漂移、解析不了、快照写不出）**只作废它自己**，
 ///   删除与其余改键照走：一个 agent 升级了配置格式，不该连累整场卸载；
-/// - 删除后清理索引里该 agent 的全部行（资源行 + agent 行）。
+/// - **删干净了才清索引**：删除后的残留、`--keep` 保住的路径、删不掉的
+///   residue，任何一样还在就保留索引行——agent 继续显示在列表里，直到它
+///   真的被删干净（残留还在却从列表消失，正是「列表说谎」）。清索引时才
+///   删该 agent 的全部行（资源行 + agent 行）。
 pub fn uninstall(opts: &UninstallOptions) -> Result<UninstallReport> {
     // ① 同意模型：逐字输入 agent id。裸 `--yes` 明确不接受。
     if opts.confirm.as_deref() != Some(opts.agent.as_str()) {
@@ -298,6 +345,7 @@ pub fn uninstall(opts: &UninstallOptions) -> Result<UninstallReport> {
         leftovers: Vec::new(),
         shared: Vec::new(),
         packages: Vec::new(),
+        residues: Vec::new(),
         warnings,
     };
 
@@ -309,12 +357,15 @@ pub fn uninstall(opts: &UninstallOptions) -> Result<UninstallReport> {
     //    在预览阶段把它变成一句 Err，等于用户唯一能拿到清单的时候拿不到清单。
     //
     //    两个新模式在这里走一遍**只读**预演：读文件、比指纹、算出删掉那个键
-    //    之后文本会不会变，但不落基准、不写盘、不跑包管理器。
+    //    之后文本会不会变，但不落基准、不写盘、不跑包管理器。residue 同样
+    //    只读预演：照读文件、只读查库，算出"真跑会删什么"，不建快照、
+    //    一个字节都不写。
     if opts.dry_run {
         let baselines = load_baselines(&idx_path, &pf.shared, &home);
         let mut learned = Vec::new();
         report.shared = apply_shared(&pf.shared, &home, &baselines, &mut learned, &pf.op_id, true);
         report.packages = package_outcomes(&pf.packages, false);
+        report.residues = residue_outcomes(&pf.residues, &home, &pf.op_id, true);
         return Ok(report);
     }
 
@@ -410,6 +461,22 @@ pub fn uninstall(opts: &UninstallOptions) -> Result<UninstallReport> {
         }
     }
 
+    // ⑧b 残留清理。与 shared 同一类动作：别人地盘上的东西，先整文件快照
+    //     再原子写。单条失败（快照写不出、库读不了、表或列不存在）只作废
+    //     它自己，其余照走——但 `Failed` 会被 [`removal_was_clean`] 看见，
+    //     索引不清，agent 继续列在列表里，直到真的删干净。
+    report.residues = residue_outcomes(&pf.residues, &home, &pf.op_id, false);
+    for r in &report.residues {
+        if let ResidueAction::Failed(detail) = &r.action {
+            report.warnings.push(format!(
+                "could not remove residue {} at {}: {}",
+                r.what,
+                r.path.display(),
+                detail
+            ));
+        }
+    }
+
     // ⑨ 包管理器。默认只把命令打出来；`--run-package-manager` 才真跑，
     //    而且 argv 原样躺在 `argv` 字段里，渲染层先打印再报输出。
     report.packages = package_outcomes(&pf.packages, opts.run_package_manager);
@@ -426,13 +493,23 @@ pub fn uninstall(opts: &UninstallOptions) -> Result<UninstallReport> {
     // ⑩ 收尾清索引。**必须在这里才开可写句柄**：`Index::open` 抢单实例排他锁，
     //    而前置检查/计划阶段的只读句柄要先 drop 掉（它们都收在 run_preflight
     //    的作用域里，此刻已经释放）。
-    let purged = purge_index(&idx_path, &opts.agent)?;
-    if purged > 0 && !pf.keep_paths.is_empty() {
+    //
+    //    只有「真的删干净了」才清索引（判定见 [`removal_was_clean`]）：残留
+    //    还在时清索引，agent 就会从列表里消失而它其实还活在盘上——列表说了谎。
+    //    留着索引行，agent 继续可见，直到它真的被删干净。duster 自己删，
+    //    删不掉的如实说一句还列着的原因，而不是叫用户去查。
+    if removal_was_clean(&report, &pf.keep_paths) {
+        purge_index(&idx_path, &opts.agent)?;
+    } else {
+        let survived = report.leftovers.len() + pf.keep_paths.len();
+        let keep_note = if pf.keep_paths.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} of them kept via --keep)", pf.keep_paths.len())
+        };
         report.warnings.push(format!(
-            "kept {} path(s) on disk via --keep, but all {} index rows for `{}` were removed \
-             along with the agent itself — the kept content is no longer tracked by duster",
-            pf.keep_paths.len(),
-            purged,
+            "`{}` is still listed: {survived} path(s) survived the removal{keep_note}; its \
+             index rows were kept so the agent stays visible until it is really gone",
             opts.agent
         ));
     }
@@ -464,6 +541,8 @@ struct Preflight {
     shared: Vec<SharedEdit>,
     /// 清单 `[uninstall].package`；`--data-only` 时为空。
     packages: Vec<PackageHint>,
+    /// 清单 `[uninstall].residue`；`--data-only` 时为空。
+    residues: Vec<ResidueSpec>,
 }
 
 fn run_preflight(opts: &UninstallOptions) -> Result<Preflight> {
@@ -484,12 +563,13 @@ fn run_preflight(opts: &UninstallOptions) -> Result<Preflight> {
     // 后面三项检查的"里/外"口径才是同一个。
     let roots = dedup_top_paths(plan.actionable().map(|i| i.path.clone()).collect());
 
-    // shared / package 两个模式的全部输入都在清单的 `[uninstall]` 段里。
-    // 没有这一段就没有这两个模式——duster 不去猜别人家的配置里哪个键是它的。
+    // shared / package / residue 三个模式的全部输入都在清单的
+    // `[uninstall]` 段里。没有这一段就没有这些模式——duster 不去猜
+    // 别人家的配置里哪个键是它的。
     let section = load_uninstall_section(&home, &opts.agent)?;
-    let (shared, packages) = match (&section, opts.data_only) {
-        (Some(s), false) => (s.shared.clone(), s.package.clone()),
-        _ => (Vec::new(), Vec::new()),
+    let (shared, packages, residues) = match (&section, opts.data_only) {
+        (Some(s), false) => (s.shared.clone(), s.package.clone(), s.residue.clone()),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
     };
 
     let mut warnings: Vec<String> = Vec::new();
@@ -497,14 +577,16 @@ fn run_preflight(opts: &UninstallOptions) -> Result<Preflight> {
     // 还留着一条指向已删程序的声明——这正是「卸载不干净」的现代形态。
     if opts.data_only
         && let Some(s) = &section
-        && !(s.shared.is_empty() && s.package.is_empty())
+        && !(s.shared.is_empty() && s.package.is_empty() && s.residue.is_empty())
     {
         warnings.push(format!(
-            "--data-only: skipped {} shared-file edit(s) and {} package hint(s) that the manifest \
-             declares for `{}`. Re-run without --data-only to also remove its keys from other \
-             agents' config files and to see how it was installed.",
+            "--data-only: skipped {} shared-file edit(s), {} package hint(s) and {} residue(s) \
+             that the manifest declares for `{}`. Re-run without --data-only to also remove its \
+             keys from other agents' config files, see how it was installed, and clean up the \
+             residue it left behind.",
             s.shared.len(),
             s.package.len(),
+            s.residue.len(),
             opts.agent
         ));
     }
@@ -533,6 +615,7 @@ fn run_preflight(opts: &UninstallOptions) -> Result<Preflight> {
         op_id,
         shared,
         packages,
+        residues,
     })
 }
 
@@ -948,6 +1031,204 @@ fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
+// ---------------------------------------------------------------------------
+// residue：声明化的已知残留
+// ---------------------------------------------------------------------------
+
+/// 逐条处理清单声明的残留（`[[uninstall.residue]]`）。
+///
+/// 与 `shared` / `package` 同级，受同一个 `--data-only` 开关管辖：数据模式
+/// 只动 agent 独占的树，别人的文件与别人的库一行都不碰。
+///
+/// `dry_run` 为真时全程只读：shell 行照读文件、sqlite 行只读查库，
+/// 算出「真跑会删什么」，但不建快照、不写盘、不动 db。预览与真跑走
+/// 同一段判断——预览说会删的，真跑就会删。
+fn residue_outcomes(
+    specs: &[ResidueSpec],
+    home: &Path,
+    op_id: &str,
+    dry_run: bool,
+) -> Vec<ResidueOutcome> {
+    specs
+        .iter()
+        .flat_map(|s| match s {
+            ResidueSpec::ShellLine {
+                files,
+                match_,
+                with_comment_above,
+                why,
+            } => files
+                .iter()
+                .map(|f| {
+                    shell_line_one(
+                        home,
+                        f,
+                        match_,
+                        *with_comment_above,
+                        why,
+                        op_id,
+                        dry_run,
+                    )
+                })
+                .collect(),
+            ResidueSpec::SqliteRow {
+                db,
+                table,
+                column,
+                equals,
+                why,
+            } => vec![sqlite_row_one(home, db, table, column, equals, why, op_id, dry_run)],
+        })
+        .collect()
+}
+
+/// shell_line 单文件处理。一个文件一条结果。
+///
+/// 逐字节规矩：命中行整行删（行终止符跟着它一起走），未命中的行
+/// **原样保留**——包括行尾空白与最后一行有没有换行，一个字节都不改。
+/// 这靠按字节切行、按字节拼回实现：`split_inclusive('\n')` 让每一行都
+/// 带着自己的终止符，拼回时只丢掉 `drop` 表里标中的那些。
+fn shell_line_one(
+    home: &Path,
+    raw: &str,
+    match_: &str,
+    with_comment_above: bool,
+    why: &str,
+    op_id: &str,
+    dry_run: bool,
+) -> ResidueOutcome {
+    let path = expand_home(home, raw);
+    let what = if with_comment_above {
+        format!("shell line containing `{match_}` (and the comment directly above it, if any)")
+    } else {
+        format!("shell line containing `{match_}`")
+    };
+    let mk = |action: ResidueAction| ResidueOutcome {
+        what: what.clone(),
+        path: path.clone(),
+        why: why.to_string(),
+        action,
+    };
+
+    // `files` 里不存在的文件跳过：没有它就没有可删的行，这不是错误。
+    if !path.is_file() {
+        return mk(ResidueAction::NotFound);
+    }
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => return mk(ResidueAction::Failed(format!("cannot read this file: {e:#}"))),
+    };
+    if bytes.len() as u64 > MAX_SHARED_BYTES {
+        return mk(ResidueAction::Failed(format!(
+            "file is larger than the {} byte config-file ceiling",
+            MAX_SHARED_BYTES
+        )));
+    }
+    let needle = match_.as_bytes();
+    if needle.is_empty() {
+        return mk(ResidueAction::Failed("match pattern is empty".to_string()));
+    }
+
+    // 按字节切行。每一行自带终止符（`\r\n` 或 `\n`），最后一行可以没有。
+    let lines: Vec<&[u8]> = bytes.split_inclusive(|&b| b == b'\n').collect();
+    let mut drop = vec![false; lines.len()];
+    let mut hits = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        // 子串包含匹配整行（含终止符在内都不影响路径类子串的命中）。
+        if line.windows(needle.len()).any(|w| w == needle) {
+            drop[i] = true;
+            hits += 1;
+            // 命中行紧邻的上一行若去空白后以 `#` 开头，是安装脚本留在
+            // 上面的注释，一并删。去空白用 trim_ascii：`\r` 也算空白，
+            // CRLF 文件的注释行同样认得出。
+            if with_comment_above && i > 0 && lines[i - 1].trim_ascii().starts_with(b"#") {
+                drop[i - 1] = true;
+            }
+        }
+    }
+    if hits == 0 {
+        return mk(ResidueAction::NotFound);
+    }
+    if dry_run {
+        return mk(ResidueAction::Planned);
+    }
+
+    // 删前整文件快照。写不出退路就不动手：快照失败这一条作废，
+    // 那个文件一个字节都不动（调用方把原因记进 warnings）。
+    if let Err(e) = snapshot_before_rewrite(&path, home, op_id) {
+        return mk(ResidueAction::Failed(format!("{e:#}")));
+    }
+    let kept: Vec<&[u8]> = lines
+        .iter()
+        .zip(&drop)
+        .filter(|(_, d)| !**d)
+        .map(|(l, _)| *l)
+        .collect();
+    if let Err(e) = duster_fs::atomic::write_atomic(&path, &kept.concat()) {
+        return mk(ResidueAction::Failed(format!("{e:#}")));
+    }
+    mk(ResidueAction::Removed)
+}
+
+/// sqlite_row 单条处理。
+///
+/// 顺序是刻意的：**先只读问「这一行还在吗」，不在就 NotFound 了事**——
+/// 快照是写的前提，不是报告的前提，为一场根本没发生的删除建快照是浪费。
+/// 问完再快照再删；检查与删除之间若被别人抢先删掉（0 行受影响），
+/// 如实报 NotFound，不报错。
+fn sqlite_row_one(
+    home: &Path,
+    raw_db: &str,
+    table: &str,
+    column: &str,
+    equals: &str,
+    why: &str,
+    op_id: &str,
+    dry_run: bool,
+) -> ResidueOutcome {
+    let path = expand_home(home, raw_db);
+    let what = format!("row `{equals}` in `{table}`.`{column}`");
+    let mk = |action: ResidueAction| ResidueOutcome {
+        what: what.clone(),
+        path: path.clone(),
+        why: why.to_string(),
+        action,
+    };
+
+    // 库不在 = 残留本来就不在。这不是错误，卸载两遍不该报错。
+    if !path.is_file() {
+        return mk(ResidueAction::NotFound);
+    }
+    let count = match duster_index::foreign::count_rows(&path, table, column, equals) {
+        Ok(Some(n)) => n,
+        // 库读不到（不是 SQLite、被锁、损坏、加密）≠ 本来就没了。
+        Ok(None) => {
+            return mk(ResidueAction::Failed(format!(
+                "cannot read {}: not a SQLite database, or it is locked, corrupt or encrypted",
+                path.display()
+            )));
+        }
+        // 表/列不存在、标识符不合法——清单声明跟库的实际形状对不上。
+        Err(e) => return mk(ResidueAction::Failed(format!("{e:#}"))),
+    };
+    if count == 0 {
+        return mk(ResidueAction::NotFound);
+    }
+    if dry_run {
+        return mk(ResidueAction::Planned);
+    }
+
+    // 删前整文件快照。写不出退路就不动手。
+    if let Err(e) = snapshot_before_rewrite(&path, home, op_id) {
+        return mk(ResidueAction::Failed(format!("{e:#}")));
+    }
+    match duster_index::foreign::delete_row(&path, table, column, equals) {
+        Ok(n) if n > 0 => mk(ResidueAction::Removed),
+        Ok(_) => mk(ResidueAction::NotFound),
+        Err(e) => mk(ResidueAction::Failed(format!("{e:#}"))),
+    }
+}
+
 /// 检查一：交叉引用。卸载 A 不得打断 B。
 ///
 /// # 三类引用，危险程度并不相同
@@ -1160,9 +1441,11 @@ fn check_cross_reference(
 /// 出路只有两条，缺一即失败：`--export-first` 打包带走，或 `--keep` 留在原地。
 /// 第三条"什么都不做直接删"不存在——那不是选项，那是事故。
 ///
-/// 归档阈值与 prune 同一条规矩：预估超过 [`archive::AUTO_ARCHIVE_LIMIT`]
-/// 而用户没表态时拒绝执行。本机 codex 是 sessions 352 MB +
-/// archived_sessions 242 MB，替他决定打不打包都是错的。
+/// 归档阈值：预估超过 [`archive::AUTO_ARCHIVE_LIMIT`] 而用户没表态时拒绝
+/// 执行。prune 已撤掉这道门（恒归档、超阈值只把体积报出来），uninstall
+/// 仍保留——卸载是一次性的，没有「先出计划再确认」的流程兜底。
+/// 本机 codex 是 sessions 352 MB + archived_sessions 242 MB，替他决定
+/// 打不打包都是错的。
 fn check_data_escape(
     opts: &UninstallOptions,
     home: &Path,
@@ -1647,8 +1930,35 @@ fn cc_switch_backups(home: &Path, agent: &str) -> Vec<PathBuf> {
     out
 }
 
+/// 判定这次卸载是否「真的删干净了」。只有干净才允许清索引。
+///
+/// 不干净的定义：
+/// 1. `leftovers` 非空——删除后仍有路径活着，agent 还在盘上；
+/// 2. `keep_paths` 非空——`--keep` 指名保留的内容还在，agent 就没走完。
+///
+/// 3. **residue 失败**——清单声明的外部残留（shell rc 里的 PATH 行、
+///    cc-switch 数据库行）没删掉时，agent 同样还活着：它的痕迹还散在
+///    别人家的文件里，从列表里抹掉它就是撒谎。
+///
+/// `NotFound` 不算不干净：声明的残留本来就不在这台机器上（比如根本没装
+/// 过 cc-switch），那是「无事可做」，不是「没做成」。
+///
+/// 反过来：残留清光才清索引，agent 才能从列表里消失——「没删干净就继续
+/// 显示在列表里」正是列表说实话的本分。
+fn removal_was_clean(report: &UninstallReport, keep_paths: &[PathBuf]) -> bool {
+    report.leftovers.is_empty()
+        && keep_paths.is_empty()
+        && !report
+            .residues
+            .iter()
+            .any(|r| matches!(r.action, ResidueAction::Failed(_)))
+}
+
 /// 清索引：先删该 agent 的全部资源行（连带 turn 与 fts_turn），再删 agent 行。
 /// 返回删掉的资源行数。库不存在时跳过——没有索引不该让卸载失败。
+///
+/// 调用方必须先用 [`removal_was_clean`] 判定卸载真的干净了：残留还在时
+/// 清索引会让 agent 从列表里消失而它其实还活着。
 fn purge_index(idx_path: &Path, agent: &str) -> Result<usize> {
     if !idx_path.is_file() {
         return Ok(0);
@@ -1679,20 +1989,6 @@ fn bullet(lines: &[String]) -> String {
         .join("\n")
 }
 
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i + 1 < UNITS.len() {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[i])
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1925,6 +2221,137 @@ mod tests {
             !query::agent_ids(idx.conn())
                 .unwrap()
                 .contains(&"codex".to_string())
+        );
+    }
+
+    /// 删不干净就不清索引：agent 继续显示在列表里，直到它真的被删干净。
+    ///
+    /// 现场：把 `computer-use/` 设成只读（unlink 需要目录写权限，普通用户
+    /// 下 `remove_dir_all` 必然摘不掉里面的 `blob.bin`），卸载留下残留——
+    /// 索引行必须原样保留，并有一句人话解释为什么还列着。
+    #[test]
+    fn 删不干净时_索引保留_agent_继续可见() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fake_home(tmp.path());
+        let index_path = fake_index(tmp.path());
+        let stuck = tmp.path().join(".codex/computer-use");
+        let mut perm = fs::metadata(&stuck).unwrap().permissions();
+        perm.set_mode(0o555);
+        fs::set_permissions(&stuck, perm).unwrap();
+
+        let mut opts = base_opts(tmp.path(), &index_path);
+        opts.dry_run = false;
+        let report = uninstall(&opts).unwrap();
+
+        // 残留如实报出来——不假装卸载成功。
+        assert!(!report.leftovers.is_empty(), "{:?}", report.leftovers);
+        // 索引原样保留：agent 还在列表里。
+        assert_eq!(agent_rows(&index_path, "codex"), 4);
+        let idx = Index::open_readonly(&index_path).unwrap();
+        assert!(
+            query::agent_ids(idx.conn())
+                .unwrap()
+                .contains(&"codex".to_string())
+        );
+        drop(idx);
+        // 必须有一句人话解释为什么还列着，而不是叫用户自己去查。
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("is still listed")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    /// 删干净了才清索引——与「删不干净时_索引保留_agent_继续可见」互为镜像：
+    /// 残留为空时资源行与 agent 行全部清掉，agent 从列表消失，也不需要
+    /// 「still listed」警告。
+    #[test]
+    fn 删干净了才清索引() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_home(tmp.path());
+        let index_path = fake_index(tmp.path());
+        let mut opts = base_opts(tmp.path(), &index_path);
+        opts.dry_run = false;
+
+        let report = uninstall(&opts).unwrap();
+        assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
+        assert_eq!(agent_rows(&index_path, "codex"), 0);
+        let idx = Index::open_readonly(&index_path).unwrap();
+        assert!(
+            !query::agent_ids(idx.conn())
+                .unwrap()
+                .contains(&"codex".to_string())
+        );
+        drop(idx);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("is still listed")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    /// residue 删不掉 ⇒ 索引不清 ⇒ agent 继续显示在列表里。
+    ///
+    /// 这条是「残留真删」与「列表说实话」两块改动**唯一的咬合点**，而它
+    /// 横跨两个函数（residue 引擎填 `residues`、`removal_was_clean` 读它），
+    /// 最容易在改动中悄悄断掉:引擎照样跑、列表照样清，只是再也不咬合了,
+    /// 全套测试还是绿的。所以直接对 `removal_was_clean` 下断言。
+    #[test]
+    fn residue_失败也算没删干净() {
+        let mk = |action: ResidueAction| ResidueOutcome {
+            what: "PATH entry".to_string(),
+            path: PathBuf::from("/home/u/.zshrc"),
+            why: "installer added it".to_string(),
+            action,
+        };
+        // 只有 residues 这一维在变,其余字段全部取「干净」值:这条测试问的
+        // 就是 residue 单独能不能拖住索引。不给 UninstallReport 派生
+        // Default——那是为测试便利改生产结构体。
+        let report = |residues: Vec<ResidueOutcome>| UninstallReport {
+            plan: Plan {
+                verb: crate::plan::Verb::Uninstall,
+                items: Vec::new(),
+                reclaim_bytes: 0,
+                install_bytes: 0,
+                stale_bytes: 0,
+                warnings: Vec::new(),
+            },
+            checks: Vec::new(),
+            executed: true,
+            removed_bytes: 0,
+            archive_path: None,
+            archive_bytes: None,
+            leftovers: Vec::new(),
+            shared: Vec::new(),
+            packages: Vec::new(),
+            residues,
+            warnings: Vec::new(),
+        };
+
+        // 全清光 = 干净，索引该清。
+        assert!(removal_was_clean(&report(vec![]), &[]));
+
+        // 声明的残留压根不在这台机器上：无事可做,不是没做成。
+        assert!(
+            removal_was_clean(&report(vec![mk(ResidueAction::NotFound)]), &[]),
+            "NotFound 不该拖住索引"
+        );
+
+        // 真的删不掉:痕迹还散在别人家文件里,列表不许抹掉它。
+        assert!(
+            !removal_was_clean(
+                &report(vec![mk(ResidueAction::Failed("permission denied".into()))]),
+                &[]
+            ),
+            "residue 删不掉就必须继续显示在列表里"
         );
     }
 
@@ -2245,6 +2672,304 @@ command = ["{remove}", "--global", "demo agent"]
             .iter()
             .find(|s| s.key == key)
             .unwrap_or_else(|| panic!("报告里没有 {key}：{:?}", report.shared))
+    }
+
+    /// 造一个带 `[[uninstall.residue]]` 段的假 home：shell rc 里躺着安装脚本
+    /// 追加的 PATH 行（上方还留着它的注释行），cc-switch 的库里躺着供应商
+    /// 行，外加一条指向不存在表的声明——「删掉 / 找不到 / 失败」三种结局
+    /// 一次测齐。永不碰真实 `~`。
+    fn residue_home(home: &Path) -> PathBuf {
+        fs::create_dir_all(home.join(".demo-agent")).unwrap();
+        // 第二行故意带行尾空白：未命中行必须逐字节活下来，包括它。
+        fs::write(
+            home.join(".zshrc"),
+            "# demo agent shell config\nexport FOO=bar   \n# opencode\nexport PATH=/Users/laibu/.opencode/bin:$PATH\nalias ll='ls -la'\n",
+        )
+        .unwrap();
+
+        let cc = home.join(".cc-switch");
+        fs::create_dir_all(&cc).unwrap();
+        {
+            let conn = rusqlite::Connection::open(cc.join("cc-switch.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE providers(id TEXT PRIMARY KEY, name TEXT, enabled INTEGER);
+                 INSERT INTO providers VALUES ('claude-official', 'Claude Official', 1);
+                 INSERT INTO providers VALUES ('codex-official', 'Codex Official', 0);
+                 INSERT INTO providers VALUES ('keeper', 'Keeper', 1);",
+            )
+            .unwrap();
+        }
+
+        let adapters = home.join(".agent-duster/adapters");
+        fs::create_dir_all(&adapters).unwrap();
+        fs::write(
+            adapters.join("demo-agent.toml"),
+            r#"
+[agent]
+id = "demo-agent"
+display_name = "Demo Agent"
+
+[probe]
+any_of = ["~/.demo-agent"]
+
+[uninstall]
+owns = ["~/.demo-agent"]
+
+[[uninstall.residue]]
+kind = "shell_line"
+files = ["~/.zshrc", "~/.zprofile"]
+match = "/.opencode/bin"
+with_comment_above = true
+why = "PATH entry added by the opencode installer"
+
+[[uninstall.residue]]
+kind = "sqlite_row"
+db = "~/.cc-switch/cc-switch.db"
+table = "providers"
+column = "id"
+equals = "claude-official"
+why = "cc-switch keeps one provider row per agent"
+
+[[uninstall.residue]]
+kind = "sqlite_row"
+db = "~/.cc-switch/cc-switch.db"
+table = "no_such_table"
+column = "id"
+equals = "x"
+why = "a table that does not exist must fail, not panic"
+"#,
+        )
+        .unwrap();
+
+        // 索引里只有 agent 行、没有资源行：data-escape 没有 session/memory
+        // 可逃，export_first=false 也照常通过（与 demo_home 同一条路）。
+        let index_path = home.join(".agent-duster/index.db");
+        let idx = Index::open(&index_path).unwrap();
+        duster_index::upsert::upsert_agent(
+            idx.conn(),
+            &duster_model::AgentInfo {
+                id: "demo-agent".to_string(),
+                display_name: "Demo Agent".to_string(),
+                root: home.join(".demo-agent"),
+                version: None,
+            },
+            0,
+        )
+        .unwrap();
+        drop(idx);
+        index_path
+    }
+
+    /// 取某条残留的结果，按路径后缀找。
+    fn residue<'a>(report: &'a UninstallReport, suffix: &str) -> &'a ResidueOutcome {
+        report
+            .residues
+            .iter()
+            .find(|r| r.path.to_string_lossy().ends_with(suffix))
+            .unwrap_or_else(|| panic!("报告里没有路径以 {suffix} 结尾的残留：{:?}", report.residues))
+    }
+
+    /// shell_line：命中行连同上方注释整行删掉，其余行**逐字节不变**
+    /// （含行尾空白与最后的换行），快照里是改写前的原文。
+    #[test]
+    fn residue_shell_line_删命中行留快照其余逐字节不变() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let index_path = residue_home(home);
+
+        let report = uninstall(&demo_opts(home, &index_path)).unwrap();
+        assert!(report.executed);
+
+        let zsh = residue(&report, ".zshrc");
+        assert_eq!(zsh.action, ResidueAction::Removed, "{:?}", zsh);
+        assert_eq!(
+            zsh.what,
+            "shell line containing `/.opencode/bin` (and the comment directly above it, if any)"
+        );
+        assert_eq!(zsh.why, "PATH entry added by the opencode installer");
+        // `~/.zprofile` 不存在：本来就是 NotFound，不是错误。
+        assert_eq!(
+            residue(&report, ".zprofile").action,
+            ResidueAction::NotFound
+        );
+
+        // 命中行 + 上方注释都该没了；其余行逐字节不变，连行尾空白都留着。
+        assert_eq!(
+            fs::read_to_string(home.join(".zshrc")).unwrap(),
+            "# demo agent shell config\nexport FOO=bar   \nalias ll='ls -la'\n",
+            "未命中行必须逐字节原样，含行尾空白与最后的换行"
+        );
+
+        // 快照里必须是改写前的原文，两行都还在。db 快照是二进制，不能当
+        // 文本读，这里只挑 `.zshrc` 那份。
+        let snaps = home.join(".agent-duster/snapshots");
+        let mut found = Vec::new();
+        for op in fs::read_dir(&snaps).expect("必须建出快照目录").flatten() {
+            found.extend(walkdir(&op.path()));
+        }
+        let zsh_snap = found
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with("zshrc"))
+            .unwrap_or_else(|| panic!("要有 .zshrc 快照：{found:?}"));
+        let body = fs::read_to_string(zsh_snap).unwrap();
+        assert!(
+            body.contains("# opencode\n") && body.contains("/.opencode/bin"),
+            "快照里必须是改写前的原文：{body:?}"
+        );
+    }
+
+    /// sqlite_row：命中行没了、别的行还在、快照里是原库；表不存在那条
+    /// 报 Failed（不是 panic），并有一条 warning 把原因说出来。
+    #[test]
+    fn residue_sqlite_row_删命中行留快照别的行还在() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let index_path = residue_home(home);
+
+        let report = uninstall(&demo_opts(home, &index_path)).unwrap();
+        assert!(report.executed);
+
+        let db = residue(&report, "cc-switch.db");
+        assert_eq!(db.action, ResidueAction::Removed, "{:?}", db);
+        assert_eq!(db.what, "row `claude-official` in `providers`.`id`");
+        assert_eq!(db.why, "cc-switch keeps one provider row per agent");
+        // 清单声明与库实际形状对不上 → Failed，不是 panic。
+        let failed: Vec<&ResidueOutcome> = report
+            .residues
+            .iter()
+            .filter(|r| matches!(r.action, ResidueAction::Failed(_)))
+            .collect();
+        assert_eq!(failed.len(), 1, "{:?}", report.residues);
+        assert!(
+            failed[0].what.contains("no_such_table"),
+            "{:?}",
+            failed[0]
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not remove residue")),
+            "{:?}",
+            report.warnings
+        );
+
+        // 命中行没了，别的行还在。
+        let conn = rusqlite::Connection::open(home.join(".cc-switch/cc-switch.db")).unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT id FROM providers ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["codex-official", "keeper"], "别的行必须原样还在");
+
+        // 快照里是原库：被删的那一行还躺在快照里。
+        let snaps = home.join(".agent-duster/snapshots");
+        let mut found = Vec::new();
+        for op in fs::read_dir(&snaps).unwrap().flatten() {
+            found.extend(walkdir(&op.path()));
+        }
+        let db_snap = found
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with("cc-switch.db"))
+            .unwrap_or_else(|| panic!("要有 db 快照：{found:?}"));
+        let snap_conn = rusqlite::Connection::open(db_snap).unwrap();
+        let n: i64 = snap_conn
+            .query_row(
+                "SELECT count(*) FROM providers WHERE id = 'claude-official'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "快照里必须还躺着被删掉的那一行");
+    }
+
+    /// dry-run：两种 kind 都只报不删——一个字节不改、不建快照、不动 db，
+    /// 而且「会删什么」要如实算出来（Planned，不是 Removed）。
+    #[test]
+    fn residue_dry_run_一个字节不碰也不留快照() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let index_path = residue_home(home);
+        let zshrc_before = fs::read(home.join(".zshrc")).unwrap();
+        let db_before = fs::read(home.join(".cc-switch/cc-switch.db")).unwrap();
+
+        let mut opts = demo_opts(home, &index_path);
+        opts.dry_run = true;
+        let report = uninstall(&opts).unwrap();
+
+        assert!(!report.executed);
+        assert_eq!(
+            residue(&report, ".zshrc").action,
+            ResidueAction::Planned,
+            "预览要说「真跑会删」，而不是假装已经删了"
+        );
+        assert_eq!(
+            residue(&report, "cc-switch.db").action,
+            ResidueAction::Planned
+        );
+        // 表不存在的声明在预览里同样如实报 Failed。
+        assert!(
+            report
+                .residues
+                .iter()
+                .any(|r| matches!(r.action, ResidueAction::Failed(_))),
+            "{:?}",
+            report.residues
+        );
+
+        // 一个字节没改，也没有任何快照。
+        assert_eq!(fs::read(home.join(".zshrc")).unwrap(), zshrc_before);
+        assert_eq!(
+            fs::read(home.join(".cc-switch/cc-switch.db")).unwrap(),
+            db_before
+        );
+        assert!(
+            !home.join(".agent-duster/snapshots").exists(),
+            "dry-run 不许建快照"
+        );
+    }
+
+    /// `--data-only` 连残留一起跳过，并把跳过了几条如实说出来；
+    /// 文件和库都原样躺着。
+    #[test]
+    fn data_only_连残留也一起跳过并如实说明() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let index_path = residue_home(home);
+        let mut opts = demo_opts(home, &index_path);
+        opts.data_only = true;
+
+        let report = uninstall(&opts).unwrap();
+        assert!(
+            report.residues.is_empty(),
+            "data-only 不该碰残留：{:?}",
+            report.residues
+        );
+        let note = report
+            .warnings
+            .iter()
+            .find(|w| w.contains("--data-only"))
+            .unwrap_or_else(|| panic!("跳过了就必须说出来：{:?}", report.warnings));
+        assert!(note.contains("3 residue(s)"), "{note}");
+        // 文件与库都原样。
+        assert!(
+            fs::read_to_string(home.join(".zshrc"))
+                .unwrap()
+                .contains("# opencode\n"),
+            "PATH 行必须还在"
+        );
+        let conn = rusqlite::Connection::open(home.join(".cc-switch/cc-switch.db")).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM providers WHERE id = 'claude-official'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "供应商行必须还在");
     }
 
     /// M2 验收线的前半句：**`uninstall` 对 `shared` 段落只删本 agent 的键，

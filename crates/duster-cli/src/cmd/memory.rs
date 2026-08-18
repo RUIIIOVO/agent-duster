@@ -35,7 +35,7 @@ use duster_core::memory::{
 };
 
 use crate::output::{
-    EXIT_CONFIRM_DENIED, EXIT_OK, EXIT_PARTIAL, OutputMode, Table, accent, display_width,
+    EXIT_CONFIRM_DENIED, EXIT_OK, EXIT_PARTIAL, OutputMode, Prefix, Table, accent, display_width,
     emit_json, human_bytes, muted, truncate_width,
 };
 use crate::{fail, render_warnings};
@@ -159,19 +159,19 @@ fn list(mode: OutputMode, index: Option<&Path>, agents: &[String]) -> i32 {
 /// SCOPE 列的宽度上限。项目段是**有损编码**串（`Users-x-Code-a-b`），
 /// 不是给人复制的地址，只是个分组标签，所以这一列可以截。
 ///
-/// 17 是 80 列预算里挤出来的：AGENT 11 + STORE 9 + SIZE 6 + 列间空隙 10 +
-/// 缩进 2 已占 38 列，SCOPE 与 TITLE 合起来只能拿 38 列，余下 4 列给 PATH。
-/// `flex_col` 只截 PATH，其余列必须自己先放得下，PATH 表头才不会在窄终端上
-/// 被截成省略号。
-const SCOPE_MAX: usize = 17;
+/// 12 是 80 列预算里挤出来的：AGENT 11 + STORE 9 + SIZE 6 + LAST USED 9 +
+/// 列间空隙 12 + 缩进 2 已占 49 列，SCOPE 与 TITLE 合起来只能拿 27 列，
+/// 余下 4 列给 PATH。`flex_col` 只截 PATH，其余列必须自己先放得下，PATH
+/// 表头才不会在窄终端上被截成省略号。
+const SCOPE_MAX: usize = 12;
 
 /// TITLE 列的宽度上限。
 ///
 /// 标题是散文（qoder 的一条能有 66 个字符），截了还认得出是哪条。PATH 列
 /// 的宽账记在 flex_col 头上（见模块文档）：TTY 上吃终端余量，重定向里不截。
-/// 21 与 SCOPE_MAX 的 17 合起来正好填满 80 列预算里剩下的 38 列——
-/// 多给 TITLE 四列，因为它才是认得出哪条记忆的那一列。
-const TITLE_MAX: usize = 21;
+/// 15 与 SCOPE_MAX 的 12 合起来正好填满 80 列预算里剩下的 27 列——
+/// 多给 TITLE 三列，因为它才是认得出哪条记忆的那一列。
+const TITLE_MAX: usize = 15;
 
 /// 空表的说明文本:说清是「哪都没有」还是「这个 agent 没有」——后者附上
 /// 有哪些 agent 真有记忆,省得用户挨个试 agent id。命令与交互菜单共用一份
@@ -198,13 +198,15 @@ fn render_list(entries: &[&MemoryEntry], total: u64, agents: &[String], all: &[M
         return;
     }
 
-    let mut t = Table::new(vec!["AGENT", "SCOPE", "TITLE", "STORE", "SIZE", "PATH"]);
+    let mut t = Table::new(vec![
+        "AGENT", "SCOPE", "TITLE", "STORE", "SIZE", "LAST USED", "PATH",
+    ]);
     t.color_col(0, accent());
     t.right_align(&[4]);
-    t.color_col(5, muted());
+    t.color_col(6, muted());
     // 路径列吃终端余量:交互菜单里选中即 `show`(key 直接递,不手抄),
     // TTY 上截断不再切断入口;重定向不是 TTY,这里不生效,路径完整落文件。
-    t.flex_col(5);
+    t.flex_col(6);
     for e in entries {
         t.push_row(vec![
             e.agent_id.clone(),
@@ -212,6 +214,9 @@ fn render_list(entries: &[&MemoryEntry], total: u64, agents: &[String], all: &[M
             truncate_width(&e.title, TITLE_MAX),
             store_label(e.store).to_string(),
             human_bytes(e.bytes),
+            // 与 session list 的 LAST USED 同一口径:索引行的 mtime,
+            // 没有证据印 `never`,不编 1970 年出来。
+            crate::relative_time(e.last_used_ms),
             // key 列:只折 `$HOME`,折叠形态就是 `show` 接受的参数。
             fold_home(&e.path.display().to_string()),
         ]);
@@ -287,54 +292,42 @@ fn store_label(store: MemoryStore) -> &'static str {
 /// (key 是折叠后的完整路径,与显示文本无关),手抄不再是唯一入口,截断的
 /// 代价消失了。行文本是纯文本,宽度按 [`display_width`] 算,宽字符不顶歪。
 pub(crate) fn browse_rows(entries: &[&MemoryEntry]) -> (String, Vec<String>, Vec<String>) {
-    const HEAD: [&str; 6] = ["AGENT", "SCOPE", "TITLE", "STORE", "SIZE", "PATH"];
-    let cells: Vec<[String; 6]> = entries
-        .iter()
-        .map(|e| {
-            [
-                e.agent_id.clone(),
-                scope_cell(e),
-                truncate_width(&e.title, TITLE_MAX),
-                store_label(e.store).to_string(),
-                human_bytes(e.bytes),
-                fold_home(&e.path.display().to_string()),
-            ]
-        })
-        .collect();
-    // 前五列定宽(表头 + 本批最宽);PATH 吃余量。
-    let mut w = [0usize; 5];
-    for (c, width) in w.iter_mut().enumerate() {
-        *width = cells
-            .iter()
-            .map(|r| display_width(&r[c]))
-            .chain(std::iter::once(HEAD[c].len()))
-            .max()
-            .unwrap_or(0);
+    browse_rows_at(entries, terminal_cols())
+}
+
+/// 宽度算法本体;`cols` 由测试直接给(60 / 80 / 200),不必 mock 终端。
+/// 前缀预算是 [`Prefix::Checkbox`]:统一列表流的浏览表每行画 `❯ [x] `。
+///
+/// 布局与 [`render_list`] 共用同一份常量(SCOPE_MAX / TITLE_MAX / 列序),
+/// 只有 PATH 的截法不同:这里按 `cols` 余量截,打印表交给 `Table::render`
+/// 的 flex 列。LAST USED 保持内容宽(它天然短,`never` / `3 days ago` 这个
+/// 量级),不设 flex——那列吃余量会把 PATH 挤到没有,而 PATH 才是要认的 key。
+pub(crate) fn browse_rows_at(
+    entries: &[&MemoryEntry],
+    cols: usize,
+) -> (String, Vec<String>, Vec<String>) {
+    let mut t = Table::new(vec![
+        "AGENT", "SCOPE", "TITLE", "STORE", "SIZE", "LAST USED", "PATH",
+    ]);
+    t.right_align(&[4]);
+    t.flex_col(6);
+    for e in entries {
+        t.push_row(vec![
+            e.agent_id.clone(),
+            scope_cell(e),
+            truncate_width(&e.title, TITLE_MAX),
+            store_label(e.store).to_string(),
+            human_bytes(e.bytes),
+            crate::relative_time(e.last_used_ms),
+            fold_home(&e.path.display().to_string()),
+        ]);
     }
-    // 控件前缀(`❯ [x] `,浏览表带勾选)+ 五列间各两空格 + 尾部留一列,
-    // 余下的全给 PATH。
-    let fixed: usize =
-        crate::output::Prefix::Checkbox.width() + w.iter().sum::<usize>() + 2 * 5 + 1;
-    let path_w = terminal_cols().saturating_sub(fixed).max(16);
-    let line = |r: &[String; 6]| {
-        format!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:>w4$}  {}",
-            r[0],
-            r[1],
-            r[2],
-            r[3],
-            r[4],
-            truncate_width(&r[5], path_w),
-            w0 = w[0],
-            w1 = w[1],
-            w2 = w[2],
-            w3 = w[3],
-            w4 = w[4],
-        )
-    };
-    let header = line(&HEAD.map(str::to_string));
-    let keys = cells.iter().map(|r| r[5].clone()).collect();
-    (header, cells.iter().map(line).collect(), keys)
+    let (header, rows) = t.rows_at(Prefix::Checkbox, cols);
+    let keys: Vec<String> = entries
+        .iter()
+        .map(|e| fold_home(&e.path.display().to_string()))
+        .collect();
+    (header, rows, keys)
 }
 
 /// 终端列数(stderr——菜单渲染在 stderr 上);取不到按 100 列算。
@@ -925,6 +918,62 @@ mod tests {
             path: std::path::PathBuf::from(path),
             bytes: 0,
             mtime_ms: 0,
+            last_used_ms: None,
+        }
+    }
+
+    /// LAST USED 列的两种长相：没有时间戳证据印 `never`（绝不是 1970 年），
+    /// 有证据印相对时间。与 session 列表同一套 `relative_time`，逐字对齐。
+    #[test]
+    fn browse_rows_last_used_无证据印never_有证据印相对时间() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let never = entry("codex", "/Users/me/.codex/AGENTS.md");
+        let stale = MemoryEntry {
+            // 恰好三天前：`3 days ago`，与墙钟无关。
+            last_used_ms: Some(now - 3 * 86_400_000),
+            ..never.clone()
+        };
+        let (_, rows, _) = browse_rows_at(&[&never, &stale], 200);
+        assert!(rows[0].contains("never"), "{}", rows[0]);
+        assert!(rows[1].contains("3 days ago"), "{}", rows[1]);
+    }
+
+    /// 浏览表的每一行(含表头)加上控件前缀 `❯ [x] `(6 列)后,显示宽度必须
+    /// 严格小于终端宽度——行宽碰到终端宽就会折成两个物理行,而控件按逻辑
+    /// 行计数、`clear_last_lines` 按物理行擦,残影每按一次翻一倍。夹具用
+    /// 长标题 + 长路径把 60 列档逼到 LAST USED 与 TITLE 都贴地板。
+    #[test]
+    fn browse_rows_行宽不超终端() {
+        let entries: Vec<MemoryEntry> = [
+            ("claude-code", "/Users/me/.claude/CLAUDE.md"),
+            ("gemini-cli", "/Users/me/.gemini/GEMINI.md"),
+            (
+                "qoder",
+                "/Users/me/.qoder/memories/abc/projects/Users-x-Code-agent-duster/coding/rust.md",
+            ),
+        ]
+        .iter()
+        .map(|(agent, path)| MemoryEntry {
+            title: "the longest memory title anyone ever wrote in a single line".to_string(),
+            // 固定过去时间:相对时间渲染成「1007 days ago」,把 LAST USED
+            // 列顶到最宽,与墙钟无关。
+            last_used_ms: Some(1_700_000_000_000),
+            ..entry(agent, path)
+        })
+        .collect();
+        let refs: Vec<&MemoryEntry> = entries.iter().collect();
+        for cols in [60usize, 80, 200] {
+            let (header, lines, _) = browse_rows_at(&refs, cols);
+            for line in std::iter::once(&header).chain(lines.iter()) {
+                let w = crate::output::Prefix::Checkbox.width() + display_width(line);
+                assert!(
+                    w < cols,
+                    "{cols} 列终端:行宽 {w} 超限: {line}"
+                );
+            }
         }
     }
 }

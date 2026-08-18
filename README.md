@@ -70,12 +70,12 @@ from scratch if search ever looks wrong.
 | `duster search <query>` | Full-text search across every agent's conversations; `--agent` narrows it (comma-separated for several), `--limit` sizes it. Hits are the extracted conversation text, not the raw transcript line. `duster open <id>` prints the whole turn a hit came from — hand it a conversation id instead and it prints the conversation, saying so. |
 | `duster session list \| show \| export \| migrate \| prune \| rm` | Browse conversations across all agents, newest first; filter by `--agent` / `--project` / `--older-than` / `--min-bytes`. `show` prints one conversation as prose: tool output collapses to one line each (`## tool · read · 4.3 KB`) and long bodies stop at 40 lines, because you came to read the conversation, not the return value of `read()`; `--full` gives you everything. `export` writes it out as Markdown or JSON, always in full. `migrate <id> --to <agent>` plants a **text-only copy** of one conversation into claude-code, codex or omp — **deliberately lossy**: only user/assistant prose is carried over; thinking and tool activity are dropped, each dropped stretch collapsing to one `[tool activity omitted]` line, and the first message is stamped with where the copy came from. The three formats' tool records are mutually untranslatable, so duster refuses to forge them — and it re-reads the written file with the same parser `scan` uses before reporting success (`--dry-run` previews, any other agent gets `sessions are stats-only, cannot migrate`). `prune --older-than 90d` compresses in place to `.zst` and deletes the original only after the decompressed bytes hash back to the same BLAKE3 — search and open still read it afterwards. `rm <id>` deletes one conversation for good — a readable copy is archived into `~/agent-duster-exports/` first (`--no-archive` skips that for scripts); conversations stored in an agent's SQLite database (opencode / omp) are removed row by row from that database, with a whole-file snapshot taken before the write. |
 | `duster memory list \| show \| migrate \| rm` | One view over `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, Qoder's per-project memory trees and SQLite-backed stores alike. `list` gives you the key, `show` prints that one memory. `migrate --from <A> --to <B>` copies the text into a marked block inside the target agent's memory file (`<!-- duster:begin from=… -->`); re-running replaces the block instead of stacking a second copy, your own writing around it is never touched, and `--dry-run` prints the block without writing anything. `rm <key> [--from <A>]` cuts out exactly the marked block migrated from A — byte for byte around it — and `--whole-file` deletes the whole file instead; a file that is only duster's block (a `from-<agent>-*.md` in a directory target, or a file left with nothing but blocks) is removed whole. Agents whose "memory" is a settings file or database (stats-only) are refused as source and as target. Everything is archived to `~/agent-duster-exports/` before it is deleted (`--no-archive` opts out, scripts). Two confirmation gates apply to a file **you wrote yourself** (no duster blocks, or `--whole-file`): it is your own writing, not something duster put there, so `--no-archive` is **refused** for it — duster never deletes your own words without a way back — and the menu asks twice, naming the paths, the bytes and the archive destination. A file holding several duster blocks and no `--from` is refused with the block list and both ways out spelled out. |
-- | `duster mcp list \| show \| sync \| rm \| ping` | One row per declaration, with a STATE column saying whether every agent declares that server identically (`identical`), differently (`drifted`), or only one agent declares it (`only copy`) — differences are visible in the table, no separate diff command. `show` prints one in full with env values and headers masked. `sync <name> --to codex,opencode` copies one declaration into other agents, converting formats; dry-run by default, snapshots each file before writing, and **refuses** any target whose format would drop a field. `rm <name> --agent <A>` removes that one declaration from **that agent's own main config file** (`~/.claude.json`, `~/.codex/config.toml`, `~/.gemini/settings.json` …) — **your primary configuration**, not duster's: the same schema guard refuses to write when the file's shape drifted, only that one key is touched (everything else in the file stays byte for byte), and the **whole config file is packed into `~/agent-duster-exports/` first**, so `tar -xf` brings it back; `--no-archive` opts out for scripts, `--dry-run` prints which key disappears from which file, `--all-agents` removes every declaration of the name. `ping` starts each server once, says `initialize`, and hangs up. |
-| `duster skill list \| link \| rm` | Cross-agent skill management. `list` lists every skill you have and flags which ones live in more than one place — including two copies inside one agent — and which of those copies drifted; `link` converges duplicates onto one copy on disk — edit once, effective everywhere. `rm <name> --agent <A> [--path <P>]` deletes exactly one copy — `--agent` is required when several agents share the name, and `--path` is required when one agent keeps the skill in several directories, because duster never deletes all copies for you; real directories are archived into `~/agent-duster-exports/` first, while symlink copies are just unlinked (the content they point to stays). |
+| `duster mcp list \| show \| sync \| rm \| ping` | One row per declaration, with a STATE column saying whether every agent declares that server identically (`identical`), differently (`drifted`), or only one agent declares it (`only copy`) — differences are visible in the table, no separate diff command. `show` prints one in full with env values and headers masked. `sync <name> --to codex,opencode` copies one declaration into other agents, converting formats; dry-run by default, snapshots each file before writing, and **refuses** any target whose format would drop a field. `rm <name> --agent <A>` removes that one declaration from **that agent's own main config file** (`~/.claude.json`, `~/.codex/config.toml`, `~/.gemini/settings.json` …) — **your primary configuration**, not duster's: the same schema guard refuses to write when the file's shape drifted, and only that one key is touched (everything else in the file stays byte for byte). It is a real delete, no archive — the retreat is the **whole-file snapshot taken before the rewrite**, in `~/.agent-duster/snapshots/`, because what is at risk is a file that still holds twenty other things, not a lost declaration. `--dry-run` prints which key disappears from which file, `--all-agents` removes every declaration of the name. `ping` starts each server once, says `initialize`, and hangs up. |
+| `duster skill list \| link \| rm` | Cross-agent skill management. `list` lists every skill you have and flags which ones live in more than one place — including two copies inside one agent — and which of those copies drifted; `link` converges duplicates onto one copy on disk — edit once, effective everywhere. `rm <name> --agent <A> [--path <P>]` deletes exactly one copy, outright and with no archive — `--agent` is required when several agents share the name, and `--path` is required when one agent keeps the skill in several directories, because duster never deletes all copies for you. Symlink copies are just unlinked (the content they point to stays). You named the target and confirmed it; `duster prune` is the one that sweeps skills by age, and that one always packs them first. |
 | `duster diff <a> <b>` | Compare two files or two folders, line by line. `--no-line-level` keeps it to which entries differ; `--include-same` also lists the identical ones. |
 | `duster doctor` | Checks **duster itself**, the way `brew doctor` checks brew: index database, adapter manifests, home-folder permissions, version — plus whether every SQLite database your agents keep (opencode.db, memories_1.sqlite, cc-switch.db…) is still readable: a broken one means sessions and memory will be unreadable. Takes no flags. Every check gets a line, including the ones that found nothing: "we haven't looked" and "we looked and found nothing" are different facts. |
 | `duster clean` | Reclaim **regenerable junk**: SQLite free pages, orphan WAL/SHM, caches, logs, temp leftovers. Dry-run by default, `--yes` executes, **really deleted, no copy kept**. Finishes by reporting the other two buckets (stale resources / installed software) and where they go. Never removes installed software. |
-| `duster prune --older-than 30d` | Reclaim **stale resources you created**: skills that neither changed for N days nor appear in any *invocation record* (a name mentioned in prose is not evidence — see below), expired backups and archives; sessions older than N days get compressed, not deleted. `--keep-generations` additionally clears surplus copies of per-generation resources such as database backups, which are redundant by count rather than by age. Always lists every item first (what it is / why it's stale / what breaks), then deletes permanently — non-regenerable content is archived to `~/agent-duster-exports/` beforehand. |
+| `duster prune --older-than 30d` | Reclaim **stale resources you created**: skills that neither changed for N days nor appear in any *invocation record* (a name mentioned in prose is not evidence — see below), expired backups and archives; sessions older than N days get compressed, not deleted. `--keep-generations` additionally clears surplus copies of per-generation resources such as database backups, which are redundant by count rather than by age. Always lists every item first (what it is / why it's stale / what breaks), then deletes permanently — and **always packs non-regenerable content into `~/agent-duster-exports/` first, with no flag to turn that off**: prune removes things you never reviewed one by one, which is the one place a retreat is worth its disk. |
 | `duster uninstall <agent>` | **Remove one agent entirely**, in three parts: the folders and files the manifest declares as its own; its keys inside config files *other* agents own (removed surgically, whole-file snapshot first); and how the software itself was installed — that uninstall command is printed and **never run**, unless you pass `--run-package-manager`. `--data-only` opts out of the last two and reports how many edits and hints it skipped. Requires typing the agent id to confirm; `--export-first` (on by default) archives sessions and memory, `--keep sessions,memory` leaves them in place. |
 
 ### Not built yet
@@ -108,6 +108,16 @@ In the menu, `clean` and `prune` both show what they would touch as one aligned 
 Enter runs the checked rows, everything starts checked, and whatever you uncheck is dropped from
 the run. The full `what / why / impact` report is the command-line path (`--dry-run`), which
 stays redirectable to a file.
+
+`uninstall` in the menu picks one agent (never a checklist — deleting several agents on one
+screen is a batch semantic too dangerous to offer), then asks a two-box scope table: **config
+& data** (`~/.qoder` — skills, MCP declarations, conversations, memory), checked by default,
+and **the software itself**, unchecked by default because checking it hands control to your
+package manager. Then one y/N that names the agent, the bytes and the counts, and says plainly
+that **nothing is archived and this cannot be undone** — the menu path deletes outright,
+because someone who came to uninstall an agent did not come to move the same bytes into a
+folder they then have to clean themselves. The command line keeps the escape hatch:
+`--export-first` is on by default there, and `--keep sessions,memory` leaves them on disk.
 
 Every other list view in the menu is a browser rather than a dump: `session list`,
 `memory list`, `mcp list`, `skill list` and `search` page through their rows (↑/↓ to move,
@@ -152,24 +162,55 @@ why surplus generations need `--keep-generations`, list separately, and say in t
 that they were picked by count. Without the flag, prune reports how many surplus copies exist
 and how much they weigh, and touches nothing.
 
-### On a trash can: there isn't one
+### Who gets an archive: sessions and memory, and only when you didn't name the target
 
-duster has no trash. A cleanup tool that leaves `df` unchanged has committed the worst
-error available to it — and the trash itself becomes the next thing that needs cleaning.
-Four stronger guarantees replace it:
+Worth stating plainly, because glossing over it turns into a nice-sounding lie: **an
+archive is a trash can.** The content did not disappear, it went to
+`~/agent-duster-exports/`, and clearing it is on you. So the question is not "is there a
+trash can" but "which deletions deserve one". duster answers on two axes.
+
+**Axis one: can you get it back from somewhere else?**
+
+| Content | On delete |
+|---|---|
+| Caches, SQLite free pages, orphan WAL, logs (`clean` — 774.6 MB on this machine, the overwhelming bulk) | Real delete, no copy. Undoing a cache deletion is meaningless; and VACUUM and log truncation rewrite in place, so **there is no file that could be moved anywhere** |
+| Skills, MCP declarations (`skill rm` / `mcp rm`) | Real delete. You still have where the skill came from, and an MCP declaration is a few lines of JSON — keeping a trash can for those just means cleaning it later |
+| Sessions, memory (`session rm` / `memory rm`) | **Packed first, by default.** This is the one genuinely non-regenerable thing: a conversation, once gone, is gone |
+
+A cleanup tool that leaves `df` unchanged has committed the worst error available to it.
+The first two rows are what make `df` actually move.
+
+**Axis two: did you name the target, or did duster pick it by age?**
+
+- **You named it** (the `rm` verbs): an explicit act should not quietly keep a copy.
+  `skill rm` demands `--agent`, plus `--path` when one agent holds several copies, plus a
+  y/N in the menu — you have already seen what you are deleting. Sessions and memory get
+  **two side-by-side choices** in their detail screen: delete with an archive, or delete
+  for good. The first is the default, but when you know exactly what you are throwing
+  away, the tool has no business handing you a package you then have to clean up.
+- **duster picked it by age** (`prune`): **always archives, with no flag to turn it off.**
+  Bulk cleanup removes things you never reviewed one by one, and that is the only place a
+  trash can genuinely earns its keep.
+
+**The archive belongs to you, not to duster.** One `.tar.zst`; `tar -xf` is the restore.
+duster never garbage-collects it, offers no restore command, and manages it in no view. It
+will never quietly delete your things — the price being that it never shrinks on its own:
+**it only grows**. `duster doctor` reports how many archives it holds and how much they
+weigh; the rest is your call. It packs hard — the user-authored content of all 77 skills
+on this machine comes to 7.9 MB.
+
+Three more guarantees go with it:
 
 - **You always see it first.** Every item carries what it is, why it was judged removable,
   what breaks, and whether it made it into the archive — not a bare list of paths.
   `--yes` skips the question, **never the list**.
-- **Non-regenerable content is packed before it goes.** Into
-  `~/agent-duster-exports/<op>-<date>.tar.zst`, with the path and size printed in the output;
-  `tar -xf` is the restore. It belongs to you, and duster will never garbage-collect it.
-  It compresses well — the user-authored content of all 77 skills on this machine packs to 7.9 MB.
 - **Sessions are compressed, not deleted.** The original is removed only after the archive
   decompresses to a byte-identical copy. Verifiable correctness beats undo.
-- **Config edits take a different path.** Dropping one MCP server out of `~/.claude.json`
-  isn't a file deletion — it rewrites a file that still holds twenty other things. Those
-  operations snapshot the whole file first.
+- **Config edits go through a snapshot, not an archive.** Dropping one MCP server out of
+  `~/.claude.json` isn't a file deletion — it rewrites a file that still holds twenty
+  other things. Those operations snapshot the whole file into
+  `~/.agent-duster/snapshots/` first. That is where you recover from, and it is a
+  different mechanism from the archive.
 
 `--json` is global and turns any command into one line of JSON. The rest belong to the
 commands that have them: `--yes` on `clean` / `prune` / `session prune` / `mcp sync`,
@@ -183,7 +224,7 @@ terminal to ask at, so duster prints the plan and exits 4.
 
 1. **Manage, never run** — no request proxying, no model hosting, no background daemon.
 2. **Zero telemetry, zero accounts, zero cloud** — fully offline by default.
-3. **Read-only by default** — destructive ops require explicit flags; every item is listed before it goes, and non-regenerable content is archived first.
+3. **Read-only by default** — destructive ops require explicit flags; every item is listed before it goes, and anything prune sweeps by age is archived first.
 4. **Don't touch what you don't understand** — only adapter-claimed paths are operated on.
 5. **Your data stays yours** — the index is disposable; delete it and rescan anytime.
 

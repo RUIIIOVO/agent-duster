@@ -4,6 +4,8 @@
 //! 1. 加载清单(内置 + `<home>/.agent-duster/adapters`),逐个 probe;
 //! 2. 已安装的按 `[[resource]]` 声明逐类采集并 upsert;
 //!    session 走增量:cheap print 未变(`changed=false`)则跳过重解析;
+//!    未安装的**不采集但照跑 stale 清理**(空 seen 集合)——用户手动 rm 掉
+//!    目录、没走 uninstall 时,旧资源行与 agent 行要能自然消失,列表才不撒谎;
 //! 3. 每类处理完调用 `delete_stale_resources` 清掉本轮未见的旧行;
 //! 4. 候选目录中未被任何清单认领的计入 unclassified。
 //!
@@ -255,7 +257,10 @@ fn expand(raw: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// 扫描单个 agent:probe 判定安装 → 逐资源采集 → 逐 kind 清 stale。
+/// 扫描单个 agent：probe 判定安装 → 逐资源采集 → 逐 kind 清 stale。
+///
+/// 未安装的 agent 不采集（目录都不在，没有可采集的），但**同样清一遍 stale**：
+/// 用户手动 rm 掉目录后旧行要能自然消失，见 [`scan_agent`] 内注释。
 fn scan_agent(idx: &Index, m: &Manifest, home: &Path, full: bool) -> Result<AgentReport> {
     let agent_id = m.agent.id.clone();
     let spec = ProbeSpec {
@@ -278,6 +283,22 @@ fn scan_agent(idx: &Index, m: &Manifest, home: &Path, full: bool) -> Result<Agen
         warnings: Vec::new(),
     };
     if !outcome.installed {
+        // 没装：什么都不采集，但**旧索引行必须清**。
+        //
+        // 用户手动 rm 掉 agent 目录、没走 `duster uninstall` 时，探针立刻
+        // 失配——若在这里直接早退，索引里那批指向不存在路径的资源行会永远
+        // 躺着，列表就永远脏着。空 seen 集合跑一遍
+        // [`upsert::delete_stale_resources`]，把这一轮见到的（零个）之外的
+        // 旧行全部清掉，turn / fts_turn 随行级清理一并消失。
+        //
+        // agent 行本身也删：它是纯派生状态，每次安装态扫描都会由
+        // [`upsert::upsert_agent`] 重建，留着只会让 status 渲染一个
+        // 「0 字节空壳」——软件都不在了还列着一行，是另一种说谎。
+        // 用户重装后下一次扫描自然把行写回来，删除没有任何信息损失。
+        for kind in ALL_KINDS {
+            upsert::delete_stale_resources(idx.conn(), &agent_id, kind, &[])?;
+        }
+        duster_index::query::delete_agent(idx.conn(), &agent_id)?;
         return Ok(report);
     }
 
@@ -1648,6 +1669,66 @@ clean_level = "l0"
             )
             .unwrap();
         assert_eq!(skills, 0);
+    }
+
+    /// 未安装 agent 重扫后旧行被清：用户手动 rm 掉目录、没走 uninstall 时，
+    /// 探针失配后旧资源行与 agent 行都必须自然消失，列表才不撒谎。
+    ///
+    /// agent 行也删：它是纯派生状态（重装后下次扫描由 upsert_agent 重建），
+    /// 留着只会让 status 渲染一个「0 字节空壳」。
+    #[test]
+    fn 未安装_agent_重扫后旧行被清() {
+        let home = TempHome::new("uninstalledscan");
+        put_manifest(home.path(), "skl-agent", SKILL_MANIFEST);
+        let skills = home.path().join(".skl/skills");
+        put_skill(&skills, "dir-a", "solo");
+
+        let index_path = home.path().join(".agent-duster/index.db");
+        let opts = ScanOptions {
+            home: Some(home.path().to_path_buf()),
+            index_path: Some(index_path.clone()),
+            full: false,
+        };
+
+        // 第一轮：装着，一行 skill + 一行 agent。
+        let first = scan(&opts).unwrap();
+        let a = first
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "skl-agent")
+            .expect("报告里应有 skl-agent");
+        assert!(a.installed);
+        assert_eq!(a.kind_counts.get("skill"), Some(&1));
+        assert_eq!(skill_keys(&index_path).len(), 1);
+        let idx = Index::open_readonly(&index_path).unwrap();
+        assert!(
+            duster_index::query::agent_ids(idx.conn())
+                .unwrap()
+                .contains(&"skl-agent".to_string())
+        );
+        drop(idx);
+
+        // 模拟「用户手动 rm 目录、没走 uninstall」。
+        fs::remove_dir_all(home.path().join(".skl")).unwrap();
+
+        // 第二轮：探针失配。不采集，但 stale 清理照跑——
+        // 旧 skill 行与 agent 行一并清掉，不留幽灵行、不留 0 字节空壳。
+        let second = scan(&opts).unwrap();
+        let a2 = second
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "skl-agent")
+            .expect("报告里应有 skl-agent");
+        assert!(!a2.installed);
+        assert_eq!(a2.resources, 0);
+        assert_eq!(skill_keys(&index_path).len(), 0, "旧 skill 行必须被清掉");
+        let idx = Index::open_readonly(&index_path).unwrap();
+        assert!(
+            !duster_index::query::agent_ids(idx.conn())
+                .unwrap()
+                .contains(&"skl-agent".to_string()),
+            "agent 行也要清：留着就是 0 字节空壳"
+        );
     }
 
     /// 在假 home 下写一份用户清单。

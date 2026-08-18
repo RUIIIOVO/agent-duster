@@ -11,7 +11,9 @@
 //!
 //! 尺寸阈值：预估超过 [`AUTO_ARCHIVE_LIMIT`] 时**不自动归档**，要求调用方
 //! 拿到显式的 `--archive` / `--no-archive` 决定，否则拒绝执行。判断在用例层，
-//! 本模块只提供 [`estimate_bytes`] 与常量。
+//! 本模块只提供 [`estimate_bytes`] 与常量——prune 恒归档，超阈值时把预估
+//! 体积与超限随报告报出而不是拒绝（见 `duster_core::prune`）；uninstall
+//! 等仍按「未表态即拒绝」走。
 
 use std::fs::{self, File};
 use std::io::Write;

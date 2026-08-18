@@ -116,19 +116,30 @@ mapper = "stats-only"
 # **它自己**的注册表。
 #
 # 无 shared 节:本机 2026-08-11 确认没有别的 agent 的文件里存着 OpenCode 的
-# 配置键。schema 表达不了的残留:~/.cc-switch/cc-switch.db 的
-# mcp_servers.enabled_opencode / skills.enabled_opencode 列。
+# 配置键。
+# cc-switch 里 OpenCode 的开关是**列**不是行:~/.cc-switch/cc-switch.db 的
+# mcp_servers / skills 两表各有 enabled_opencode 布尔列,residue 的
+# sqlite_row 删的是整行,表达不了列级开关;providers 表里也没有 opencode
+# 的行(2026-08-18 实测,该表只有 claude / codex / gemini 三族)——所以这里
+# 没有 sqlite_row 声明,不是漏,是查过没有。
 #
 # 无 package 节 —— 这不是漏,是本 schema 表达不了的一条,别当缺失去补:
 # 本机 2026-08-11 实测 `command -v opencode` → ~/.opencode/bin/opencode,
 # `readlink -f` 指向它自己,是一个 139 MB 的独立二进制(1.18.13),既不在
 # `npm ls -g --depth 0`、`brew list`、`cargo install --list` 里,也不在 mise
-# 管的工具里 ⇒ 官方 curl 安装脚本装的。它没有卸载子命令:卸载 = 删
-# ~/.opencode(已由 owns 覆盖)+ 删掉 ~/.zshrc 第 36 行
-#   export PATH=/Users/laibu/.opencode/bin:$PATH
-# (上面第 35 行是安装脚本留的 `# opencode` 注释)。shell rc 的 PATH 行既不是
-# JSON pointer 也不是 TOML 点路径,[[uninstall.shared]] 表达不了;而
-# command 又不许为空,所以整条 [[uninstall.package]] 不写,比塞一条
-# `rm -rf` 或猜一条 `npm uninstall -g` 都诚实。
+# 管的工具里 ⇒ 官方 curl 安装脚本装的。它没有卸载子命令,command 又不许
+# 为空,所以整条 [[uninstall.package]] 不写,比塞一条 `rm -rf` 或猜一条
+# `npm uninstall -g` 都诚实。
 [uninstall]
 owns = ["~/.opencode", "~/.config/opencode", "~/.local/share/opencode"]
+
+# 安装脚本在 shell rc 里追加的 PATH 行(2026-08-11 实测 ~/.zshrc 第 35-36 行:
+# `# opencode` 注释 + export PATH=.../.opencode/bin:$PATH)。match 只写
+# `/.opencode/bin` 不写死用户名,换机换人照样命中;with_comment_above 把
+# 上方的 `# opencode` 注释一并带走,不然删了行还留一行来历不明的注释。
+[[uninstall.residue]]
+kind = "shell_line"
+files = ["~/.zshrc", "~/.zprofile", "~/.bashrc", "~/.bash_profile"]
+match = "/.opencode/bin"
+with_comment_above = true
+why = "PATH entry added by the opencode installer"

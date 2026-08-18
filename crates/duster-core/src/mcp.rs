@@ -73,6 +73,15 @@ pub struct Declaration {
     pub dialect: String,
     /// 这组声明的合并结论（见 [`Declaration`] 头的说明）。
     pub state: DupState,
+    /// 这份配置文件（[`Declaration::path`]）上次被修改的时间（Unix 毫秒）。
+    ///
+    /// 取自索引行的 mtime——它属于**整份配置文件**（`~/.claude.json` 这类），
+    /// 文件里还装着大量与这个 server 无关的配置，所以它回答的是「这份配置
+    /// 上次被改是何时」，**不是**「这个 server 上次被调用是何时」。
+    /// 人读时列名是 `CONFIG TOUCHED`（`duster mcp list`），JSON 字段名仍叫
+    /// `last_used_ms`，与 skill / memory / session 的时间列口径一致。
+    /// `None` = scan 时没取到时间戳（没有证据，不是「1970 年用过」）。
+    pub last_used_ms: Option<i64>,
 }
 
 /// 合并后的一个 MCP server。
@@ -950,6 +959,7 @@ fn merge(rows: &[ResourceRecord], cat: &mut Catalog) -> McpList {
                     .clone()
                     .unwrap_or_else(|| UNKNOWN_DIALECT.to_string()),
                 state,
+                last_used_ms: d.row.last_used_ms(),
             })
             .collect();
         declared_in.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -1644,10 +1654,7 @@ fn str_map(m: &BTreeMap<String, String>) -> serde_json::Value {
 pub struct RemoveOptions {
     pub index_path: Option<PathBuf>,
     pub home: Option<PathBuf>,
-    /// true = 删前把整份配置文件打包进 `~/agent-duster-exports`。默认开——
-    /// 摘错了一条声明，用户要能把整份配置捣回来；脚本用 `--no-archive` 关。
-    pub archive: bool,
-    /// true = 只报「将变成什么样」，一个字节不写、一个归档不打。
+    /// true = 只报「将变成什么样」，一个字节不写。
     pub dry_run: bool,
     /// 要摘掉的 server 名。
     pub name: String,
@@ -1679,8 +1686,9 @@ pub struct RemoveOutcome {
 #[derive(Debug, Clone, Serialize)]
 pub struct RemoveReport {
     pub outcomes: Vec<RemoveOutcome>,
-    /// 删前整份配置文件打成的归档包。`--no-archive` 或 dry-run 时为 None。
-    pub archive: Option<PathBuf>,
+    /// 这次改写留的整文件快照目录（`<home>/.agent-duster/snapshots/<op-id>/`）。
+    /// dry-run、或没有任何目标真写盘时为 None——没写盘就没有退路可指。
+    pub snapshots: Option<PathBuf>,
     /// 各文件摘键后释放的字节合计（dry-run 为预估）。
     pub freed_bytes: u64,
     pub warnings: Vec<String>,
@@ -1697,13 +1705,11 @@ pub struct RemoveReport {
 /// 1. **写前过 schema_guard**（[`duster_adapter::guard::check`]）。指纹对不上
 ///    就把这个目标**自动降为只读**并如实说出期望与实际的指纹，不强写——
 ///    上游升级了格式，我们的保守摘键会改到语义已经不同的位置。
-/// 2. **写前留整文件快照**（[`duster_fs::snapshot::snapshot_file`]）。改的是还
-///    装着二十条别的声明的文件，用户同意的是「摘一条」，写坏了丢的是整个文件。
+/// 2. **写前留整文件快照**（[`duster_fs::snapshot::snapshot_file`]）。摘掉一个
+///    键不是删文件——是原地改一份还装着二十条别的声明的文件，所以退路是
+///    快照，不是归档包。快照失败即放弃改写，一个键都不许摘。
 /// 3. **只删那一个键**（codec 的 `remove_json_pointer` / `remove_toml_path`）：
 ///    同文件内其他键、注释、键序、缩进逐字节不变。
-/// 4. **删前归档**（[`crate::delete::archive_before_delete`]）：把将改写的每份
-///    配置文件**整份**原样打进 `~/agent-duster-exports/`。归档失败即整体中止，
-///    一个键都不许摘。
 ///
 /// # 目标怎么定
 ///
@@ -1717,10 +1723,10 @@ pub struct RemoveReport {
 /// 摘键成功后（以及发现文件里本来就没有这条声明时）同步删掉对应的
 /// `resource` 行——下一次 `duster mcp list` 不许再列着已删的东西。
 ///
-/// 执行是两遍的：先整轮只算一遍（guard 不落基准、一字节不写），归档只包
-/// 「真会写」的文件；归档落定后才逐目标重读重算并写盘。归档与写盘之间文件
-/// 可能又被改过——每个目标在快照之前重过 guard 与「声明还在不在」，万一漂了
-/// 当场降为 `refused`，归档里多一份没改过的原件，那是安全的一侧。
+/// 执行是两遍的：先整轮只算一遍（guard 不落基准、一字节不写），定出哪些目标
+/// 真会写；然后逐目标重读重算并写盘。两遍之间文件可能又被改过——每个目标在
+/// 快照之前重过 guard 与「声明还在不在」，万一漂了当场降为 `refused`，一个键
+/// 都不许摘，那是安全的一侧。
 pub fn remove(opts: &RemoveOptions) -> Result<RemoveReport> {
     if opts.name.trim().is_empty() {
         bail!("no MCP server name given");
@@ -1791,59 +1797,37 @@ pub fn remove(opts: &RemoveOptions) -> Result<RemoveReport> {
         .map(|row| remove_row(&mut ctx, row, true))
         .collect();
 
-    // dry-run 到此为止：一个字节不写、一个归档不打。
+    // dry-run 到此为止：一个字节不写、一份快照不留。
     if opts.dry_run {
         let freed_bytes = planned.iter().map(|o| o.freed).sum();
         return Ok(RemoveReport {
             outcomes: planned,
             freed_bytes,
-            archive: None,
+            snapshots: None,
             warnings: Vec::new(),
         });
     }
 
-    let to_archive: Vec<PathBuf> = planned
-        .iter()
-        .filter(|o| o.action == "removed")
-        .map(|o| PathBuf::from(&o.path))
-        .collect();
-
-    // 归档是删之前的唯一退路：打包失败就整体中止，一个键都不许摘。
-    // 标签带上 server 与 agent：同一秒里删两家（批量动作逐条删）不会撞包名
-    // ——归档包命名只有秒级分辨率，撞名即报错（宁可报错也不覆盖用户的东西）。
-    let label = match (&opts.agent, opts.all_agents) {
-        (Some(a), _) => format!("mcp-rm-{}-{}", opts.name, a),
-        (None, true) => format!("mcp-rm-{}-all", opts.name),
-        (None, false) => format!("mcp-rm-{}", opts.name),
-    };
-    let archive = if opts.archive && !to_archive.is_empty() {
-        Some(
-            crate::delete::archive_before_delete(&to_archive, &label, &home).with_context(
-                || {
-                    format!(
-                        "failed to pack the original config files before removing `{}`; \
-                         nothing was removed",
-                        opts.name
-                    )
-                },
-            )?,
-        )
-    } else {
-        None
-    };
-
     // 第二遍：真写盘。每个目标在快照之前重读重算，guard 与「声明还在不在」
-    // 都按那一刻的现实判定（见 `remove` 的文档）。
+    // 都按那一刻的现实判定（见 `remove` 的文档）。快照是这次改写唯一的退路，
+    // 落点 `<home>/.agent-duster/snapshots/<op-id>/`（见 `remove_row`）。
     let executed: Vec<RemoveOutcome> = targets
         .iter()
         .map(|row| remove_row(&mut ctx, row, false))
         .collect();
     let freed_bytes = executed.iter().map(|o| o.freed).sum();
+    // 只要有目标真写了盘，op 目录就在（快照先于每一次写盘）；全 refused /
+    // absent 时没写盘，没有退路可指，报告如实 None。
+    let snapshots = if executed.iter().any(|o| o.action == "removed") {
+        Some(home.join(".agent-duster").join("snapshots").join(&op_id))
+    } else {
+        None
+    };
 
     Ok(RemoveReport {
         outcomes: executed,
         freed_bytes,
-        archive,
+        snapshots,
         warnings: Vec::new(),
     })
 }
@@ -2107,9 +2091,20 @@ mapper = "{mapper}"
         }
 
         /// 按 scan 的口径播种索引行：key = server 名，path = 配置文件，哈希 = 语义哈希。
+        /// mtime 恒为 0（= 没有时间戳证据）。
         fn seed(&self, rows: &[(&str, PathBuf, McpServerSpec)]) {
+            let with_mtime: Vec<(&str, PathBuf, McpServerSpec, i64)> = rows
+                .iter()
+                .map(|(a, p, s)| (*a, p.clone(), s.clone(), 0))
+                .collect();
+            self.seed_mtime(&with_mtime);
+        }
+
+        /// 同上，但由调用方指定 `mtime_ns`——测 `last_used_ms` 的传导用
+        /// （`None` 与真值两条渲染路径都要有夹具）。
+        fn seed_mtime(&self, rows: &[(&str, PathBuf, McpServerSpec, i64)]) {
             let idx = Index::open(&self.index()).unwrap();
-            for (agent, path, spec) in rows {
+            for (agent, path, spec, mtime_ns) in rows {
                 let row = duster_index::upsert::ResourceRow {
                     agent_id: (*agent).to_string(),
                     kind: "mcp".to_string(),
@@ -2117,7 +2112,7 @@ mapper = "{mapper}"
                     key: spec.name.clone(),
                     path: path.display().to_string(),
                     size: 0,
-                    mtime_ns: 0,
+                    mtime_ns: *mtime_ns,
                     hash_content: Some(*spec.content_hash().as_bytes()),
                     cheap_print: None,
                     clean_level: None,
@@ -2187,6 +2182,36 @@ mapper = "{mapper}"
                 .map(|d| d.state)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// `last_used_ms` 来自**索引行的 mtime**（配置文件的修改时间），与
+    /// prune 的陈旧判定共用 [`ResourceRecord::last_used_ms`] 这一份实现，
+    /// 渲染层不再重查库。`mtime_ns <= 0` = 没有证据 → `None`，绝不是 1970。
+    #[test]
+    fn list_last_used_ms_取索引行的mtime() {
+        let f = Fake::new();
+        let spec = stdio("echo", "echo", &["hi"]);
+        let file = f.agent("a1", &body(r#""hi""#));
+        // 1700000000_000_000_000 ns = 2023-11-14，一个非 0 的固定值。
+        f.seed_mtime(&[("a1", file, spec.clone(), 1_700_000_000_000_000_000)]);
+
+        let out = list(Some(&f.index())).unwrap();
+        assert_eq!(out.servers.len(), 1);
+        let d = &out.servers[0].declared_in[0];
+        assert_eq!(d.last_used_ms, Some(1_700_000_000_000));
+    }
+
+    /// mtime 缺失（scan 时 stats-only 采集失败等）→ `None`：这一行在任何
+    /// 时间列里都渲染成 `never`，而不是「1970 年用过」。
+    #[test]
+    fn list_last_used_ms_无mtime为None() {
+        let f = Fake::new();
+        let spec = stdio("echo", "echo", &["hi"]);
+        f.seed(&[("a1", f.agent("a1", &body(r#""hi""#)), spec.clone())]);
+
+        let out = list(Some(&f.index())).unwrap();
+        assert_eq!(out.servers.len(), 1);
+        assert_eq!(out.servers[0].declared_in[0].last_used_ms, None);
     }
 
     /// 单家声明 → only copy；同名不同内容 → 每组每行 drifted。
@@ -3199,7 +3224,7 @@ mapper = "{mapper}"
             .unwrap();
         }
 
-        /// 那份配置文件在删除前的内容（断言「归档里有整份原配置」用）。
+        /// 那份配置文件在删除前的内容（断言「快照里有整份原配置」用）。
         fn file_body(&self, rel: &str) -> Vec<u8> {
             fs::read(self.home().join(rel)).unwrap()
         }
@@ -3209,7 +3234,6 @@ mapper = "{mapper}"
         RemoveOptions {
             index_path: Some(f.index()),
             home: Some(f.home().to_path_buf()),
-            archive: true,
             dry_run: false,
             name: name.to_string(),
             agent: agent.map(|s| s.to_string()),
@@ -3348,10 +3372,12 @@ mapper = "{mapper}"
             .contains("stitch"));
     }
 
-    /// 归档里必须有**整份**原配置：删前打包，`tar -xf` 在 home 下解开即
-    /// 原位还原——摘错了一条声明，用户要能把整份配置捣回来。
+    /// 快照里必须有**整份**原配置：改写前整文件复制到
+    /// `<home>/.agent-duster/snapshots/<op-id>/`，逐字节与改写前相同——
+    /// 摘错了一条声明，用户要从快照里把整份配置捞回来。真删不打包：
+    /// 导出目录不该存在。
     #[test]
-    fn rm_归档里是删前的整份原配置() {
+    fn rm_快照里是改写前的整份原配置() {
         let f = RealFake::new();
         f.scan();
         let claude = f.file_body(".claude.json");
@@ -3363,28 +3389,31 @@ mapper = "{mapper}"
             ..rm_opts(&f, "stitch", None)
         })
         .unwrap();
-        let pack = r.archive.expect("默认必须归档");
-        assert!(pack.is_file(), "归档包要真的落在盘上: {}", pack.display());
         assert!(
-            pack.starts_with(f.home().join("agent-duster-exports")),
-            "归档要落进 home 的导出目录: {}",
-            pack.display()
+            !f.home().join("agent-duster-exports").exists(),
+            "mcp rm 真删不打包，导出目录不该存在"
         );
+        let snap_root = r.snapshots.expect("真写盘必须有快照落点");
+        assert!(
+            snap_root.starts_with(f.home().join(".agent-duster/snapshots")),
+            "快照要落进 home 的快照目录: {}",
+            snap_root.display()
+        );
+        assert!(snap_root.is_dir(), "快照目录要真的存在: {}", snap_root.display());
 
-        let out = tempfile::tempdir().unwrap();
-        duster_fs::archive::extract_to(&pack, out.path()).unwrap();
+        // 快照里是改写前的整份配置（条目路径相对 home 展开），逐字节相同。
         assert_eq!(
-            fs::read(out.path().join(".claude.json")).unwrap(),
+            fs::read(snap_root.join(".claude.json")).unwrap(),
             claude,
-            "归档里是删前的整份 claude 配置"
+            "快照里是改写前的整份 claude 配置"
         );
         assert_eq!(
-            fs::read(out.path().join(".codex/config.toml")).unwrap(),
+            fs::read(snap_root.join(".codex/config.toml")).unwrap(),
             codex,
-            "归档里是删前的整份 codex 配置"
+            "快照里是改写前的整份 codex 配置"
         );
 
-        // 摘完的盘上文件与归档里的原件必须不同——归档存的是「删之前」。
+        // 摘完的盘上文件与快照里的原件必须不同——快照存的是「改写之前」。
         assert_ne!(
             fs::read(f.home().join(".claude.json")).unwrap(),
             claude
@@ -3421,8 +3450,8 @@ mapper = "{mapper}"
                 .any(|s| s.name == "stitch" && s.declared_in.iter().any(|d| d.agent_id == "codex")),
             "被拒的目标索引行不许删"
         );
-        // 没写盘 → 也不该有快照垃圾与归档包。
-        assert!(!r.archive.is_some(), "refused 不许归档");
+        // 没写盘 → 也不该有快照垃圾（真删不打包，没有导出目录可言）。
+        assert!(r.snapshots.is_none(), "refused 不许留快照");
         assert!(
             !f.home().join(".agent-duster/snapshots").exists(),
             "refused 不许留快照"
@@ -3439,7 +3468,6 @@ mapper = "{mapper}"
         let toml = fs::read(f.home().join(".codex/config.toml")).unwrap();
 
         let r = remove(&RemoveOptions {
-            archive: true,
             dry_run: true,
             ..rm_opts(&f, "stitch", Some("claude-code"))
         })
@@ -3449,7 +3477,7 @@ mapper = "{mapper}"
         assert_eq!(r.outcomes[0].key, "/mcpServers/stitch");
         assert!(r.outcomes[0].freed > 0, "预估要给出释放字节");
         assert!(r.freed_bytes > 0);
-        assert!(r.archive.is_none(), "dry-run 不许打归档包");
+        assert!(r.snapshots.is_none(), "dry-run 不许留快照");
 
         assert_eq!(fs::read(f.home().join(".claude.json")).unwrap(), claude);
         assert_eq!(fs::read(f.home().join(".codex/config.toml")).unwrap(), toml);
@@ -3461,26 +3489,6 @@ mapper = "{mapper}"
             !f.home().join(".agent-duster/snapshots").exists(),
             "dry-run 不许留快照"
         );
-    }
-
-    /// `--no-archive` 显式关掉归档：键照删，但导出目录里什么都不留。
-    /// 摘键依旧走 guard + 快照 + 原子写那套。
-    #[test]
-    fn rm_no_archive_键照删但不打归档包() {
-        let f = RealFake::new();
-        f.scan();
-        let r = remove(&RemoveOptions {
-            archive: false,
-            ..rm_opts(&f, "stitch", Some("claude-code"))
-        })
-        .unwrap();
-        assert_eq!(r.outcomes[0].action, "removed");
-        assert!(r.archive.is_none());
-        assert_eq!(
-            fs::read_to_string(f.home().join(".claude.json")).unwrap(),
-            CLAUDE_AFTER
-        );
-        assert!(!f.home().join("agent-duster-exports").exists());
     }
 
     /// 索引里说在、文件里已经没有这条声明（duster 之外动过文件）：

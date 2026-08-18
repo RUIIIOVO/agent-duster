@@ -44,9 +44,6 @@ pub struct PruneOptions {
     /// 是否把声明了 `keep_generations` 的资源的超编代际纳入 prune。
     /// 默认关——关了与今天行为一致，只多一行点名旗标的收尾报告。
     pub keep_generations: bool,
-    /// 归档决定：`None` = 未表态。预估体积超过
-    /// [`duster_fs::archive::AUTO_ARCHIVE_LIMIT`] 且未表态时**拒绝执行**。
-    pub archive: Option<bool>,
     /// 导出目录；缺省 `~/agent-duster-exports`。
     pub export_dir: Option<PathBuf>,
     /// true = 只出计划不执行。**默认 true**。
@@ -93,15 +90,25 @@ const MIB: u64 = 1024 * 1024;
 ///
 /// 执行前的硬门槛，任一未过即返回 Err（CLI 映射退出码 4）：
 /// 1. `json && !yes` → 拒绝；
-/// 2. 归档预估 > 阈值且 `archive == None` → 拒绝，要求显式
-///    `--archive` / `--no-archive`；
-/// 3. `archive != Some(false)` 时**先打包成功再删**，打包失败即中止整个操作。
+/// 2. **先打包成功再删**：凡要删的不可再生内容一律先进归档包，打包失败即
+///    中止整个操作、一个字节不删。没有关闭归档的旗标——`prune` 能删的
+///    东西没有可再生的，跳过打包就等于给「删错了」留一个无法撤销的口子。
 ///
-/// 门槛 1、2 都只在**真要动手时**才咬人：dry-run 什么都不执行，也就无所谓
-/// "人有没有读过清单"、"要不要打包"。`--json --dry-run` 是完整预览，必须放行，
+/// 归档预估超过 [`duster_fs::archive::AUTO_ARCHIVE_LIMIT`] **不再拒绝执行**。
+/// 旧语义是「超阈值且用户没表态就拒绝」，那扇门依赖 `--archive` /
+/// `--no-archive` 三态旗标；旗标没了，门的落点必须重定，而不是悄悄删掉：
+/// 超阈值照常打包，但报告里的警告必须把包的预估体积与"超过自动归档上限"
+/// 点名说出来。取舍是——prune 本来就先出计划再要 `--yes`，同意建立在
+/// 逐行过目的清单上，体积是这份同意的一部分；「拒绝执行」把决定权退给
+/// 一枚旗标，而「报数」把决定权留在人读计划的那一步。uninstall 不适用
+/// 这条：它没有先出计划再确认的流程，`archive_choice` 三态与拒绝门槛
+/// 在那边原样保留。
+///
+/// 门槛 1 只在**真要动手时**才咬人：dry-run 什么都不执行，也就无所谓
+/// "人有没有读过清单"。`--json --dry-run` 是完整预览，必须放行，
 /// 否则 §1.2 ② 要的"重定向到文件、看完再回来跑 `--yes`"就没了机器可读的一半。
-/// 代价是预览与执行的门槛不同，所以 dry-run 报告必须自己把预估与
-/// `--archive` / `--no-archive` 的存在讲清楚，不能让用户到执行那一刻才撞墙。
+/// 代价是预览与执行的门槛不同，所以 dry-run 报告必须自己把预估写清楚，
+/// 不能让用户到执行那一刻才撞墙。dry-run 不建导出目录、不写包。
 pub fn prune(opts: &PruneOptions) -> Result<PruneReport> {
     prune_filtered(opts, &PlanFilter::default())
 }
@@ -157,37 +164,35 @@ pub fn prune_filtered(opts: &PruneOptions, filter: &PlanFilter) -> Result<PruneR
         );
     }
 
-    // 门槛 2：预估超阈值且用户没表态 → 不替他决定。打包几百 MB 要花时间、
-    // 要占空间，而他可能根本不想留。
-    if over_limit && opts.archive.is_none() && !opts.dry_run {
-        bail!(
-            "archive estimate is {} MiB across {} path(s), above the {} MiB auto-archive \
-             limit; duster will not decide this for you: pass --archive to pack it anyway \
-             or --no-archive to delete without packing",
+    // 归档预估随报告走，dry-run 与执行两条路径都要带上：prune 恒归档，
+    // 「包会有多大」是这份同意的一部分，不能等执行完才让用户看见数字。
+    // 超过 [`duster_fs::archive::AUTO_ARCHIVE_LIMIT`] 不再拒绝执行（见
+    // [`prune`] 的取舍说明），但阈值本身依旧要出现在报告里——把安全门
+    // 从「拒绝」降级成「报数」的前提是数字确实到了用户眼前。
+    if !roots.is_empty() {
+        let dir = export_dir(opts).display().to_string();
+        let tense = if opts.dry_run {
+            "would be packed into"
+        } else {
+            "packed into"
+        };
+        warnings.push(format!(
+            "archive estimate: {} MiB across {} path(s) {tense} {dir}",
             estimate / MIB,
             roots.len(),
-            duster_fs::archive::AUTO_ARCHIVE_LIMIT / MIB
-        );
-    }
-
-    // 门槛 3：dry-run。一个字节都不动，预估与后续会遇到的门槛都写进 warnings，
-    // 让"看完报告再回来跑 --yes"这条路上没有意外。
-    if opts.dry_run {
-        if !roots.is_empty() {
+        ));
+        if over_limit {
             warnings.push(format!(
-                "archive estimate: {} MiB across {} path(s) would be packed into {}",
-                estimate / MIB,
-                roots.len(),
-                export_dir(opts).display()
-            ));
-        }
-        if over_limit && opts.archive.is_none() {
-            warnings.push(format!(
-                "the estimate is above the {} MiB auto-archive limit; the real run will \
-                 refuse until you pass --archive or --no-archive",
+                "the estimate is above the {} MiB auto-archive limit; it will still be packed \
+                 — pruning never deletes without a backup",
                 duster_fs::archive::AUTO_ARCHIVE_LIMIT / MIB
             ));
         }
+    }
+
+    // 门槛 2：dry-run。一个字节都不动，预估已经写进 warnings，
+    // 让"看完报告再回来跑 --yes"这条路上没有意外。
+    if opts.dry_run {
         return Ok(PruneReport {
             plan,
             executed: false,
@@ -213,28 +218,22 @@ pub fn prune_filtered(opts: &PruneOptions, filter: &PlanFilter) -> Result<PruneR
     }
 
     // **先打包成功，再删。顺序不能反**——这是归档机制存在的全部意义。
+    // 没有关闭归档的旗标：凡删必先进包，打包失败即中止、一个字节不删。
     let mut archive_path = None;
     let mut archive_bytes = None;
     if !roots.is_empty() {
-        if opts.archive == Some(false) {
-            warnings.push(format!(
-                "--no-archive: {} path(s) will be deleted permanently with no backup archive",
-                roots.len()
-            ));
-        } else {
-            let home = resolve_home(opts.home.as_deref())?;
-            let receipt = duster_fs::archive::archive_paths(
-                "prune",
-                &roots,
-                &export_dir(opts),
-                &home,
-            )
-            .context(
-                "archiving failed, so nothing was deleted; fix the cause or pass --no-archive",
-            )?;
-            archive_path = Some(receipt.path.display().to_string());
-            archive_bytes = Some(receipt.bytes);
-        }
+        let home = resolve_home(opts.home.as_deref())?;
+        let receipt = duster_fs::archive::archive_paths(
+            "prune",
+            &roots,
+            &export_dir(opts),
+            &home,
+        )
+        .context(
+            "archiving failed, so nothing was deleted; fix the cause and rerun",
+        )?;
+        archive_path = Some(receipt.path.display().to_string());
+        archive_bytes = Some(receipt.bytes);
     }
 
     let index_path = index_path(opts)?;
@@ -699,7 +698,6 @@ mod tests {
             agents: Vec::new(),
             older_than_days: 30,
             keep_generations: false,
-            archive: None,
             export_dir: Some(home.path().join("exports")),
             dry_run: true,
             yes: false,
@@ -756,7 +754,6 @@ mod tests {
         o.dry_run = false;
         o.json = true;
         o.yes = false;
-        o.archive = Some(false);
 
         let err = prune(&o).unwrap_err();
         let msg = format!("{err:#}");
@@ -770,24 +767,75 @@ mod tests {
         );
     }
 
+    /// 归档是硬保证，不是旗标：`--archive` / `--no-archive` 已不存在，类型上
+    /// 就没有「跳过打包」这个输入，没有任何输入能让 prune 删了东西却不先
+    /// 打包。超过自动归档阈值照样打包——旧的「未表态就拒绝」门随旗标一起
+    /// 撤了，取而代之的是报告里点名的预估体积与超限说明（见 [`prune`] 的
+    /// 取舍）。删掉的内容必须能在 `<home>/agent-duster-exports/` 的包里
+    /// 原样解出。
     #[test]
-    fn prune_预估超阈值且未表态时拒绝() {
+    fn prune_超阈值照样归档且包内内容逐字节还原() {
         let (home, db) = seed(true);
         let mut o = opts(&home, &db);
         o.dry_run = false;
         o.yes = true;
-        o.archive = None;
+        o.export_dir = Some(home.path().join("agent-duster-exports"));
 
-        let err = prune(&o).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("--archive"), "{msg}");
-        assert!(msg.contains("--no-archive"), "{msg}");
-        assert!(
-            home.path()
-                .join(".claude/skills/big-skill/blob.bin")
-                .is_file()
+        let report = prune(&o).unwrap();
+        assert!(report.executed);
+        let w = report.warnings.join("\n");
+        assert!(w.contains("archive estimate"), "{w}");
+        assert!(w.contains("auto-archive limit"), "{w}");
+
+        // 陈旧 skill 连同 210 MiB 的 blob 都已删，但必须先躺在包里。
+        let big = home.path().join(".claude/skills/big-skill");
+        assert!(!big.exists(), "陈旧 skill 应已删除: {}", big.display());
+        let archive = PathBuf::from(
+            report
+                .archive_path
+                .as_deref()
+                .expect("恒归档:执行后必须产出归档包"),
         );
-        assert!(!home.path().join("exports").exists(), "不许偷偷打包");
+        assert!(archive.is_file(), "{}", archive.display());
+        assert!(
+            archive.starts_with(home.path().join("agent-duster-exports")),
+            "包必须落在 <home>/agent-duster-exports/: {}",
+            archive.display()
+        );
+        assert_eq!(
+            report.archive_bytes,
+            Some(fs::metadata(&archive).unwrap().len())
+        );
+
+        let dest = tempfile::tempdir().unwrap();
+        duster_fs::archive::extract_to(&archive, dest.path()).unwrap();
+
+        // 稀疏 blob:set_len 出来的内容恒为全零。逐字节校验长度与内容
+        // （流式，不把 210 MiB 整块搬进内存）。
+        let blob = dest.path().join(".claude/skills/big-skill/blob.bin");
+        let meta = fs::metadata(&blob).unwrap();
+        assert_eq!(meta.len(), 210 * MIB, "blob 长度必须原样");
+        let mut f = fs::File::open(&blob).unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut n = 0u64;
+        let mut all_zero = true;
+        loop {
+            let r = std::io::Read::read(&mut f, &mut buf).unwrap();
+            if r == 0 {
+                break;
+            }
+            n += r as u64;
+            all_zero &= buf[..r].iter().all(|&b| b == 0);
+        }
+        assert_eq!(n, 210 * MIB);
+        assert!(all_zero, "blob 内容必须原样（全零）");
+
+        // 普通文本文件逐字节一致。
+        assert_eq!(
+            fs::read_to_string(dest.path().join(".claude/skills/big-skill/SKILL.md")).unwrap(),
+            "---\nname: big-skill\n---\n"
+        );
+        assert!(report.freed_bytes > 0, "freed 必须是实测值，不能是 0");
     }
 
     #[test]
@@ -810,24 +858,23 @@ mod tests {
         assert_eq!(tree_snapshot(&data), before);
     }
 
-    /// dry-run 什么都不执行，所以"人有没有读过清单"和"要不要打包"这两道门槛
-    /// 都不该咬人：`--json --dry-run` 必须是完整预览，还要把执行时会遇到的
-    /// `--archive` / `--no-archive` 抉择提前说清楚。
+    /// dry-run 什么都不执行，所以"人有没有读过清单"这道门槛不该咬人：
+    /// `--json --dry-run` 必须是完整预览，还要把执行时会打的包有多大、
+    /// 是否超过自动归档上限提前说清楚——恒归档之后「拒绝」撤了，
+    /// 「报数」顶上（见 [`prune`] 的取舍）。
     #[test]
-    fn prune_json_dry_run_是完整预览且预告归档抉择() {
+    fn prune_json_dry_run_是完整预览且报出归档预估() {
         let (home, db) = seed(true);
         let mut o = opts(&home, &db);
         o.json = true;
         o.yes = false;
-        o.archive = None;
 
         let report = prune(&o).unwrap();
         assert!(!report.executed);
         assert!(!report.plan.items.is_empty());
         let w = report.warnings.join("\n");
         assert!(w.contains("archive estimate"), "{w}");
-        assert!(w.contains("--archive"), "{w}");
-        assert!(w.contains("--no-archive"), "{w}");
+        assert!(w.contains("auto-archive limit"), "{w}");
         assert!(
             home.path()
                 .join(".claude/skills/big-skill/blob.bin")

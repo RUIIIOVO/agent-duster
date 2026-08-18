@@ -25,6 +25,13 @@
 //! - 打不开、正在恢复、被加密——**都不是错误**，是"这一项读不到"。
 //!   返回 `Ok(None)` 让调用方降级成只统计体积，绝不让一次扫描因为
 //!   别人家的库而整体失败。
+//!
+//! # 写侧（uninstall residue）
+//!
+//! [`delete_row`] 是同一套策略的写侧：短 `busy_timeout`、不做重试循环，
+//! 标识符走白名单、值走参数绑定。删的是**别人家**库里的行，所以动刀前
+//! 仍要先问一遍「这张表/这一列还在吗」——上游换 schema 是常态，把一条
+//! 会失败的 DELETE 交给 SQLite 去猜，不如先问出来报成可读的错误。
 
 use std::path::Path;
 use std::time::Duration;
@@ -152,6 +159,91 @@ pub fn columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
 /// 只认 `[A-Za-z0-9_]+`。够用：我们要读的都是上游自己建的普通表名。
 fn is_plain_identifier(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// 统计外部库里 `column = equals` 的行数（只读）。uninstall residue 的
+/// dry-run 预演用：预览要说出「会删什么」，而「读都读不了」不等于
+/// 「本来就没了」——所以读不到返回 `Ok(None)`，调用方据此记成 Failed
+/// 而不是 NotFound。
+///
+/// 表/列名走 [`is_plain_identifier`] 白名单，值走参数绑定：名字不是数据，
+/// 但没有理由让它有机会变成 SQL。
+pub fn count_rows(db: &Path, table: &str, column: &str, equals: &str) -> Result<Option<u64>> {
+    for name in [table, column] {
+        if !is_plain_identifier(name) {
+            bail!("refusing unsafe identifier in foreign database query: {name:?}");
+        }
+    }
+    let Some(conn) = open(db)? else {
+        return Ok(None);
+    };
+    if !has_table(&conn, table)? {
+        bail!("foreign database has no `{table}` table: {}", db.display());
+    }
+    if !columns(&conn, table)?.iter().any(|c| c == column) {
+        bail!(
+            "foreign database table `{table}` has no `{column}` column: {}",
+            db.display()
+        );
+    }
+    let n: i64 = conn
+        .query_row(
+            &format!("SELECT count(*) FROM \"{table}\" WHERE \"{column}\" = ?1"),
+            [equals],
+            |r| r.get(0),
+        )
+        .with_context(|| {
+            format!("failed to count rows of {table}.{column} in {}", db.display())
+        })?;
+    Ok(Some(n as u64))
+}
+
+/// 从外部库里按 `column = equals` 精确等值删行（uninstall residue 用）。
+///
+/// 写侧与读侧同一套锁策略：短 `busy_timeout`、不做重试循环——等很久说明
+/// 对方正忙，让开比排队礼貌，等不到就 Err（调用方记成 Failed，别的条目
+/// 照删）。
+///
+/// # 为什么先验形状再动刀
+///
+/// 这是**别人家**的库，上游换 schema 是常态。表缺了、列改名了，先问出来
+/// 再报错，而不是把一条注定失败的 DELETE 交给 SQLite 去猜。标识符走白名单
+/// 校验、双引号引用，值走参数绑定——**绝不拼字符串**。
+///
+/// 返回受影响行数：0 表示「本来就没有这一行」，调用方按 NotFound 处理。
+pub fn delete_row(db: &Path, table: &str, column: &str, equals: &str) -> Result<u64> {
+    for name in [table, column] {
+        if !is_plain_identifier(name) {
+            bail!("refusing unsafe identifier in foreign database delete: {name:?}");
+        }
+    }
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open foreign database: {}", db.display()))?;
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+
+    if !has_table(&conn, table)? {
+        bail!("foreign database has no `{table}` table: {}", db.display());
+    }
+    if !columns(&conn, table)?.iter().any(|c| c == column) {
+        bail!(
+            "foreign database table `{table}` has no `{column}` column: {}",
+            db.display()
+        );
+    }
+    // 单条 DELETE 自带原子性，不需要事务。名字已过白名单，双引号只是让
+    // `order` 这类关键字也能当标识符用。
+    let n = conn
+        .execute(
+            &format!("DELETE FROM \"{table}\" WHERE \"{column}\" = ?1"),
+            [equals],
+        )
+        .with_context(|| {
+            format!("failed to delete from {table}.{column} in {}", db.display())
+        })?;
+    Ok(n as u64)
 }
 
 #[cfg(test)]
@@ -343,5 +435,92 @@ mod tests {
         assert!(has_table(&conn, "session").unwrap());
         // sqlite_master 走绑定参数，脏名字只是查不到，不会报错。
         assert!(!has_table(&conn, "session\"; DROP TABLE session;--").unwrap());
+    }
+
+    /// residue 的按行删除：命中行没了、别的行还在；值走参数绑定，
+    /// 表/列走白名单，脏名字连库都不打开就拒绝。
+    #[test]
+    fn delete_row_只删命中行_其余原样() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db(dir.path(), "providers.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE providers(id TEXT PRIMARY KEY, enabled INTEGER);
+                 INSERT INTO providers VALUES ('claude-official', 1);
+                 INSERT INTO providers VALUES ('codex-official', 0);
+                 INSERT INTO providers VALUES ('keeper', 1);",
+            )
+            .unwrap();
+        }
+
+        // 计数：命中 1 行，别的行不受影响。
+        assert_eq!(
+            count_rows(&db, "providers", "id", "claude-official").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            count_rows(&db, "providers", "id", "no-such-row").unwrap(),
+            Some(0)
+        );
+
+        let n = delete_row(&db, "providers", "id", "claude-official").unwrap();
+        assert_eq!(n, 1, "恰好删掉一行");
+        let conn = Connection::open(&db).unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT id FROM providers ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["codex-official", "keeper"], "别的行必须原样还在");
+
+        // 再删一次：0 行受影响，不是错误。
+        assert_eq!(delete_row(&db, "providers", "id", "claude-official").unwrap(), 0);
+
+        // 表不存在 → Err（不是 panic）；列不存在 → Err。
+        assert!(delete_row(&db, "no_such_table", "id", "x").is_err());
+        assert!(delete_row(&db, "providers", "no_such_column", "x").is_err());
+        assert!(count_rows(&db, "no_such_table", "id", "x").is_err());
+
+        // 值带引号也只能是值：永远匹配不到，而不是拼成 SQL。
+        assert_eq!(
+            delete_row(&db, "providers", "id", "x'; DROP TABLE providers;--").unwrap(),
+            0
+        );
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM providers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "注入值一个字都没进 SQL");
+    }
+
+    /// 只读计数与写删除共享同一道标识符闸门：脏表名/列名在拼 SQL 之前
+    /// 就被拒绝，库一个字节都不动。
+    #[test]
+    fn count_rows_与_delete_row_拒绝脏标识符() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db(dir.path(), "inject2.db");
+
+        for bad in [
+            "session\"",
+            "session\"); DROP TABLE session;--",
+            "session; DROP TABLE session",
+            "ses sion",
+            "",
+        ] {
+            assert!(count_rows(&db, bad, "id", "x").is_err(), "{bad:?}");
+            assert!(delete_row(&db, bad, "id", "x").is_err(), "{bad:?}");
+        }
+        assert!(count_rows(&db, "session", "id\"", "x").is_err());
+        assert!(delete_row(&db, "session", "id\"", "x").is_err());
+
+        // 库毫发无损。
+        let conn = open(&db).unwrap().unwrap();
+        assert!(has_table(&conn, "session").unwrap());
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

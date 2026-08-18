@@ -80,10 +80,6 @@ pub enum McpCmd {
         /// Remove the declaration from every agent that has it
         #[arg(long)]
         all_agents: bool,
-        /// Delete without packing the whole config file into
-        /// ~/agent-duster-exports first
-        #[arg(long)]
-        no_archive: bool,
         /// Print what would change — which key disappears from which file —
         /// and stop without touching anything
         #[arg(long)]
@@ -113,22 +109,13 @@ pub fn run(mode: OutputMode, index: Option<&Path>, action: McpCmd) -> i32 {
             name,
             agent,
             all_agents,
-            no_archive,
             dry_run,
-        } => cmd_rm(
-            mode,
-            index,
-            name,
-            agent,
-            all_agents,
-            no_archive,
-            dry_run,
-        ),
+        } => cmd_rm(mode, index, name, agent, all_agents, dry_run),
         McpCmd::Ping { name, timeout_ms } => cmd_ping(mode, index, name.as_deref(), timeout_ms),
     }
 }
 
-/// COMMAND 列的截断宽度。命令行本身可以很长（`npx -y @scope/pkg@1.2.3 --flag`），
+/// TARGET 列的截断宽度。目标本身可以很长（`npx -y @scope/pkg@1.2.3 --flag`），
 /// 而这一列只用来认人；要看全的走 `duster mcp show`。
 const COMMAND_WIDTH: usize = 44;
 
@@ -194,9 +181,12 @@ fn render_list(list: &McpList) -> String {
     let mut blocks: Vec<String> = Vec::new();
 
     let mut t = Table::new(vec![
-        "SERVER", "STATE", "AGENT", "TRANSPORT", "COMMAND / URL", "PATH",
+        "SERVER", "STATE", "AGENT", "TARGET", "CONFIG TOUCHED", "PATH",
     ]);
     t.color_col(0, accent());
+    // CONFIG TOUCHED 与 PATH 都是旁证列（「这份配置上次被改何时」/ 出处），
+    // 置灰让 SERVER / STATE / TARGET 自己跳出来。
+    t.color_col(4, muted());
     t.color_col(5, muted());
     for s in &list.servers {
         for (i, d) in s.declared_in.iter().enumerate() {
@@ -205,9 +195,9 @@ fn render_list(list: &McpList) -> String {
                 if i == 0 { s.name.clone() } else { String::new() },
                 crate::dup_state_label(d.state).to_string(),
                 d.agent_id.clone(),
-                transport_name(&s.spec.transport).to_string(),
-                truncate_width(&command_cell(&s.spec), COMMAND_WIDTH),
-                truncate_width(&d.path.display().to_string(), PATH_WIDTH),
+                truncate_width(&target_cell(&s.spec), COMMAND_WIDTH),
+                crate::relative_time(d.last_used_ms),
+                truncate_width(&duster_fs::path::display_tilde(&d.path), PATH_WIDTH),
             ]);
         }
     }
@@ -242,9 +232,9 @@ fn render_list(list: &McpList) -> String {
 }
 
 /// 给交互菜单的逐条浏览:表头 + 对齐行,列与 [`render_list`] 的铺平表一致
-/// (SERVER / STATE / AGENT / TRANSPORT / COMMAND / PATH),一行一条声明,
+/// (SERVER / STATE / AGENT / TARGET / CONFIG TOUCHED / PATH),一行一条声明,
 /// 组名只印首行。行文本是纯文本,宽度按 [`display_width`] 算好,宽字符不
-/// 顶歪;COMMAND 照旧按 [`COMMAND_WIDTH`] 截——认人靠 SERVER 列,命令只看
+/// 顶歪;TARGET 照旧按 [`COMMAND_WIDTH`] 截——认人靠 SERVER 列,目标只看
 /// 个大概。PATH 列吃余量([`Table::flex_col`]),窄终端里截断给出,重定向成
 /// 文件时整条留下。返回的行直接喂 `browse` 原语。
 pub(crate) fn browse_rows(list: &McpList) -> (String, Vec<String>) {
@@ -255,10 +245,10 @@ pub(crate) fn browse_rows(list: &McpList) -> (String, Vec<String>) {
 /// 前缀预算是 [`Prefix::Checkbox`]:统一列表流的浏览表每行画 `❯ [x] `。
 pub(crate) fn browse_rows_at(list: &McpList, cols: usize) -> (String, Vec<String>) {
     let mut t = Table::new(vec![
-        "SERVER", "STATE", "AGENT", "TRANSPORT", "COMMAND / URL", "PATH",
+        "SERVER", "STATE", "AGENT", "TARGET", "CONFIG TOUCHED", "PATH",
     ]);
     // PATH 吃余量:声明路径天然就长(~/Library/Application Support/…),
-    // 不设总宽上限的话,没有人算过整行,COMMAND 截到 44 也只是把问题
+    // 不设总宽上限的话,没有人算过整行,TARGET 截到 44 也只是把问题
     // 挪到别处。
     t.flex_col(5);
     for s in &list.servers {
@@ -271,8 +261,8 @@ pub(crate) fn browse_rows_at(list: &McpList, cols: usize) -> (String, Vec<String
                 s.name.clone(),
                 crate::dup_state_label(d.state).to_string(),
                 d.agent_id.clone(),
-                transport_name(&s.spec.transport).to_string(),
-                truncate_width(&command_cell(&s.spec), COMMAND_WIDTH),
+                truncate_width(&target_cell(&s.spec), COMMAND_WIDTH),
+                crate::relative_time(d.last_used_ms),
                 // PATH 折 `~`:声明住在 home 下,`/Users/<你>/` 那 13 列对
                 // 用户零信息量,而这一列是最宽的那一列(与 `memory list` 同口径)。
                 duster_fs::path::display_tilde(&d.path),
@@ -357,7 +347,8 @@ fn transport_name(t: &McpTransport) -> &'static str {
     }
 }
 
-/// COMMAND 列：stdio 给命令行，远程给端点。两者都没有就说明声明是残的。
+/// TARGET 单元格的命令 / URL 部分：stdio 给命令行，远程给端点。
+/// 两者都没有就说明声明是残的。
 fn command_cell(spec: &McpServerSpec) -> String {
     match spec.transport {
         McpTransport::Stdio => match spec.command.as_deref() {
@@ -372,6 +363,15 @@ fn command_cell(spec: &McpServerSpec) -> String {
         },
         _ => spec.url.clone().unwrap_or_else(|| "(no url)".to_string()),
     }
+}
+
+/// TARGET 列：`stdio npx -y foo` / `http https://…` / `sse https://…`。
+///
+/// 传输类型并进单元格——http 与 sse 都渲染成 URL，光看 URL 分不出两者，
+/// 前缀 `stdio` / `http` / `sse` 让传输类型与目标一眼可见，省下一整列
+/// （TRANSPORT 与 COMMAND / URL 两列并成一列，两张表都保持同构）。
+fn target_cell(spec: &McpServerSpec) -> String {
+    format!("{} {}", transport_name(&spec.transport), command_cell(spec))
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +678,8 @@ pub(crate) fn render_sync(outcomes: &[SyncOutcome], dry_run: bool) -> String {
 /// 这是全项目最危险的写入——改的是 `~/.claude.json`、`~/.codex/config.toml`、
 /// `~/.gemini/settings.json` 这种别人家的主配置，同文件里全是用户其他设置。
 /// 所以这里走 `duster_core::mcp::remove`，它的每一道工序（schema_guard 降只读、
-/// 整文件快照、只删那一个键、删前归档）在 core 那一侧，外壳只负责把话说清。
+/// 整文件快照、只删那一个键）在 core 那一侧，外壳只负责把话说清。快照是这次
+/// 改写唯一的退路，落点 `~/.agent-duster/snapshots/<op-id>/` 由渲染印出来。
 ///
 /// 目标即同意：`--agent a` / `--all-agents` 就是那份授权，与 `uninstall` 的
 /// `--confirm` 同一个思路——删哪一家必须由用户说死，`--dry-run` 是预览。
@@ -688,13 +689,11 @@ fn cmd_rm(
     name: String,
     agent: Option<String>,
     all_agents: bool,
-    no_archive: bool,
     dry_run: bool,
 ) -> i32 {
     let report = match mcp::remove(&mcp::RemoveOptions {
         index_path: index.map(Path::to_path_buf),
         home: None,
-        archive: !no_archive,
         dry_run,
         name,
         agent,
@@ -705,10 +704,11 @@ fn cmd_rm(
     };
     match mode {
         // `--json` 出四组共用的 DeleteReport（Contract 1）：机器可读的删除
-        // 报告只有一种形状，脚本不必为每个名词学一套。
+        // 报告只有一种形状，脚本不必为每个名词学一套。mcp rm 真删不打包，
+        // `archived` 恒为 None；快照落点看人话输出。
         OutputMode::Json => {
             let rep = duster_core::delete::DeleteReport {
-                archived: report.archive.clone(),
+                archived: None,
                 removed: report
                     .outcomes
                     .iter()
@@ -722,7 +722,7 @@ fn cmd_rm(
         }
         OutputMode::Human => {
             println!();
-            println!("{}", render_rm(&report, dry_run, !no_archive));
+            println!("{}", render_rm(&report, dry_run));
             render_warnings(&report.warnings);
         }
     }
@@ -752,7 +752,7 @@ fn rm_exit(report: &RemoveReport, dry_run: bool) -> i32 {
 /// 每块必须说清**哪个文件的哪个键**——摘键这种事，用户要能逐条核对
 /// 落点，而不是相信一句「已删除」。拒写的原因是一整句话（还带着两个
 /// 指纹），挤进表格必然被截断，所以照 `render_sync` 的块式排版。
-pub(crate) fn render_rm(report: &RemoveReport, dry_run: bool, archive: bool) -> String {
+pub(crate) fn render_rm(report: &RemoveReport, dry_run: bool) -> String {
     let mut blocks: Vec<String> = Vec::new();
     blocks.push(format!(
         "  {}",
@@ -816,32 +816,23 @@ pub(crate) fn render_rm(report: &RemoveReport, dry_run: bool, archive: bool) -> 
         blocks.push(b);
     }
 
-    // 收尾：归档去向与释放字节。归档是摘错后的唯一退路，必须原样出现。
+    // 收尾：快照落点与释放字节。快照是摘键后的唯一退路——改坏了从哪捞——
+    // 必须原样出现；全 refused / absent（没写盘）时没有快照可指，就不编。
     let mut footer: Vec<String> = Vec::new();
-    match (&report.archive, dry_run) {
+    match (&report.snapshots, dry_run) {
         (Some(p), false) => footer.push(format!(
             "  {} {}",
-            muted().apply_to("archive of the original files:"),
+            muted().apply_to("snapshot of the original files:"),
             p.display()
-        )),
-        (None, false) => footer.push(format!(
-            "  {}",
-            muted().apply_to(
-                "--no-archive: the original files were deleted without packing a copy."
-            )
-        )),
-        (_, true) if archive => footer.push(format!(
-            "  {}",
-            muted().apply_to(
-                "A real run would pack the whole config file into ~/agent-duster-exports first."
-            )
         )),
         (_, true) => footer.push(format!(
             "  {}",
             muted().apply_to(
-                "A real run would delete the key without packing a copy (--no-archive)."
+                "A real run would snapshot the whole config file under \
+                 ~/.agent-duster/snapshots/ first."
             )
         )),
+        (None, false) => {}
     }
     footer.push(format!(
         "  {} {} {}",
@@ -982,6 +973,7 @@ mod tests {
             path: PathBuf::from(format!("/home/u/.{agent}/mcp.json")),
             dialect: dialect.to_string(),
             state: DupState::Identical,
+            last_used_ms: None,
         }
     }
 
@@ -1053,8 +1045,8 @@ mod tests {
             "等价组每行都标 identical:\n{got}"
         );
         assert!(stitch[0].contains("claude-code"), "{got}");
-        // 方言不单列一列(铺平表按任务口径:AGENT / TRANSPORT / COMMAND / PATH
-        // 足够认人,方言跟着 PATH 走),但冲突块里它随声明一起报出来。
+        // 方言不单列一列(铺平表按任务口径:AGENT / TARGET / CONFIG TOUCHED /
+        // PATH 足够认人,方言跟着 PATH 走),但冲突块里它随声明一起报出来。
         assert!(stitch[1].contains("codex"), "{got}");
         assert!(stitch[0].contains("npx -y @stitch/mcp"), "{got}");
 
@@ -1121,16 +1113,47 @@ mod tests {
         assert!(!got.contains("declared differently"), "{got}");
     }
 
+    /// CONFIG TOUCHED 列：无时间戳 → `never`（不是 1970）；有值 → 相对时间。
+    /// 语义是「这份配置上次被改是何时」，所以列名不叫 LAST USED——
+    /// mcp 声明的 mtime 属于整份配置文件，不是这个 server 的调用记录。
+    #[test]
+    fn list_config_touched_无时间戳never_有值渲染相对时间() {
+        let list = |last_used_ms: Option<i64>| McpList {
+            servers: vec![merged(
+                "eeeeeeeeeeeeeeee5555",
+                stdio("solo", "echo", &["hi"], &[]),
+                vec![Declaration {
+                    last_used_ms,
+                    ..decl("a1", "mcp/standard-json")
+                }],
+            )],
+            conflicts: BTreeMap::new(),
+            warnings: vec![],
+        };
+
+        let none = plain(&render_list(&list(None)));
+        assert!(none.contains("CONFIG TOUCHED"), "列名必须是 CONFIG TOUCHED:\n{none}");
+        assert!(none.contains("never"), "无时间戳渲染 never:\n{none}");
+
+        // 固定过去时间戳（2023-11-14）：相对时间带 `ago` 后缀，且不是 never。
+        let some = plain(&render_list(&list(Some(1_700_000_000_000))));
+        assert!(some.contains("ago"), "有值渲染相对时间:\n{some}");
+        assert!(!some.contains("never"), "{some}");
+        assert!(!some.contains("LAST USED"), "mcp 不许用 LAST USED 列名:\n{some}");
+    }
+
     /// 铺平后的浏览表每一行(含表头)加上控件前缀 `❯ [x] `(6 列)后,显示
     /// 宽度必须严格小于终端宽度——行宽碰到终端宽就会折成两个物理行,而控件
     /// 按逻辑行计数、`clear_last_lines` 按物理行擦,残影每按一次翻一倍。
-    /// 数据把 COMMAND / PATH 两列顶满(PATH 是 flex 列),60 列档恰好把它
-    /// 逼到地板。
+    /// 数据把 TARGET / PATH 两列顶满(PATH 是 flex 列),60 列档恰好把它
+    /// 逼到地板。CONFIG TOUCHED 也带真值(epoch → 5 位天数,与 14 宽的表头
+    /// 持平,把这一列能吃下的余量吃干),None 与真值两条渲染路径都被压过。
     #[test]
     fn browse_rows_行宽不超终端() {
         let long = "~/Library/Application Support/Claude/claude_desktop_config.json";
         let decl_at = |agent: &str, path: &str| Declaration {
             path: PathBuf::from(path),
+            last_used_ms: Some(0),
             ..decl(agent, "mcp/standard-json")
         };
         let list = McpList {
@@ -1367,7 +1390,9 @@ mapper = "mcp/standard-json"
         RemoveReport {
             freed_bytes: outcomes.iter().map(|o| o.freed).sum(),
             outcomes,
-            archive: Some(PathBuf::from("/home/u/agent-duster-exports/mcp-rm-stitch-codex-20260814-090000.tar.zst")),
+            snapshots: Some(PathBuf::from(
+                "/home/u/.agent-duster/snapshots/20260814-090000-12345",
+            )),
             warnings: vec![],
         }
     }
@@ -1400,19 +1425,24 @@ mapper = "mcp/standard-json"
     }
 
     /// 人类视图必须说清「哪个文件的哪个键会没」：每块带 agent、路径、键，
-    /// dry-run 加「一个字节没写」的明说，收尾给归档去向与释放字节。
+    /// dry-run 加「一个字节没写」的明说，收尾给快照落点与释放字节。mcp rm
+    /// 真删不打包——文案里不许再出现导出目录。
     #[test]
-    fn render_rm_报出文件_键_归档与释放字节() {
+    fn render_rm_报出文件_键_快照与释放字节() {
         let dry = rm_report(vec![rm_outcome("removed", "mcp_servers.stitch", None)]);
-        let shown = plain(&render_rm(&dry, true, true));
+        let shown = plain(&render_rm(&dry, true));
         assert!(shown.contains("not one byte has been written"), "{shown}");
         assert!(shown.contains("removed"), "{shown}");
         assert!(shown.contains("codex"), "{shown}");
         assert!(shown.contains(".codex/config.toml"), "{shown}");
         assert!(shown.contains("mcp_servers.stitch"), "必须说出哪个键会没: {shown}");
         assert!(shown.contains("nothing written yet"), "{shown}");
-        assert!(shown.contains("A real run would pack the whole config file"), "{shown}");
+        assert!(
+            shown.contains("A real run would snapshot the whole config file"),
+            "dry-run 要预告快照: {shown}"
+        );
         assert!(shown.contains("128 B"), "释放字节要出现: {shown}");
+        assert!(!shown.contains("agent-duster-exports"), "{shown}");
 
         // 拒写：REFUSED 红块 + 指纹 + 「没写」的明说。
         let refused = rm_report(vec![rm_outcome(
@@ -1420,26 +1450,33 @@ mapper = "mcp/standard-json"
             "",
             Some("structure changed (fingerprint aaa -> bbb)"),
         )]);
-        let shown = plain(&render_rm(&refused, false, true));
+        let shown = plain(&render_rm(&refused, false));
         assert!(shown.contains("REFUSED"), "{shown}");
         assert!(shown.contains("fingerprint aaa -> bbb"), "{shown}");
         assert!(shown.contains("nothing was written to this file"), "{shown}");
-        assert!(
-            shown.contains("archive of the original files:"),
-            "归档去向必须出现: {shown}"
-        );
 
-        // --no-archive 执行后：说清没打包。报告里 archive 恒为 None——
-        // 渲染器按报告说话，旗标只影响 dry-run 那一句。
-        let no_archive = RemoveReport {
-            archive: None,
+        // 真删过的报告：快照落点必须原样出现——改坏了从哪捞，这是唯一退路。
+        let ran = rm_report(vec![rm_outcome("removed", "/mcpServers/stitch", None)]);
+        let shown = plain(&render_rm(&ran, false));
+        assert!(
+            shown.contains("snapshot of the original files:"),
+            "快照落点必须出现: {shown}"
+        );
+        assert!(
+            shown.contains("/home/u/.agent-duster/snapshots/"),
+            "快照落点要是可捞的路径: {shown}"
+        );
+        assert!(!shown.contains("agent-duster-exports"), "{shown}");
+
+        // 没写盘（全 refused / absent）→ 报告里没有快照可指，渲染不编假话。
+        let no_write = RemoveReport {
+            snapshots: None,
             ..rm_report(vec![rm_outcome("removed", "/mcpServers/stitch", None)])
         };
-        let shown = plain(&render_rm(&no_archive, false, false));
+        let shown = plain(&render_rm(&no_write, false));
         assert!(
-            shown.contains("deleted without packing a copy"),
-            "--no-archive 要明说: {shown}"
+            !shown.contains("snapshot of the original files"),
+            "没写盘不许提快照: {shown}"
         );
-        assert!(!shown.contains("archive of the original files"), "{shown}");
     }
 }

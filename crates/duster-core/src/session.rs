@@ -481,7 +481,6 @@ pub struct SessionPruneOptions {
     /// 与压缩不冲突：压缩包是给 duster 读的，导出是给人读的。
     pub export_first: bool,
     pub export_dir: Option<PathBuf>,
-    pub archive: Option<bool>,
     pub dry_run: bool,
     pub yes: bool,
     pub json: bool,
@@ -601,7 +600,6 @@ pub fn prune_filtered(
             agents: opts.agents.clone(),
             older_than_days: opts.older_than_days,
             keep_generations: false,
-            archive: opts.archive,
             export_dir: opts.export_dir.clone(),
             dry_run: opts.dry_run,
             yes: opts.yes,
@@ -1358,7 +1356,6 @@ mod tests {
             older_than_days: 30,
             export_first: false,
             export_dir: Some(home.join("exports")),
-            archive: None,
             dry_run: false,
             yes: true,
             json: false,

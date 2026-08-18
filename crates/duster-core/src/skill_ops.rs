@@ -33,7 +33,7 @@ use duster_index::db::Index;
 use duster_index::query;
 use duster_model::ResourceKind;
 
-use crate::delete::{self, DeleteOptions, DeleteReport};
+use crate::delete::{DeleteOptions, DeleteReport};
 use crate::diff::{Change, DiffOptions, diff_trees};
 use crate::freshness;
 
@@ -86,6 +86,16 @@ pub struct SkillCopy {
     pub bytes: u64,
     /// 目录内嵌的 install 子路径体积（不参与哈希，单独报出来）。
     pub install_bytes: u64,
+    /// 「上次使用」的证据：索引行 mtime 的 Unix 毫秒；`None` = scan 当时没取到
+    /// 时间戳（没有证据，不是「1970 年用过」）。口径与 session 列表的
+    /// LAST USED 列、prune 的陈旧判定同源（`ResourceRecord::last_used_ms`，
+    /// 只有这一份实现）。
+    ///
+    /// 软链副本（Linked / Broken）记的是**链本身**的 mtime，不是目标的——
+    /// 磁盘上这一行只有链的 stat，跟随软链去 stat 目标会把那份内容在
+    /// 两个名字下各统计一次。内容归目标自己那一行管，这里只对「这一份
+    /// 副本的文件系统痕迹」负责。
+    pub last_used_ms: Option<i64>,
 }
 
 /// 一组同名 skill。
@@ -164,6 +174,7 @@ pub fn list(index_path: Option<&std::path::Path>) -> Result<Vec<SkillGroup>> {
                     tree_hash: String::new(),
                     bytes: 0,
                     install_bytes: 0,
+                    last_used_ms: r.last_used_ms(),
                 });
                 continue;
             }
@@ -221,6 +232,7 @@ pub fn list(index_path: Option<&std::path::Path>) -> Result<Vec<SkillGroup>> {
                         tree_hash,
                         bytes: m.bytes,
                         install_bytes: m.install_bytes,
+                        last_used_ms: r.last_used_ms(),
                     });
                 }
                 // 单份读不动（权限、坏链）同样降级成警告：别让一个副本
@@ -483,12 +495,12 @@ pub fn link(
 /// 那一份，也可能是几家共享的本体。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CopyKind {
-    /// 根路径是软链。只 unlink 链接本身，不归档。
+    /// 根路径是软链。只 unlink 链接本身。
     Symlink,
     /// 目录但没有任何常规文件（只含软链，或空目录）。内容同样住在别处：
-    /// 删目录（里面的软链原样随删，不跟随），不归档。
+    /// 删目录（里面的软链原样随删，不跟随）。
     NoContent,
-    /// 目录且含常规文件：真实内容，归档后整棵删。
+    /// 目录且含常规文件：真实内容，整棵删。
     RealDir,
 }
 
@@ -507,10 +519,18 @@ enum CopyKind {
 /// 报错列路径。理由与上一段逐字相同——「指名一家」不等于「同意删掉那家
 /// 的每一份」，而这两份的内容可以完全不同。
 ///
+/// # 为什么真删、不归档
+///
+/// `skill rm` 是对着**一个点名的东西**下手：`--agent` 必给，同一 agent
+/// 名下多份时 `--path` 还必给，交互里还有 y/N——用户已经指名道姓同意删
+/// 这一份了。显式的删除不需要暗中留副本；批量按龄清理的 `duster prune`
+/// 仍然会给 skill 打包进 `~/agent-duster-exports/`，那才是需要退路的场合。
+/// 所以这里真删：目录整棵删，一个字节都不留。
+///
 /// # 三种形态，三种删法
 ///
-/// - **RealDir**（普通目录，有真实内容）：先归档整目录再删——skill 是
-///   用户写的东西，删了要有一条退路（`--no-archive` 显式关）。
+/// - **RealDir**（普通目录，有真实内容）：整棵删，**不归档**——删的是
+///   点名的副本，不是批量清扫，理由见上。
 /// - **Symlink / NoContent**（根软链，或只含软链的目录）：只删链接本身，
 ///   不归档。没自己的内容可归——归一个断链或归一条指向别处的链，都是
 ///   假安全感；内容在别处，删链不丢东西。
@@ -569,7 +589,15 @@ pub fn remove(
 
     let copies: Vec<&duster_index::query::ResourceRecord> = match path {
         Some(p) => {
-            let hits: Vec<_> = by_agent.iter().copied().filter(|r| r.path == p).collect();
+            // 两种写法都认:列表把 PATH 折成 `~/...` 印出来,而索引里存的是
+            // 绝对路径。只认绝对路径的话,用户从表里复制一行粘过来必然失配
+            // ——「表里印什么就能拿来当参数」是这一列存在的前提。
+            let want = expand_tilde_at(&home, p);
+            let hits: Vec<_> = by_agent
+                .iter()
+                .copied()
+                .filter(|r| r.path == p || Path::new(&r.path) == want)
+                .collect();
             if hits.is_empty() {
                 bail!(
                     "no copy of skill `{name}` at `{p}`; candidates: {}",
@@ -594,19 +622,13 @@ pub fn remove(
     };
 
     let mut report = DeleteReport::default();
-    let mut to_archive: Vec<PathBuf> = Vec::new();
     let mut targets: Vec<(i64, PathBuf, CopyKind)> = Vec::new();
 
-    // 第一遍：现场分类 + 收集归档内容。分类失败只作废那一条。
+    // 第一遍：现场分类。分类失败只作废那一条。
     for rec in &copies {
         let root = PathBuf::from(&rec.path);
         match classify_copy(&root) {
-            Ok(kind) => {
-                if kind == CopyKind::RealDir && opts.archive && !opts.dry_run {
-                    to_archive.push(root.clone());
-                }
-                targets.push((rec.rid, root, kind));
-            }
+            Ok(kind) => targets.push((rec.rid, root, kind)),
             Err(e) => report
                 .warnings
                 .push(format!("skill `{name}` for agent `{}`: {e:#}; skipped", rec.agent_id)),
@@ -617,18 +639,8 @@ pub fn remove(
         return Ok(report);
     }
 
-    // 先归档后删：归档失败整体中止（一个字节都不删）。
-    let archived = if opts.archive && !opts.dry_run && !to_archive.is_empty() {
-        Some(delete::archive_before_delete(&to_archive, "skill-rm", &home)?)
-    } else {
-        None
-    };
-
-    // 干跑：只报将删什么。`removed` 在这条路径上读作「将删」——整个
-    // `DeleteReport` 在干跑里都是条件式的，所以 `archived` 同样读作
-    // 「将归档到哪」，给的是目录而不是编造一个带秒级时间戳的包名。
-    // 软链副本只 unlink、没有自己的内容可归档，所以一份 RealDir 都没有时
-    // 这里是 None——外壳照这一位分行文，不能笼统说「会归档」。
+    // 干跑：只报将删什么。`removed` 在这条路径上读作「将删」。skill 删除
+    // 不归档（见函数文档），所以这里没有什么「将归档到哪」要报。
     if opts.dry_run {
         report.removed = targets.iter().map(|(_, p, _)| p.clone()).collect();
         report.freed_bytes = targets
@@ -636,10 +648,6 @@ pub fn remove(
             .filter(|(_, _, k)| *k == CopyKind::RealDir)
             .map(|(_, p, _)| dir_bytes(p))
             .sum();
-        let any_real = targets.iter().any(|(_, _, k)| *k == CopyKind::RealDir);
-        if opts.archive && any_real {
-            report.archived = Some(delete::exports_dir(&home));
-        }
         return Ok(report);
     }
 
@@ -661,12 +669,11 @@ pub fn remove(
                 .push(format!("skill `{name}` at {}: {e:#}; kept", root.display())),
         }
     }
-    report.archived = archived;
     Ok(report)
 }
 
 /// 现场判定一份副本的形态。读不到路径（被外力删了）按 NoContent 处理——
-/// 没有内容可归档，删的动作会落空，索引行照清。
+/// 没有真实内容可删，删的动作会落空，索引行照清。
 fn classify_copy(root: &Path) -> Result<CopyKind> {
     let meta = match std::fs::symlink_metadata(root) {
         Ok(m) => m,
@@ -677,12 +684,12 @@ fn classify_copy(root: &Path) -> Result<CopyKind> {
         return Ok(CopyKind::Symlink);
     }
     if !meta.is_dir() {
-        // 存在但不是目录（普通文件占了位）：不是一份 skill，别归档也别删
-        // 内容，按「没有可删的真实内容」处理。
+        // 存在但不是目录（普通文件占了位）：不是一份 skill，别删内容，
+        // 按「没有可删的真实内容」处理。
         return Ok(CopyKind::NoContent);
     }
     // 目录：有没有常规文件？只含软链的目录（connect-chrome 这类转发副本）
-    // 内容住在别处，不该归档。软链按链接本身计，不跟随。
+    // 内容住在别处，删掉只是摘链接。软链按链接本身计，不跟随。
     let mut has_regular = false;
     let mut bytes = 0u64;
     walk_files(
@@ -1779,17 +1786,19 @@ mod tests {
     // rm
     // -----------------------------------------------------------------------
 
-    fn rm_opts(db: &Path, home: &Path, archive: bool, dry_run: bool) -> DeleteOptions {
+    /// skill 删除不归档（见 [`remove`] 的文档）：helper 不再收 archive 参数，
+    /// 字段填 false 只是占住共享结构体里属于 session/memory 的那一位。
+    fn rm_opts(db: &Path, home: &Path, dry_run: bool) -> DeleteOptions {
         DeleteOptions {
             index_path: Some(db.to_path_buf()),
             home: Some(home.to_path_buf()),
-            archive,
+            archive: false,
             dry_run,
         }
     }
 
-    /// 悬空软链：只 unlink 链接本身，不归档（没内容可归，归一个断链是
-    /// 假安全感），索引行照清。
+    /// 悬空软链：只 unlink 链接本身（归一个断链是假安全感——它连内容都
+    /// 没有），索引行照清。skill 删除不归档，`archived` 恒为 None。
     #[test]
     fn rm_悬空软链只unlink_且不归档() {
         let home = tempfile::tempdir().unwrap();
@@ -1799,13 +1808,13 @@ mod tests {
         std::os::unix::fs::symlink(home.path().join("deleted-target"), &dangling).unwrap();
         seed_skill_row(&db, "qoder", "gone", &dangling);
 
-        let report = remove(&rm_opts(&db, home.path(), true, false), "gone", None, None).unwrap();
+        let report = remove(&rm_opts(&db, home.path(), false), "gone", None, None).unwrap();
         assert!(
             std::fs::symlink_metadata(&dangling).is_err(),
             "悬空链接应被 unlink"
         );
         assert_eq!(report.removed, vec![dangling.clone()], "{:?}", report.removed);
-        assert!(report.archived.is_none(), "断链没有内容,不许归档");
+        assert!(report.archived.is_none(), "skill 删除不归档,archived 恒为 None");
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
         // 索引无幽灵行。
         assert!(list(Some(&db)).unwrap().is_empty(), "删完不该再列出来");
@@ -1824,9 +1833,9 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         seed_skill_row(&db, "claude-code", "foo", &link);
 
-        let report = remove(&rm_opts(&db, home.path(), true, false), "foo", None, None).unwrap();
+        let report = remove(&rm_opts(&db, home.path(), false), "foo", None, None).unwrap();
         assert!(std::fs::symlink_metadata(&link).is_err(), "链接应被 unlink");
-        assert!(report.archived.is_none(), "链接没有自己的内容,不许归档");
+        assert!(report.archived.is_none(), "skill 删除不归档,archived 恒为 None");
         // 目标仍在、内容原封不动。
         assert!(target.is_dir(), "目标目录必须还在");
         assert!(
@@ -1838,9 +1847,12 @@ mod tests {
         assert!(list(Some(&db)).unwrap().is_empty());
     }
 
-    /// 真实目录：归档整目录后删除；归档里是完整的内容树。
+    /// 真实目录：整棵真删，**不归档**——`skill rm` 是对着点名的副本下手
+    /// （`--agent`/`--path`/y/N 三道指名），显式删除不需要暗中留副本；
+    /// 批量按龄清理的 `duster prune` 才会给 skill 打包。删完 `<home>/
+    /// agent-duster-exports` 必须不存在：一个字节的归档都不要有。
     #[test]
-    fn rm_真实目录归档后删除() {
+    fn rm_真实目录真删_导出目录不创建() {
         let home = tempfile::tempdir().unwrap();
         let db = home.path().join(".agent-duster").join("index.db");
         let dir = home.path().join(".claude").join("skills").join("foo");
@@ -1848,16 +1860,15 @@ mod tests {
         std::fs::write(dir.join("notes.md"), "extra notes").unwrap();
         seed_skill_row(&db, "claude-code", "foo", &dir);
 
-        let report = remove(&rm_opts(&db, home.path(), true, false), "foo", None, None).unwrap();
+        let report = remove(&rm_opts(&db, home.path(), false), "foo", None, None).unwrap();
         assert!(!dir.exists(), "目录应被整棵删除");
         assert!(report.removed.contains(&dir), "{:?}", report.removed);
         assert!(report.freed_bytes > 0);
-        let archive = report.archived.expect("真实内容必须归档");
-
-        let dest = home.path().join("restore");
-        duster_fs::archive::extract_to(&archive, &dest).unwrap();
-        assert!(dest.join(".claude/skills/foo/SKILL.md").is_file());
-        assert!(dest.join(".claude/skills/foo/notes.md").is_file());
+        assert!(report.archived.is_none(), "真删不归档,archived 恒为 None");
+        assert!(
+            !home.path().join("agent-duster-exports").exists(),
+            "真删之后导出目录根本不该存在"
+        );
         assert!(list(Some(&db)).unwrap().is_empty());
     }
 
@@ -1867,7 +1878,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (db, a, b) = two_copies(home.path(), "left body", "right body");
 
-        let err = remove(&rm_opts(&db, home.path(), true, false), "foo", None, None).unwrap_err();
+        let err = remove(&rm_opts(&db, home.path(), false), "foo", None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--agent"), "缺 --agent 必须明说: {msg}");
         assert!(msg.contains("claude-code") && msg.contains("codex"), "列出候选: {msg}");
@@ -1881,7 +1892,7 @@ mod tests {
         let (db, a, b) = two_copies(home.path(), "left body", "right body");
 
         let report =
-            remove(&rm_opts(&db, home.path(), true, false), "foo", Some("claude-code"), None).unwrap();
+            remove(&rm_opts(&db, home.path(), false), "foo", Some("claude-code"), None).unwrap();
         assert!(!a.exists(), "被点名的那份要删");
         assert!(b.is_dir(), "没点名的那份分毫不动");
         assert!(report.removed.contains(&a));
@@ -1896,7 +1907,7 @@ mod tests {
     fn rm_指名未装的agent报错() {
         let home = tempfile::tempdir().unwrap();
         let (db, a, _) = two_copies(home.path(), "left body", "right body");
-        let err = remove(&rm_opts(&db, home.path(), true, false), "foo", Some("qoder"), None).unwrap_err();
+        let err = remove(&rm_opts(&db, home.path(), false), "foo", Some("qoder"), None).unwrap_err();
         assert!(err.to_string().contains("qoder"), "{err:#}");
         assert!(a.is_dir());
     }
@@ -1922,7 +1933,7 @@ mod tests {
 
         // 缺 path：报错，两份都还在。
         let err = remove(
-            &rm_opts(&db, home.path(), true, false),
+            &rm_opts(&db, home.path(), false),
             "foo",
             Some("claude-code"),
             None,
@@ -1934,7 +1945,7 @@ mod tests {
 
         // 指名 path：只删那一份。
         let report = remove(
-            &rm_opts(&db, home.path(), true, false),
+            &rm_opts(&db, home.path(), false),
             "foo",
             Some("claude-code"),
             Some(&one.display().to_string()),
@@ -1959,15 +1970,15 @@ mod tests {
         seed_skill_row(&db, "claude-code", "foo@dir-b", &two);
 
         // 只有一家 → 不该报「多家」，而是走到 path 那一关。
-        let err = remove(&rm_opts(&db, home.path(), true, false), "foo", None, None).unwrap_err();
+        let err = remove(&rm_opts(&db, home.path(), false), "foo", None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--path"), "只有一家时该问 path: {msg}");
         assert!(!msg.contains("claude-code, claude-code"), "同一家不许列两次: {msg}");
     }
 
-    /// 干跑：不归档、不删、不动索引；但要报出**将**归档到哪个目录——
-    /// `archived` 在干跑里读作「将归档到哪」（与 `removed` 读作「将删」
-    /// 同一个约定），给目录而不是编造一个带秒级时间戳的包名。
+    /// 干跑：不删、不动索引；只报将删什么。skill 删除没有归档这回事
+    /// （见 [`remove`] 的文档），所以干跑里也没有「将归档到哪」可报——
+    /// `archived` 恒为 None，导出目录不许被创建。
     #[test]
     fn rm_干跑不动盘() {
         let home = tempfile::tempdir().unwrap();
@@ -1976,29 +1987,14 @@ mod tests {
         make_skill(&dir, "foo", "body");
         seed_skill_row(&db, "claude-code", "foo", &dir);
 
-        let report = remove(&rm_opts(&db, home.path(), true, true), "foo", None, None).unwrap();
+        let report = remove(&rm_opts(&db, home.path(), true), "foo", None, None).unwrap();
         assert!(dir.is_dir(), "预览不许删");
-        assert_eq!(
-            report.archived.as_deref(),
-            Some(home.path().join("agent-duster-exports").as_path()),
-            "预览要报将归档到哪个目录"
+        assert!(report.archived.is_none(), "干跑同样没有归档可报");
+        assert!(
+            !home.path().join("agent-duster-exports").exists(),
+            "预览不许写导出目录"
         );
-        assert!(!home.path().join("agent-duster-exports").exists(), "预览不许写导出目录");
         assert!(report.removed.contains(&dir), "预览要报将删什么");
         assert!(list(Some(&db)).unwrap().len() == 1, "索引行不许动");
-    }
-
-    /// `--no-archive`：显式接受内容消失，直接删。
-    #[test]
-    fn rm_不归档直接删() {
-        let home = tempfile::tempdir().unwrap();
-        let db = home.path().join(".agent-duster").join("index.db");
-        let dir = home.path().join(".claude").join("skills").join("foo");
-        make_skill(&dir, "foo", "body");
-        seed_skill_row(&db, "claude-code", "foo", &dir);
-
-        let report = remove(&rm_opts(&db, home.path(), false, false), "foo", None, None).unwrap();
-        assert!(!dir.exists());
-        assert!(report.archived.is_none());
     }
 }

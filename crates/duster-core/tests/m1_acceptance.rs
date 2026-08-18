@@ -7,7 +7,8 @@
 //!    "加个回收站更安全"就顺手加上，那会让"已回收 774 MB"变成一句谎话。
 //! 2. 归档包解开后与删除前**逐字节一致**。归档是 prune 唯一的退路，
 //!    往返一致是它唯一的机器守卫。
-//! 3. 预估超阈值且用户没表态时**拒绝执行**。
+//! 3. prune **恒归档**：`--archive` / `--no-archive` 旗标不存在，没有任何
+//!    输入能让它跳过打包；预估超阈值不拒绝，但体积与超限随报告点名报出。
 //! 4. `install` 路径在 clean / prune 计划里**恒为空集**。这是
 //!    "duster 永不卸载用户软件"唯一的机器守卫。
 //!
@@ -310,7 +311,6 @@ fn prune_归档包解开后与删除前逐字节一致() {
         agents: Vec::new(),
         older_than_days: 30,
         keep_generations: false,
-        archive: Some(true),
         export_dir: Some(fx.exports.clone()),
         dry_run: false,
         yes: true,
@@ -347,13 +347,16 @@ fn prune_归档包解开后与删除前逐字节一致() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. 超阈值未表态即拒绝
+// 3. 恒归档：没有任何输入能让 prune 跳过打包
 // ---------------------------------------------------------------------------
 
-/// 归档预估超过 200 MB 时不自动打包：用户必须显式说 `--archive` 或
-/// `--no-archive`。没表态就拒绝执行，且一个字节都不许动。
+/// 归档预估超过 200 MB 时**照样打包**——旧的「未表态即拒绝」门随
+/// `--archive` / `--no-archive` 旗标一起撤了（见 `prune::prune` 的取舍）。
+/// 安全门换了个位置：预估体积与超限说明必须出现在报告里，用户逐行过目的
+/// 那份计划带着数字。删掉的内容（含超阈值的 210 MB 稀疏文件）必须能从
+/// 归档包里原样解出。
 #[test]
-fn prune_预估超阈值时不自动归档且未表态即拒绝() {
+fn prune_超阈值照样归档且未表态不再是拒绝理由() {
     let fx = Fixture::new();
     // 稀疏文件：set_len 不占真实磁盘，但 metadata().len() 是真的。
     let big = fx.home.join(".claude/skills/demo/huge.bin");
@@ -369,39 +372,41 @@ fn prune_预估超阈值时不自动归档且未表态即拒绝() {
     .unwrap();
 
     let now = NOW_MS + 365 * DAY_MS;
-    let base = prune::PruneOptions {
+    let report = prune::prune(&prune::PruneOptions {
         index_path: Some(fx.index.clone()),
         home: Some(fx.home.clone()),
         agents: Vec::new(),
         older_than_days: 30,
         keep_generations: false,
-        archive: None,
         export_dir: Some(fx.exports.clone()),
         dry_run: false,
         yes: true,
         json: false,
         now_ms: Some(now),
-    };
-
-    let before = fx.snapshot();
-    let err = prune::prune(&base).expect_err("未表态必须拒绝");
-    let msg = format!("{err:#}");
-    assert!(msg.contains("--archive"), "错误必须点名 --archive: {msg}");
-    assert!(
-        msg.contains("--no-archive"),
-        "错误必须点名 --no-archive: {msg}"
-    );
-    assert!(!fx.exports.exists(), "拒绝执行时不许留下归档目录");
-    assert_eq!(fx.snapshot(), before, "拒绝执行时一个文件都不许动");
-
-    // 表态之后放行：--no-archive 直接删，不打包。
-    let report = prune::prune(&prune::PruneOptions {
-        archive: Some(false),
-        ..base
     })
-    .unwrap();
+    .expect("超阈值不再是拒绝理由，必须照常执行");
+
     assert!(report.executed);
-    assert!(report.archive_path.is_none(), "--no-archive 不该产出归档包");
+    let w = report.warnings.join("\n");
+    assert!(w.contains("archive estimate"), "预估体积必须随报告报出: {w}");
+    assert!(w.contains("auto-archive limit"), "超限必须点名: {w}");
+
+    // 删掉的内容躺在包里：huge.bin 长度原样，skill 文本逐字节一致。
+    let pack = PathBuf::from(report.archive_path.expect("恒归档:必须产出归档包"));
+    assert!(pack.is_file(), "归档包要真的落在盘上: {}", pack.display());
+    let out = TempDir::new().unwrap();
+    duster_fs::archive::extract_to(&pack, out.path()).unwrap();
+    let restored = out.path().join(".claude/skills/demo/huge.bin");
+    assert_eq!(
+        fs::metadata(&restored).unwrap().len(),
+        duster_fs::archive::AUTO_ARCHIVE_LIMIT + 1,
+        "超阈值文件必须原样在包里"
+    );
+    assert_eq!(
+        fs::read_to_string(out.path().join(".claude/skills/demo/SKILL.md")).unwrap(),
+        "---\nname: demo\n---\nbody\n"
+    );
+    assert!(!big.exists(), "原件应已删除");
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +480,6 @@ fn install_目录在_clean_与_prune_计划里恒为空集() {
         agents: Vec::new(),
         older_than_days: 30,
         keep_generations: false,
-        archive: Some(true),
         export_dir: Some(fx.exports.clone()),
         dry_run: false,
         yes: true,

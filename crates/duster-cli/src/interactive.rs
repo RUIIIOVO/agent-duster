@@ -69,9 +69,9 @@ use crate::prompt::{
 use duster_core::freshness::{Freshness, ensure_fresh};
 use duster_core::mcp::{self, MergedServer, SyncOptions, SyncOutcome};
 use duster_core::memory::{self, MemoryEntry, RemoveInspection, RemoveRequest, RemoveTarget};
-use duster_core::plan::{Action, OLDER_THAN_PRESETS, Plan, PlanItem, parse_older_than};
+use duster_core::plan::{Action, OLDER_THAN_PRESETS, Plan, PlanItem, binary_inside_owns, parse_older_than};
 use duster_core::session::{self, SessionFilter, SessionRow};
-use duster_core::skill_ops::{self, DupState, SkillCopy, SkillGroup};
+use duster_core::skill_ops::{self, DupState, SkillGroup};
 use duster_core::status::{AgentStatus, status};
 use duster_fs::path::display_tilde;
 use duster_model::CleanLevel;
@@ -180,8 +180,8 @@ struct Menu {
 /// diff 或 `duster diff`。
 ///
 /// `uninstall` 排在第 3 位,比以前靠前很多——这条不是随手排的:它的护栏是
-/// 两道默认 No 的 y/N 确认(见 [`prompt_uninstall`]),不是一个 y;位置再靠前,
-/// 误触也过不了那关。
+/// 一张范围勾选表,随后只有一道 y/N 确认(见 [`prompt_uninstall`]);不是旧版
+/// 那种两道默认 No 的确认。位置再靠前,误触也过不了这两层门。
 static TOP: Menu = Menu {
     prompt: "Pick a command",
     items: &TOP_ITEMS,
@@ -358,6 +358,16 @@ pub fn run(mode: OutputMode, index: Option<&Path>) -> i32 {
         let _ = Cli::command().print_help();
         return EXIT_OK;
     }
+
+    // 首屏与「命令跑完回菜单」走同一套顶对齐:先把终端上已有的东西滚进
+    // scrollback,再从左上角画菜单。
+    //
+    // 少了这一下,裸 `duster` 的招牌会直接画在 shell 提示符下面,上一次运行
+    // 的残留、`ls` 的输出、上一条命令的报错全都留在菜单上方——而回菜单那条
+    // 路(`scroll_out_and_clear`)是顶对齐的,同一个菜单两种长相,先看到的
+    // 那一种还是更脏的那一种。用 scroll_out 而不是直接 2J:用户的历史输出
+    // 是他自己的东西,滚进 scrollback 上翻还能找回来,擦掉就真没了。
+    scroll_out_and_clear();
 
     // 菜单不等扫描:线程先跑起来,菜单立刻画(见 [`BackgroundScan`])。
     let mut scan = BackgroundScan::spawn(index);
@@ -990,7 +1000,7 @@ fn session_bulk(
         "export each as json".to_string(),
         "delete each (a readable copy is archived first)".to_string(),
     ];
-    let pick = match menu_pick(&format!("{} conversations: what next", sel.len()), &actions, 0) {
+    let pick = match menu_pick(&format!("{}: what next", crate::plural(sel.len(), "conversation")), &actions, 0) {
         Ok(Some(i)) => i,
         // Esc:回列表,勾选留着。
         _ => return None,
@@ -1025,7 +1035,7 @@ fn session_bulk(
     let total: u64 = sel.iter().map(|&i| rows[i].bytes).sum();
     match prompt_yes_no(
         &format!(
-            "Delete {} conversations ({}), archiving a readable copy of each into \
+            "Delete {} ({}), archiving a readable copy of each into \
              ~/agent-duster-exports/ first?",
             crate::plural(sel.len(), "conversation"),
             human_bytes(total)
@@ -1091,7 +1101,7 @@ fn session_list_rows_at(rows: &[SessionRow], cols: usize) -> (String, Vec<String
 }
 
 /// 一场会话的下钻:先折叠视图(与命令行默认同档)扫一遍,再在同一行上
-/// 给上下文动作(全文 / 两种导出 / migrate / delete)。
+/// 给上下文动作(全文 / 两种导出 / migrate / 两种 delete)。
 ///
 /// `--full` 是菜单以前唯一够不着又最痛的能力——折叠视图是**扫**一场会话的
 /// 形态,而用户扫完往往正是要读全文,让他退出菜单去敲一条带 rid 的命令是
@@ -1100,8 +1110,8 @@ fn session_list_rows_at(rows: &[SessionRow], cols: usize) -> (String, Vec<String
 /// 并起来——看了五条有一条报错,整趟就不是 0。
 ///
 /// Esc 回列表,一次一层(back 条目已撤)。默认光标落第 0 格(全文,只读):
-/// 写类动作(导出灌 stdout、migrate 动别人家的盘、delete 删数据)排在
-/// 后面,而且 delete 自己还有一句 y/N 确认,回车不会一击写盘。
+/// 写类动作(导出灌 stdout、migrate 动别人家的盘、两条 delete 删数据)排
+/// 在后面,而且两条 delete 各有一句 y/N 确认(默认 No),回车不会一击写盘。
 ///
 /// 导出 `out` 恒为 None(写到 stdout):在提示符后面拼文件路径是 shell 的活,
 /// 菜单不抢。全文那档 `limit: 0` + `full: true`:`limit` 0 = 全部轮次、
@@ -1163,8 +1173,12 @@ fn session_detail(mode: OutputMode, index: Option<&Path>, row: &SessionRow) -> D
                 SessionDetailAction::Migrate => {
                     code = worse(code, session_migrate_action(mode, index, rid));
                 }
-                SessionDetailAction::Delete => {
-                    let (c, deleted) = session_delete_action(mode, index, row);
+                // 两条 delete 共用同一个 helper,唯一的差别是 `no_archive`:
+                // 菜单不留第二套业务逻辑。
+                SessionDetailAction::DeleteArchived | SessionDetailAction::DeleteForGood => {
+                    let no_archive =
+                        matches!(SESSION_DETAIL_ACTIONS[i], SessionDetailAction::DeleteForGood);
+                    let (c, deleted) = session_delete_action(mode, index, row, no_archive);
                     code = worse(code, c);
                     if deleted {
                         // 真删了:列表下一轮必须重取,不许继续列着这一行。
@@ -1179,19 +1193,39 @@ fn session_detail(mode: OutputMode, index: Option<&Path>, row: &SessionRow) -> D
     DrillOutcome::from(code)
 }
 
-/// 详情动作里的 delete:一句 y/N 确认(亮出将删的路径与归档去处),然后走
-/// `cmd::session::run` 的同一条 `Rm` 通路——菜单不留第二套业务逻辑,
-/// 回执、退出码、报错文案与命令行逐字相同。
+/// 详情动作里的 delete:菜单把「删」拆成两条并列动作——归档后删与真删,
+/// 唯一的差别是 `no_archive`。会话是不可再生的用户内容,删之前默认留一份
+/// 可读副本是对的;但用户明确知道自己在扔什么的时候,工具不该强塞一个他
+/// 还得自己去清的包——所以两条并列,业务逻辑只有一份。两条都走
+/// `cmd::session::run` 的同一条 `Rm` 通路,回执、退出码、报错文案与命令行
+/// 逐字相同。
+///
+/// 确认句由 `no_archive` 决定:归档删亮出路径、体积与归档去处;真删点明
+/// 没有退路。两句默认答案都是 No。
 ///
 /// 返回 (退出码, 是否真删了)。真删了才让列表重取;拒绝 / Esc / 终端拿
 /// 不到 = 不动盘,不是错误,也不触发重取。
-fn session_delete_action(mode: OutputMode, index: Option<&Path>, row: &SessionRow) -> (i32, bool) {
-    let prompt = format!(
-        "Delete this conversation ({path} · {size})? A readable copy is archived into \
-         ~/agent-duster-exports/ first",
-        path = display_tilde(Path::new(&row.path)),
-        size = human_bytes(row.bytes)
-    );
+fn session_delete_action(
+    mode: OutputMode,
+    index: Option<&Path>,
+    row: &SessionRow,
+    no_archive: bool,
+) -> (i32, bool) {
+    let prompt = if no_archive {
+        format!(
+            "Delete this conversation ({path} · {size}) for good? No archive is made — \
+             the conversation is gone",
+            path = display_tilde(Path::new(&row.path)),
+            size = human_bytes(row.bytes)
+        )
+    } else {
+        format!(
+            "Delete this conversation ({path} · {size})? A readable copy is archived into \
+             ~/agent-duster-exports/ first",
+            path = display_tilde(Path::new(&row.path)),
+            size = human_bytes(row.bytes)
+        )
+    };
     match prompt_yes_no(&prompt, false) {
         Ok(Some(true)) => {
             let code = cmd::session::run(
@@ -1199,7 +1233,7 @@ fn session_delete_action(mode: OutputMode, index: Option<&Path>, row: &SessionRo
                 index,
                 cmd::session::SessionCmd::Rm {
                     id: row.rid.to_string(),
-                    no_archive: false,
+                    no_archive,
                     dry_run: false,
                 },
             );
@@ -1214,13 +1248,19 @@ fn session_delete_action(mode: OutputMode, index: Option<&Path>, row: &SessionRo
 /// 返回,一屏一次,菜单里再放一条 back 等于给同一扇门装两个把手。
 /// migrate 的实现在 [`session_migrate_action`],delete 的实现在
 /// [`session_delete_action`]。
+///
+/// 为什么只有会话(和记忆,见 `memory_detail_actions`)配得上「两条
+/// delete」:它们是不可再生的用户内容,删之前默认留一份归档是对的;但
+/// 用户明确知道自己在扔什么的时候,工具不该强塞一个他还得自己去清的包。
+/// 两条并列,唯一的差别是 `no_archive`,业务逻辑只有一份。
 #[derive(Clone, Copy)]
 enum SessionDetailAction {
     Full,
     ExportMarkdown,
     ExportJson,
     Migrate,
-    Delete,
+    DeleteArchived,
+    DeleteForGood,
 }
 
 impl SessionDetailAction {
@@ -1233,20 +1273,24 @@ impl SessionDetailAction {
             SessionDetailAction::Migrate => {
                 "plant a text-only copy into another agent (tool calls are not carried over)"
             }
-            SessionDetailAction::Delete => {
+            SessionDetailAction::DeleteArchived => {
                 "delete it (a readable copy is archived into ~/agent-duster-exports/ first)"
+            }
+            SessionDetailAction::DeleteForGood => {
+                "delete it for good (no archive — the conversation is gone)"
             }
         }
     }
 }
 
 /// 顺序即菜单顺序;[`session_detail`] 按下标回查这一份。
-const SESSION_DETAIL_ACTIONS: [SessionDetailAction; 5] = [
+const SESSION_DETAIL_ACTIONS: [SessionDetailAction; 6] = [
     SessionDetailAction::Full,
     SessionDetailAction::ExportMarkdown,
     SessionDetailAction::ExportJson,
     SessionDetailAction::Migrate,
-    SessionDetailAction::Delete,
+    SessionDetailAction::DeleteArchived,
+    SessionDetailAction::DeleteForGood,
 ];
 
 /// 下钻动作的行文。单独成函数而不是 inline:这是对用户可见的稳定契约
@@ -1334,11 +1378,15 @@ fn memory_list(mode: OutputMode, index: Option<&Path>) -> Outcome {
 }
 
 /// 一条记忆的详情:先 `memory show` 全文(key 是行尾那一串,原样递,不经
-/// 过用户的手抄),再挂上下文动作(migrate)。Esc 回列表,一次一层。
+/// 过用户的手抄),再挂上下文动作(migrate / 两条 delete)。Esc 回列表,一次
+/// 一层。
 ///
-/// 默认光标落第 0 格:migrate 自己还有目标单选 + y/N 两道门,回车不会
-/// 一击写盘。
+/// 默认光标落第 0 格:migrate 自己还有目标单选 + y/N 两道门,两条 delete
+/// 各有一句 y/N 确认(默认 No),回车不会一击写盘。
 fn memory_detail(mode: OutputMode, index: Option<&Path>, entry: &MemoryEntry, key: &str) -> i32 {
+    // 这一屏的下一步是 migrate / delete——用户决定要不要删这条记忆,
+    // 路径、体积、上次修改三个事实得先摆出来,不能回列表去数。
+    println!("\n  {}", muted().apply_to(memory_meta_line(entry)));
     let mut code = cmd::memory::run(
         mode,
         index,
@@ -1352,7 +1400,11 @@ fn memory_detail(mode: OutputMode, index: Option<&Path>, entry: &MemoryEntry, ke
             code,
             match i {
                 0 => memory_migrate_action(mode, index, entry),
-                _ => memory_delete_action(mode, index, entry),
+                1 => memory_delete_action(mode, index, entry, false),
+                2 => memory_delete_action(mode, index, entry, true),
+                // menu_pick 的下标不会越出 actions 的长度;枚举穷尽只是
+                // 把「再加一条就得接线」变成编译期提醒。
+                _ => unreachable!("memory_detail_actions 只有 3 项,下标 {i} 不会出现"),
             },
         );
     }
@@ -1360,12 +1412,33 @@ fn memory_detail(mode: OutputMode, index: Option<&Path>, entry: &MemoryEntry, ke
     code
 }
 
+/// 详情屏正文之前的元信息行:`路径 · 体积 · 上次修改`。
+///
+/// 单独成函数而不是 inline:这一行是用户可见的稳定契约,测试要逐字核对。
+/// 路径折 `~`(与列表的 PATH 列同口径);「上次修改」与 LAST USED 列共用
+/// [`relative_time`](crate::relative_time)——索引行的 mtime,没有证据印
+/// `never`,绝不编 1970 年出来。
+fn memory_meta_line(entry: &MemoryEntry) -> String {
+    format!(
+        "{} · {} · {}",
+        display_tilde(&entry.path),
+        human_bytes(entry.bytes),
+        crate::relative_time(entry.last_used_ms),
+    )
+}
+
 /// 下钻动作的行文。单独成函数而不是 inline:数量与措辞是用户可见的稳定
 /// 契约,测试要逐字核对。back 没有条目——Esc 就是返回。
+///
+/// 为什么记忆配得上「两条 delete」(和会话同一理由,见
+/// [`SessionDetailAction`]):记忆是不可再生的用户内容,删之前默认留一份
+/// 归档是对的;但用户明确知道自己在扔什么的时候,工具不该强塞一个他还得
+/// 自己去清的包。两条并列,唯一的差别是 `no_archive`,业务逻辑只有一份。
 fn memory_detail_actions() -> Vec<String> {
     vec![
         "migrate it into another agent's memory".to_string(),
-        "delete".to_string(),
+        "delete it (a readable copy is archived into ~/agent-duster-exports/ first)".to_string(),
+        "delete it for good (no archive — the memory is gone)".to_string(),
     ]
 }
 
@@ -1384,7 +1457,7 @@ fn memory_bulk(
         "print each in full".to_string(),
         "delete selected".to_string(),
     ];
-    match menu_pick(&format!("{} memories: what next", sel.len()), &actions, 0) {
+    match menu_pick(&format!("{}: what next", crate::plural(sel.len(), "memory")), &actions, 0) {
         Ok(Some(0)) => {
             let mut code = EXIT_OK;
             for &i in sel {
@@ -1627,15 +1700,28 @@ fn memory_migrate_action(mode: OutputMode, index: Option<&Path>, entry: &MemoryE
     }
 }
 
-/// memory 详情动作里的 delete:先勘察这份文件属于谁(duster 块 / duster
-/// 建的整份文件 / 用户手写),按归类走不同道数的确认,然后走
-/// `cmd::memory::rm_execute` 的同一条通路——菜单不留第二套业务逻辑,
-/// 回执、退出码、报错文案与命令行逐字相同。
+/// memory 详情动作里的 delete:菜单把「删」拆成两条并列动作——归档后删与
+/// 真删,唯一的差别是 `no_archive`。记忆是不可再生的用户内容(与会话同一
+/// 理由,见 [`SessionDetailAction`]):删之前默认留一份归档是对的;但用户
+/// 明确知道自己在扔什么的时候,工具不该强塞一个他还得自己去清的包——
+/// 所以两条并列,业务逻辑只有一份。
+///
+/// 先勘察这份文件属于谁(duster 块 / duster 建的整份文件 / 用户手写),按
+/// 归类走不同道数的确认,然后走 `cmd::memory::run` 的同一条 `Rm` 通路——
+/// 菜单不留第二套业务逻辑,回执、退出码、报错文案与命令行逐字相同。
+/// 确认句由 `no_archive` 决定:归档删亮出归档落点,真删点明没有退路。
 ///
 /// 文件里有多个 duster 块时先摆子菜单挑哪一块;整删永远两道 y/N(文件
-/// 同时还有 N 个 duster 块时,确认句照亮出块数)。Esc / 拒绝确认 =
+/// 同时还有 N 个 duster 块时,确认句照亮出块数)。用户手写文件归档强制
+/// 是核心层的硬规则(见 duster-core 的 `memory::remove`):真删在那一支上
+/// 会被核心拒绝,菜单不绕过——报错文案就是命令行那套。Esc / 拒绝确认 =
 /// 不动盘,EXIT_OK 回详情。
-fn memory_delete_action(mode: OutputMode, index: Option<&Path>, entry: &MemoryEntry) -> i32 {
+fn memory_delete_action(
+    mode: OutputMode,
+    index: Option<&Path>,
+    entry: &MemoryEntry,
+    no_archive: bool,
+) -> i32 {
     let path = entry.path.display().to_string();
     let inspection = match memory::inspect_remove(index, None, &path) {
         Ok(i) => i,
@@ -1646,21 +1732,29 @@ fn memory_delete_action(mode: OutputMode, index: Option<&Path>, entry: &MemoryEn
     // 整删一道门。
     if inspection.duster_file {
         let prompt = format!(
-            "Delete the duster-created file {}? It will be archived to {}.",
+            "Delete the duster-created file {}? {}",
             display_tilde(&inspection.file),
-            memory_archive_dir()
+            memory_archive_tail(no_archive)
         );
         return match prompt_yes_no(&prompt, false) {
-            Ok(Some(true)) => {
-                cmd::memory::rm_execute(mode, index, &path, None, false, true, false)
-            }
+            Ok(Some(true)) => cmd::memory::run(
+                mode,
+                index,
+                &cmd::memory::MemoryCmd::Rm {
+                    key: path.clone(),
+                    from: None,
+                    whole_file: false,
+                    no_archive,
+                    dry_run: false,
+                },
+            ),
             _ => EXIT_OK,
         };
     }
 
     // 没有 duster 块 → 用户自己手写的文件:两道门 + 强制归档。
     if inspection.block_count() == 0 {
-        return memory_delete_user_file(mode, index, &path, &inspection);
+        return memory_delete_user_file(mode, index, &path, &inspection, no_archive);
     }
 
     // 只有一个完整块:直切。菜单里选中这份文件就是选中了唯一的那个块,
@@ -1668,15 +1762,22 @@ fn memory_delete_action(mode: OutputMode, index: Option<&Path>, entry: &MemoryEn
     if inspection.blocks.len() == 1 && inspection.broken.is_empty() {
         let from = &inspection.blocks[0];
         let prompt = format!(
-            "Cut the duster block from={from} out of {}? Your own text is untouched. \
-             The file will be archived to {}.",
+            "Cut the duster block from={from} out of {}? Your own text is untouched. {}",
             display_tilde(&inspection.file),
-            memory_archive_dir()
+            memory_archive_tail(no_archive)
         );
         return match prompt_yes_no(&prompt, false) {
-            Ok(Some(true)) => {
-                cmd::memory::rm_execute(mode, index, &path, Some(from), false, true, false)
-            }
+            Ok(Some(true)) => cmd::memory::run(
+                mode,
+                index,
+                &cmd::memory::MemoryCmd::Rm {
+                    key: path.clone(),
+                    from: Some(from.clone()),
+                    whole_file: false,
+                    no_archive,
+                    dry_run: false,
+                },
+            ),
             _ => EXIT_OK,
         };
     }
@@ -1702,31 +1803,41 @@ fn memory_delete_action(mode: OutputMode, index: Option<&Path>, entry: &MemoryEn
     if i < inspection.blocks.len() {
         let from = inspection.blocks[i].clone();
         let prompt = format!(
-            "Cut the duster block from={from} out of {}? Your own text is untouched. \
-             The file will be archived to {}.",
+            "Cut the duster block from={from} out of {}? Your own text is untouched. {}",
             display_tilde(&inspection.file),
-            memory_archive_dir()
+            memory_archive_tail(no_archive)
         );
         match prompt_yes_no(&prompt, false) {
-            Ok(Some(true)) => {
-                cmd::memory::rm_execute(mode, index, &path, Some(&from), false, true, false)
-            }
+            Ok(Some(true)) => cmd::memory::run(
+                mode,
+                index,
+                &cmd::memory::MemoryCmd::Rm {
+                    key: path.clone(),
+                    from: Some(from),
+                    whole_file: false,
+                    no_archive,
+                    dry_run: false,
+                },
+            ),
             _ => EXIT_OK,
         }
     } else {
-        memory_delete_user_file(mode, index, &path, &inspection)
+        memory_delete_user_file(mode, index, &path, &inspection, no_archive)
     }
 }
 
 /// 用户手写文件的删除:两道 y/N。第一道报路径与字节(文件同时还有
 /// duster 块时一并亮出块数);第二道亮出所有权与归档去处——这道门是给
 /// 「这是我自己写的、不是 duster 放的」这句事实一个单独的确认机会。
-/// 归档强制:菜单永远传 archive=true(核心层本来就拒绝 --no-archive)。
+/// 核心层对用户手写文件强制归档(`--no-archive` 拒绝生效),真删走到这支
+/// 也一样被拒——这里只按 `no_archive` 措辞确认句,拒绝是核心层的事,
+/// 菜单不自己实现第二套规则。
 fn memory_delete_user_file(
     mode: OutputMode,
     index: Option<&Path>,
     path: &str,
     inspection: &RemoveInspection,
+    no_archive: bool,
 ) -> i32 {
     let size = std::fs::metadata(&inspection.file)
         .map(|m| m.len())
@@ -1756,22 +1867,43 @@ fn memory_delete_user_file(
     match prompt_yes_no(
         &format!(
             "This is your own writing, not something duster put there. \
-             Delete it for good? It will be archived to {}.",
-            memory_archive_dir()
+             Delete it for good? {}",
+            memory_archive_tail(no_archive)
         ),
         false,
     ) {
-        Ok(Some(true)) => cmd::memory::rm_execute(mode, index, path, None, false, true, false),
+        Ok(Some(true)) => cmd::memory::run(
+            mode,
+            index,
+            &cmd::memory::MemoryCmd::Rm {
+                key: path.to_string(),
+                from: None,
+                whole_file: false,
+                no_archive,
+                dry_run: false,
+            },
+        ),
         _ => EXIT_OK,
     }
 }
 
-/// 确认文案里的归档落点目录。core 给的就是目录（包名带秒级时间戳，预告一个
-/// 保证会变的精确文件名是假信息）；真跑之后的报告里有实际路径。
+/// 确认文案里的归档落点目录。core 给的就是目录(包名带秒级时间戳,预告一个
+/// 保证会变的精确文件名是假信息);真跑之后的报告里有实际路径。
 fn memory_archive_dir() -> String {
     memory::remove_archive_dest(None)
         .map(|p| display_tilde(&p))
         .unwrap_or_else(|_| "~/agent-duster-exports".to_string())
+}
+
+/// 确认句的归档尾注。菜单把「删」拆成归档删 / 真删两条,唯一的差别是
+/// `no_archive`,尾注要把各自的结果讲透:归档删亮出落点目录,真删点明
+/// 没有退路(用户手写文件那一支核心层还会拒绝,见 [`memory_delete_user_file`])。
+fn memory_archive_tail(no_archive: bool) -> String {
+    if no_archive {
+        "No archive is made — the original is gone.".to_string()
+    } else {
+        format!("It will be archived to {}.", memory_archive_dir())
+    }
 }
 
 /// `mcp list` → 进组直接列表。**一行一条声明**(铺平,与 `skill list` 同构,
@@ -1848,7 +1980,7 @@ fn mcp_bulk(
         "delete each declaration from its agent's config".to_string(),
     ];
     match menu_pick(
-        &format!("{} declarations: what next", sel.len()),
+        &format!("{}: what next", crate::plural(sel.len(), "declaration")),
         &actions,
         0,
     ) {
@@ -1918,7 +2050,6 @@ fn mcp_bulk_delete(
         match mcp::remove(&mcp::RemoveOptions {
             index_path: index.map(Path::to_path_buf),
             home: None,
-            archive: true,
             dry_run: true,
             name: name.clone(),
             agent: Some(agent.clone()),
@@ -1935,13 +2066,13 @@ fn mcp_bulk_delete(
         }
     }
 
-    // 一道 y/N:亮出条数、文件数与合计字节,外加归档去处。这是摘键前的
-    // 最后一道门,默认 No。
+    // 一道 y/N:亮出条数、文件数与合计字节,外加改写前的快照落点。这是摘键前
+    // 的最后一道门,默认 No。
     match prompt_yes_no(
         &format!(
-            "Delete {} declaration(s) from {} file(s) — about {} freed? The whole files go into ~/agent-duster-exports first.",
-            targets.len(),
-            files.len(),
+            "Delete {} from {} — about {} freed? The whole files are snapshotted to ~/.agent-duster/snapshots first.",
+            crate::plural(targets.len(), "declaration"),
+            crate::plural(files.len(), "file"),
             human_bytes(freed)
         ),
         false,
@@ -1958,7 +2089,6 @@ fn mcp_bulk_delete(
                             name: name.clone(),
                             agent: Some(agent.clone()),
                             all_agents: false,
-                            no_archive: false,
                             dry_run: false,
                         },
                     ),
@@ -2043,7 +2173,7 @@ fn mcp_detail(mode: OutputMode, index: Option<&Path>, server: &MergedServer) -> 
 
 /// 详情屏的 delete 动作:先挑「哪一条声明」(同一个 server 可能被多家声明,
 /// 删哪家是删除的目标本身,不许默认替用户挑),再一道 y/N 确认——文案亮出
-/// 将删的路径与归档去处——然后走 `duster mcp rm` 的同一条通路,回执、
+/// 将删的路径与快照落点——然后走 `duster mcp rm` 的同一条通路,回执、
 /// 退出码、报错文案与命令行逐字相同。
 ///
 /// Esc / 拒绝确认 = 不动盘,EXIT_OK 回详情。
@@ -2071,11 +2201,11 @@ fn mcp_delete_decl(mode: OutputMode, index: Option<&Path>, server: &MergedServer
         }
     };
     let d = &server.declared_in[chosen];
-    // 往别人家主配置里摘键前的最后一道门。文案点明路径与归档去处:
-    // 摘错了一条声明,用户要能把整份配置捣回来。
+    // 往别人家主配置里摘键前的最后一道门。文案点明路径与快照落点:
+    // 摘错了一条声明,用户要从快照里把整份配置捞回来。
     match prompt_yes_no(
         &format!(
-            "Remove `{}` from {}? The whole file goes into ~/agent-duster-exports first, so `tar -xf` brings it back.",
+            "Remove `{}` from {}? The whole file is snapshotted to ~/.agent-duster/snapshots first, so it can be restored from there.",
             server.name,
             display_tilde(&d.path)
         ),
@@ -2088,7 +2218,6 @@ fn mcp_delete_decl(mode: OutputMode, index: Option<&Path>, server: &MergedServer
                 name: server.name.clone(),
                 agent: Some(d.agent_id.clone()),
                 all_agents: false,
-                no_archive: false,
                 dry_run: false,
             },
         ),
@@ -2362,9 +2491,9 @@ fn skill_bulk(
 ) -> Option<DrillOutcome> {
     let actions = [
         "link each into another agent (one copy on disk)".to_string(),
-        "delete each (a copy is archived first)".to_string(),
+        "delete each (deleted outright — no archive, nothing to restore from)".to_string(),
     ];
-    let pick = match menu_pick(&format!("{} copies: what next", sel.len()), &actions, 0) {
+    let pick = match menu_pick(&format!("{}: what next", crate::plural(sel.len(), "copy")), &actions, 0) {
         Ok(Some(i)) => i,
         // Esc:回列表,勾选留着。
         _ => return None,
@@ -2403,8 +2532,8 @@ fn skill_bulk(
     }
     match prompt_yes_no(
         &format!(
-            "Delete {} copies ({}), archiving each real copy into ~/agent-duster-exports/ \
-             first?",
+            "Delete {} ({}) outright? Skill deletion makes no archive — nothing to \
+             restore from.",
             crate::plural(plan.len(), "copy"),
             human_bytes(total)
         ),
@@ -2424,7 +2553,6 @@ fn skill_bulk(
                     // 那家的同名多份一起删掉(本机 open-gstack-browser 在
                     // claude-code 下就有两份),而确认句说的是「这一份」。
                     Some(&g.copies[ci].path.display().to_string()),
-                    true,
                     false,
                 );
                 code = worse(code, c);
@@ -2471,11 +2599,13 @@ fn skill_copy_rows(groups: &[SkillGroup]) -> (String, Vec<String>) {
 /// 宽度算法本体;`cols` 由测试直接给(60 / 80 / 200),不必 mock 终端。
 /// 前缀预算是 [`Prefix::Checkbox`]:统一列表流的浏览表每行画 `❯ [x] `。
 fn skill_copy_rows_at(groups: &[SkillGroup], cols: usize) -> (String, Vec<String>) {
-    let mut table = Table::new(vec!["SKILL", "STATE", "AGENT", "CONTENT", "PATH"]);
+    let mut table = Table::new(vec!["SKILL", "STATE", "AGENT", "CONTENT", "LAST USED", "PATH"]);
     table.right_align(&[3]);
-    // PATH 吃余量:它天然最长,窄终端里按余量截断。名字 / 状态 / agent 三列
-    // 一格不让——「哪个 skill、什么状态、谁装的」是这一屏存在的理由。
-    table.flex_col(4);
+    // LAST USED 是短列(「3d ago」/「never」这个量级),按内容宽放、不做
+    // flex;PATH 吃余量:它天然最长,窄终端里按余量截断。名字 / 状态 /
+    // agent 三列一格不让——「哪个 skill、什么状态、谁装的」是这一屏存在
+    // 的理由。
+    table.flex_col(5);
     for g in groups {
         for c in &g.copies {
             table.push_row(vec![
@@ -2483,40 +2613,13 @@ fn skill_copy_rows_at(groups: &[SkillGroup], cols: usize) -> (String, Vec<String
                 crate::dup_state_label(c.state).to_string(),
                 c.agent_id.clone(),
                 human_bytes(c.bytes),
+                crate::relative_time(c.last_used_ms),
                 // 折 `~`:副本住在 home 下,`/Users/<你>/` 那 13 列零信息量。
                 display_tilde(&c.path),
             ]);
         }
     }
     table.rows_at(Prefix::Checkbox, cols)
-}
-
-/// AGENTS 列的单元格:按 `copies` 里的出现顺序列出持有这份 skill 的 agent,
-/// 同一 agent 的多份副本标 `×N`。
-///
-/// 分组键是**声明的 skill 名**,不是目录名——同一个 agent 可能同名装两份
-/// (本机 `open-gstack-browser` 在 claude-code 里就有两份,目录名分别叫
-/// `connect-chrome` 与 `open-gstack-browser`)。所以这里只做出现顺序去重,
-/// 不去重后当成「一家」:`claude-code` 持有两份却报成一份,用户顺着 AGENTS
-/// 列去详情核对时就会对不上。顺序照搬 `copies`,不重新排序,渲染稳定可 diff。
-fn agents_cell(copies: &[SkillCopy]) -> String {
-    let mut order: Vec<&str> = Vec::new();
-    let mut n: Vec<usize> = Vec::new();
-    for c in copies {
-        match order.iter().position(|&a| a == c.agent_id) {
-            Some(i) => n[i] += 1,
-            None => {
-                order.push(&c.agent_id);
-                n.push(1);
-            }
-        }
-    }
-    order
-        .iter()
-        .zip(n)
-        .map(|(a, n)| if n > 1 { format!("{a} ×{n}") } else { (*a).to_string() })
-        .collect::<Vec<_>>()
-        .join(" · ")
 }
 
 /// 一组 skill 的详情:副本表(agent / 内容 / install / 路径)+ 软链去向
@@ -2537,6 +2640,9 @@ fn skill_group_detail(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) ->
     if show_install {
         head.push("INSTALLED");
     }
+    // LAST USED 在 PATH 前:这一屏是用户决定删哪一份的地方,「哪一份早
+    // 就不用了」正是判据;PATH 留到行尾吃终端余量。
+    head.push("LAST USED");
     head.push("PATH");
     let path_col = head.len() - 1;
     let mut t = Table::new(head);
@@ -2552,7 +2658,10 @@ fn skill_group_detail(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) ->
         if show_install {
             row.push(human_bytes(c.install_bytes));
         }
-        row.push(c.path.display().to_string());
+        row.push(crate::relative_time(c.last_used_ms));
+        // 折 `~`,与列表那一屏同口径:同一条动线里一处折一处不折,用户会
+        // 以为是两个不同的路径。
+        row.push(display_tilde(&c.path));
         t.push_row(row);
     }
     // 路径列吃终端余量:这一屏是 TTY 上的阅读屏,超宽就截;要完整路径走
@@ -2612,7 +2721,7 @@ fn skill_group_detail(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) ->
 
     // 动作菜单只剩 link。Esc 回组列表;link 自己还有源/目标两问,
     // 回车不会一击写盘。
-    let actions = skill_group_actions();
+    let actions = skill_group_actions(g);
     match menu_pick(&format!("{}: what next", g.name), &actions, 0) {
         Ok(Some(0)) => {
             let code = skill_link_action(mode, index, g);
@@ -2634,11 +2743,14 @@ fn skill_group_detail(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) ->
 }
 
 /// 详情动作里的 delete:多份副本时先挑一份(单份免问),一句 y/N 确认
-/// (亮出将删的路径与归档去处),然后走 `cmd_skill_rm` 的同一条通路——
-/// 菜单不留第二套业务逻辑,回执、退出码、报错文案与命令行逐字相同。
+/// (亮出将删的路径、体积与形态对应的实话),然后走 `cmd_skill_rm` 的
+/// 同一条通路——菜单不留第二套业务逻辑,回执、退出码、报错文案与命令行
+/// 逐字相同。
 ///
 /// 软链副本(Linked / Broken)的确认句必须说实话:只删链接,指向的内容
-/// 原样留在别处,也没有归档可做。
+/// 原样留在别处。真目录也不再说「先归档」——skill 删除不归档(见
+/// [`duster_core::skill_ops::remove`] 的文档),确认句照实说「直接删、不留
+/// 副本」。
 ///
 /// 返回 (退出码, 是否真删了)。真删了才让列表重取;拒绝 / Esc / 终端拿
 /// 不到 = 不动盘,不是错误,也不触发重取。
@@ -2657,7 +2769,7 @@ fn skill_delete_action(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) -
         DupState::Linked | DupState::Broken => {
             "only the link is removed — the content it points to stays"
         }
-        _ => "a copy is archived into ~/agent-duster-exports/ first",
+        _ => "deleted outright — no archive, nothing to restore from",
     };
     let prompt = format!(
         "Delete this copy of {} ({path} · {size})? {note}",
@@ -2675,7 +2787,6 @@ fn skill_delete_action(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) -
                 Some(&c.agent_id),
                 // 同上:确认句写的是「this copy」,删的就得是这一份。
                 Some(&c.path.display().to_string()),
-                true,
                 false,
             );
             (code, code != EXIT_ERROR)
@@ -2690,12 +2801,28 @@ fn skill_delete_action(mode: OutputMode, index: Option<&Path>, g: &SkillGroup) -
 ///
 /// link 把「只在 claude-code 里的 skill 共享给 codex」——单份 skill 最
 /// 有用的动作,列表现在把单份组也摊开了,这一格就是它们的出口;
-/// delete 是反方向:删掉一份副本(先归档)。「对比两份副本」已撤(见
+/// delete 是反方向:删掉一份副本。「对比两份副本」已撤(见
 /// [`skill_group_detail`])。
-fn skill_group_actions() -> Vec<String> {
+///
+/// delete 那句的后半段跟着副本形态走，不能写死「先归档」：skill 删除
+/// **不归档**（见 [`duster_core::skill_ops::remove`] 的文档）——真目录整棵
+/// 删、软链副本（Linked / Broken）删的只是链接本身。原来的三档（真目录
+/// 说先归档 / 软链说只摘链接 / 混着不承诺）并成两档：全是软链就说只摘链接；
+/// 其余（含混着）都说「直接删、不留副本」——这句对每一份副本都是实话，
+/// 软链那份的「内容留在别处」留给 [`skill_delete_action`] 挑完副本后逐份
+/// 补充。
+fn skill_group_actions(g: &SkillGroup) -> Vec<String> {
+    let link_like = |c: &duster_core::skill_ops::SkillCopy| {
+        matches!(c.state, DupState::Linked | DupState::Broken)
+    };
+    let delete = if g.copies.iter().all(link_like) {
+        "delete a copy (only the link is removed — the content it points to stays)"
+    } else {
+        "delete a copy (deleted outright — no archive, nothing to restore from)"
+    };
     vec![
         "link this skill into another agent (one copy on disk)".to_string(),
-        "delete a copy (it is archived into ~/agent-duster-exports/ first)".to_string(),
+        delete.to_string(),
     ]
 }
 
@@ -2759,8 +2886,8 @@ fn prompt_clean(mode: OutputMode, index: Option<&Path>) -> Outcome {
 
 /// 交互式 prune:阈值问句见 [`prompt_age`],范围见 [`prompt_agent`]。
 ///
-/// 归档在这里必须当场表态:未表态且预估超阈值时 core 会拒绝执行,
-/// 而交互模式里"再去敲一遍带 --archive 的命令"是最没道理的收场。
+/// 归档在这里没有开关:prune 恒归档,凡删必先打包;预估超阈值不拦路,
+/// 体积随计划报告给用户过目,不再当场表态。
 fn prompt_prune(mode: OutputMode, index: Option<&Path>) -> Outcome {
     let age = match prompt_age() {
         Ok(Some(a)) => a,
@@ -2769,11 +2896,6 @@ fn prompt_prune(mode: OutputMode, index: Option<&Path>) -> Outcome {
     };
     let agents = match prompt_agent(index) {
         Ok(Some(v)) => v,
-        Ok(None) => return Outcome::silent(EXIT_OK),
-        Err(()) => return Outcome::silent(EXIT_ERROR),
-    };
-    let archive = match prompt_yes_no("Pack a copy into ~/agent-duster-exports first?", true) {
-        Ok(Some(b)) => Some(b),
         Ok(None) => return Outcome::silent(EXIT_OK),
         Err(()) => return Outcome::silent(EXIT_ERROR),
     };
@@ -2793,21 +2915,25 @@ fn prompt_prune(mode: OutputMode, index: Option<&Path>) -> Outcome {
         index,
         agents,
         Some(age),
-        archive,
         Consent::Ask,
         keep_generations,
     ))
 }
 
-/// 交互式 uninstall:单选 agent → 两道默认 No 的 y/N 确认,都过才动手。
+/// 交互式 uninstall:单选 agent → 勾一张两格的范围表([`uninstall_scope`])
+/// → 一次默认 No 的 y/N,过了才动手。
 ///
-/// 不用 checklist 而用单选([`prompt_pick`]):卸载是最重的动作,一屏勾多个
-/// agent 全删的批量语义太危险,产品上单选。两道确认的数字来自索引统计
-/// ([`uninstall_summary`]),先看数字后表态才是有效确认。
+/// 不用 checklist 选 agent 而用单选([`prompt_pick`]):卸载是最重的动作,
+/// 一屏勾多个 agent 全删的批量语义太危险,产品上单选。范围那一张才是勾选
+/// 表——它问的不是「删几个 agent」,而是「这一个 agent 的哪两样东西」。
 ///
-/// 任何一道确认按 Esc 或选 No 都退回列表重新挑,一次 Esc 一层;只有两关
-/// 全过才把确认串交给 [`cmd_uninstall`]——与命令行 `--confirm <agent>`
-/// 走同一条执行门,授权凭据不再需要逐字输入。
+/// 只留一道 y/N 而不是两道:范围表本身已经是一次逐项过目,后面再叠一句
+/// 「你真的确定吗」只会训练用户闭眼按 y。该说的都压进那一句里——数字来自
+/// 索引统计([`uninstall_summary`]),外加「什么都不归档、不可撤销」。
+///
+/// 范围表或确认句按 Esc / 选 No 都退回列表重新挑,一次 Esc 一层;过了才把
+/// 确认串交给 [`cmd_uninstall`]——与命令行 `--confirm <agent>` 走同一条执行
+/// 门,授权凭据不再需要逐字输入。
 ///
 /// 收场的停顿口径([`Outcome`]):Esc 一路取消 = silent(交互屏自己擦干
 /// 净了,屏上没有没读过的东西);「索引里没 agent」的那一句与执行后的
@@ -2844,30 +2970,17 @@ fn prompt_uninstall(mode: OutputMode, index: Option<&Path>) -> Outcome {
             ok_mark(),
             muted().apply_to(format!("agent · {}", agent.agent_id))
         );
-        // 第一道:把会删掉什么讲成人话。数字从索引统计取,取不到的项省略。
-        match ask(
-            &ColorfulTheme::default(),
-            &format!(
-                "Delete everything {} keeps - {}",
-                agent.agent_id,
-                uninstall_summary(agent)
-            ),
-        ) {
+        // 范围勾选:卸载要动的是两件不同性质的东西,让用户各自表态,
+        // 而不是替他把「删数据」和「代跑包管理器」捆成一个 y。
+        let Some(scope) = uninstall_scope(agent) else {
+            continue;
+        };
+        // 一次 y/N 收口。勾选表本身已经是一次逐项过目,再叠第二道
+        // 「你真的确定吗」只会训练用户闭眼按 y——把该说的数字与
+        // 不可逆一次说全,那才是同意门。
+        match ask(&ColorfulTheme::default(), &scope.confirm_line(agent)) {
             Approval::Yes => {}
             // Esc 与 No 同路:退回列表重新挑。
-            Approval::No => continue,
-            Approval::Aborted => return Outcome::silent(EXIT_ERROR),
-        }
-        // 第二道:归档兜底 + 不可撤销。两道确认分开问,不是一次 y 到底——
-        // 卸载删的是全部历史会话与记忆,一次按键换不来它。
-        match ask(
-            &ColorfulTheme::default(),
-            &format!(
-                "Cannot be undone. An archive goes to ~/agent-duster-exports first. Delete {}?",
-                agent.agent_id
-            ),
-        ) {
-            Approval::Yes => {}
             Approval::No => continue,
             Approval::Aborted => return Outcome::silent(EXIT_ERROR),
         }
@@ -2879,22 +2992,122 @@ fn prompt_uninstall(mode: OutputMode, index: Option<&Path>) -> Outcome {
                 // 菜单用户加不上旗标,所以给他完整的那个卸载:清单打全(包括要动
                 // 别人家哪一个键)。留一条指向已删程序的 MCP 声明不叫卸载干净。
                 data_only: false,
-                // 两道确认就是授权凭据:确认串直接给 agent id,core 会再校验一次,
-                // 与命令行 `--confirm <agent>` 走同一道执行门。
+                // 勾选表 + 确认句就是授权凭据:确认串直接给 agent id,core 会再
+                // 校验一次,与命令行 `--confirm <agent>` 走同一道执行门。
                 confirm: Some(agent.agent_id.clone()),
-                // 交互模式默认先导出:菜单用户不会想到自己该加旗标。
+                // `export_first` 在 core 里的含义是「sessions / memory 进删除
+                // 计划」(反义是 `--keep` 留在原地),不是「一定打包」;真正决定
+                // 打不打包的是 `archive`。菜单要的是卸载干净,所以两者搭成
+                // 「进计划 + 显式接受永久丢失」。
                 export_first: true,
                 keep: Vec::new(),
-                archive: Some(true),
-                // 代跑包管理器只能来自一个显式的旗标,菜单里不提供。
-                run_package_manager: false,
+                // 归档在这条路上是关掉的:用户是来卸载的,不是来换个目录囤
+                // 同一批字节的——留一个他还得自己去清的包,不叫卸载干净。
+                // 想要退路的人走命令行 `--export-first`(默认开)。
+                archive: Some(false),
+                run_package_manager: scope.software,
             },
             Consent::Granted,
         ));
     }
 }
 
-/// 第一道确认的数字摘要:`SIZE, N conversations, N skills, N memories`。
+/// 卸载范围:两个复选框各自代表什么。
+///
+/// 拆成两格而不是一句「全删吗」,因为它们的性质根本不同:一格是**删本机
+/// 文件**(duster 自己动手,可预期),另一格是**代跑包管理器**(把控制权
+/// 交给 npm / brew,输出与后果都不在 duster 手里)。把后者塞进前者的 y
+/// 里,等于替用户签了一份他没读过的字。
+struct UninstallScope {
+    /// 删 agent 的 owns 树;二进制若也在树里,这一项连它一起删除。
+    data: bool,
+    /// 连软件本体一起卸:`--run-package-manager` 的菜单入口。
+    software: bool,
+    /// 二进制已属于 owns 树时,确认句明确说出这一点。
+    binary_inside_owns: bool,
+}
+
+impl UninstallScope {
+    /// 同意门那一句。数字与不可逆一次说全:说不清丢什么的确认句
+    /// 换不来真正的同意。
+    fn confirm_line(&self, a: &AgentStatus) -> String {
+        let tail = if self.binary_inside_owns {
+            " · the binary itself is inside the data tree"
+        } else if self.software {
+            " · the software itself is uninstalled too"
+        } else {
+            ""
+        };
+        format!(
+            "Delete {} for good - {} · nothing is archived, this cannot be undone{}",
+            a.agent_id,
+            uninstall_summary(a),
+            tail
+        )
+    }
+}
+
+/// 问一张两格的范围表。`None` = Esc / 勾了个不成立的组合,调用方退回
+/// agent 列表重挑,一个字节都没动。
+///
+/// 数据那一格默认勾上、软件本体默认不勾:前者是这个动词的定义,后者会
+/// 把控制权交给包管理器,默认替人做主是错的。
+fn uninstall_scope(a: &AgentStatus) -> Option<UninstallScope> {
+    // 清单/环境探测失败只保守地保留旧两格,不能让展示问题阻断卸载。
+    let binary_inside_owns = binary_inside_owns(&a.agent_id).unwrap_or(false);
+    if binary_inside_owns {
+        // 只有一件真实选择: owns 树同时包含配置、数据和二进制。再画一格
+        // 「软件本体」会暗示它能独立保留,所以直接进入同意句而不画假勾选表。
+        return Some(UninstallScope {
+            data: true,
+            software: false,
+            binary_inside_owns: true,
+        });
+    }
+    let items = vec![
+        format!(
+            "config & data · ~/.{} — skills, MCP declarations, conversations, memory",
+            a.agent_id
+        ),
+        "the software itself · runs its package-manager uninstall".to_string(),
+    ];
+    let checked = match prompt_checklist(
+        &menu_theme(),
+        Checklist {
+            prompt: "What to remove · Space toggle · Enter confirm · Esc back",
+            header: None,
+            items: &items,
+            checked: vec![true, false],
+            select_all: false,
+            page: crate::browse::viewport(CHECKLIST_RESERVED),
+        },
+    ) {
+        Ok(Some(v)) => v,
+        _ => return None,
+    };
+    let scope = UninstallScope {
+        data: checked.contains(&0),
+        software: checked.contains(&1),
+        binary_inside_owns: false,
+    };
+    if !scope.data {
+        // 只卸软件本体、留着配置,不是 uninstall 能表达的事:它删的就是
+        // 那些文件。与其假装支持,不如说清楚该去哪做——那条卸载命令本来
+        // 就会印在正常一趟的结尾。
+        eprintln!(
+            "  {}",
+            muted().apply_to(
+                "uninstall is the file deletion — unchecking it leaves nothing to do; \
+                 to remove only the software, run its package-manager command (a normal \
+                 run prints it)"
+            )
+        );
+        return None;
+    }
+    Some(scope)
+}
+
+/// 同意门那一句里的数字摘要:`SIZE, N conversations, N skills, N memories`。
 ///
 /// 计数来自索引的 `kind_counts`——某类资源一行都没有时键不存在,省略那一
 /// 项而不是印「0 conversations」:没有会话的 agent 不该被这句话暗示有。
@@ -3778,7 +3991,8 @@ mod tests {
 
     /// 下钻菜单的条目是用户可见的稳定契约:数量与措辞逐字钉死。back 没有
     /// 条目——Esc 就是返回(全菜单同一条导航契约),这里顺带守住「不许
-    /// 有人把 back 加回来」。
+    /// 有人把 back 加回来」。两条 delete 的先后顺序同样是契约:归档删在
+    /// 前(默认留退路),真删在后。
     #[test]
     fn 会话下钻动作_数量措辞稳定且无back() {
         assert_eq!(
@@ -3789,20 +4003,70 @@ mod tests {
                 "export as json",
                 "plant a text-only copy into another agent (tool calls are not carried over)",
                 "delete it (a readable copy is archived into ~/agent-duster-exports/ first)",
+                "delete it for good (no archive — the conversation is gone)",
             ]
         );
+        let a = session_detail_actions();
+        assert_eq!(
+            a[4],
+            "delete it (a readable copy is archived into ~/agent-duster-exports/ first)"
+        );
+        assert_eq!(a[5], "delete it for good (no archive — the conversation is gone)");
         assert!(session_detail_actions().iter().all(|a| a != "back"));
     }
 
-    /// memory 详情动作:migrate + delete,back 没有条目——Esc 就是返回。
+    /// memory 详情动作:migrate + 两条 delete,back 没有条目——Esc 就是
+    /// 返回。两条 delete 的先后顺序同样是契约:归档删在前(默认留退路),
+    /// 真删在后。
     #[test]
     fn 记忆下钻动作_数量措辞稳定且无back() {
         assert_eq!(
             memory_detail_actions(),
             [
                 "migrate it into another agent's memory",
-                "delete",
+                "delete it (a readable copy is archived into ~/agent-duster-exports/ first)",
+                "delete it for good (no archive — the memory is gone)",
             ]
+        );
+        let a = memory_detail_actions();
+        assert_eq!(
+            a[1],
+            "delete it (a readable copy is archived into ~/agent-duster-exports/ first)"
+        );
+        assert_eq!(a[2], "delete it for good (no archive — the memory is gone)");
+    }
+
+    /// 详情屏正文前的元信息行:`路径 · 体积 · 上次修改`,逐字钉死。
+    /// 路径不在 home 下,`display_tilde` 原样返回(不依赖测试机的 $HOME);
+    /// 「上次修改」与 LAST USED 列同一口径,没有证据印 `never`(绝不编
+    /// 1970 年出来),有证据印相对时间。
+    #[test]
+    fn 记忆详情元信息行_路径体积与上次修改() {
+        let e = MemoryEntry {
+            agent_id: "codex".into(),
+            project: None,
+            title: "AGENTS.md".into(),
+            category: None,
+            store: duster_core::memory::MemoryStore::Markdown,
+            path: std::path::PathBuf::from("/tmp/mem/AGENTS.md"),
+            bytes: 2048,
+            mtime_ms: 0,
+            last_used_ms: None,
+        };
+        assert_eq!(memory_meta_line(&e), "/tmp/mem/AGENTS.md · 2 KB · never");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let stale = MemoryEntry {
+            // 恰好三天前：`3 days ago`，与墙钟无关。
+            last_used_ms: Some(now - 3 * 86_400_000),
+            ..e
+        };
+        assert_eq!(
+            memory_meta_line(&stale),
+            "/tmp/mem/AGENTS.md · 2 KB · 3 days ago"
         );
     }
 
@@ -3912,124 +4176,169 @@ mod tests {
         assert_eq!(&lines[2][55..], "never");
     }
 
-    /// 一行测试副本;`agent_id` 以外的字段对行宽与单元格测试无关紧要,
-    /// 给稳定值。模块级助手:两个旧测试各写一份同形闭包,不如一份共享。
-    fn copy(agent: &str) -> duster_core::skill_ops::SkillCopy {
+    /// 一行测试副本。`path` 可给:铺平后 PATH 是吃余量的那一列,行宽测试
+    /// 要靠长路径把余量吃干。`last_used_ms` 由调用方给:夹具里 None 与真值
+    /// 两种都要有(None 印 `never`,有值印相对时间),LAST USED 列才不是
+    /// 一行死数据,两种渲染路径才都被行宽测试压过。
+    fn copy_at(
+        agent: &str,
+        path: &str,
+        last_used_ms: Option<i64>,
+    ) -> duster_core::skill_ops::SkillCopy {
         duster_core::skill_ops::SkillCopy {
             agent_id: agent.into(),
-            path: PathBuf::from("/tmp/skill"),
+            path: PathBuf::from(path),
             state: duster_core::skill_ops::DupState::Identical,
             link_target: None,
             tree_hash: "abc123".into(),
             bytes: 0,
             install_bytes: 0,
+            last_used_ms,
         }
     }
 
-    /// 组表的每一行(含表头)加上控件前缀 `❯ [x] `(6 列)后不得折行;长
-    /// skill 名把 60 列档的 AGENTS 列逼到很窄,整行仍不越线。
-    /// 夹具里放一组「claude-code 两份 + 另一 agent」,AGENTS 列是
-    /// `claude-code ×2 · gpt-oss-120b` 这种带计数的长串,比单份行更容易
-    /// 顶破行宽;再放一组单份组,验证 `Single` 状态进表也守得住。
+    /// 铺平后的副本表:每一行(含表头)加上控件前缀 `❯ [x] `(6 列)后不得
+    /// 折行——行宽碰到终端宽就折成两个物理行,而控件按逻辑行计数、按物理行
+    /// 擦,残影每按一次翻一倍。夹具用长 skill 名 + 长路径把 60 列档逼到底。
     #[test]
-    fn skill_group_rows_行宽不超终端() {
+    fn skill_copy_rows_行宽不超终端() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         let groups = [
             SkillGroup {
                 name: "the-longest-skill-name-anyone-ever-wrote".into(),
-                state: duster_core::skill_ops::DupState::Drifted,
-                copies: vec![copy("claude-code"), copy("gpt-oss-120b"), copy("claude-code")],
+                state: DupState::Drifted,
+                copies: vec![
+                    copy_at("claude-code", "/Users/me/.claude/skills/connect-chrome", None),
+                    copy_at("gpt-oss-120b", "/Users/me/.config/opencode/skills/x", Some(now_ms)),
+                ],
                 diff: None,
                 warnings: vec![],
             },
             SkillGroup {
                 name: "frontend".into(),
-                state: duster_core::skill_ops::DupState::Single,
-                copies: vec![copy("codex")],
+                state: DupState::Single,
+                copies: vec![copy_at("codex", "/Users/me/.codex/skills/frontend", None)],
                 diff: None,
                 warnings: vec![],
             },
         ];
         for cols in [60usize, 80, 200] {
-            let (header, lines) = skill_group_rows_at(&groups, cols);
+            let (header, lines) = skill_copy_rows_at(&groups, cols);
             for line in std::iter::once(&header).chain(lines.iter()) {
                 let w = Prefix::Checkbox.width() + display_width(line);
-                assert!(
-                    w < cols,
-                    "{cols} 列终端:行宽 {w} 超限: {line}"
-                );
+                assert!(w < cols, "{cols} 列终端:行宽 {w} 超限: {line}");
             }
         }
     }
 
-    /// 组表列名 / 顺序 / 对齐的逐字契约:SKILL / STATE 左对齐、AGENTS 左对齐
-    /// (agent 名列表不是数字,右对齐没有意义)。80 列下 SKILL 40、STATE 9
-    /// (「identical」与「only copy」同宽 9),AGENTS 吃余量:内容 `a · b · c`
-    /// 只有 9 宽,余量 24 用不完,列宽就按内容 9。表头与数据行同宽,按字节
-    /// 切片钉死(数据全 ASCII,字节 == 列)。
+    /// 铺平的两条硬契约:**一行一份副本**(不是一行一组),且 skill 名
+    /// **每行都印**——表会翻页,一组的几份可能被切到下一页,而每行都是可
+    /// 勾选的删除目标,空名字的行既认不出属于谁又能被选中删掉。
     #[test]
-    fn skill_group_rows_列名顺序对齐照旧() {
-        let groups = [
-            SkillGroup {
-                name: "the-longest-skill-name-anyone-ever-wrote".into(),
-                state: duster_core::skill_ops::DupState::Drifted,
-                copies: vec![copy("a"), copy("b"), copy("c")],
-                diff: None,
-                warnings: vec![],
-            },
-            SkillGroup {
-                name: "frontend".into(),
-                state: duster_core::skill_ops::DupState::Identical,
-                copies: vec![copy("a")],
-                diff: None,
-                warnings: vec![],
-            },
-        ];
-        let (header, lines) = skill_group_rows_at(&groups, 80);
-        assert_eq!(&header[0..5], "SKILL");
-        assert_eq!(&header[42..47], "STATE");
-        assert_eq!(&header[53..59], "AGENTS");
-        assert_eq!(&lines[0][0..40], "the-longest-skill-name-anyone-ever-wrote");
-        assert_eq!(&lines[0][42..51], format!("{:<9}", "drifted"));
-        assert_eq!(&lines[0][53..], "a · b · c");
-        assert_eq!(&lines[1][0..40], format!("{:<40}", "frontend"));
-        assert_eq!(&lines[1][42..51], "identical");
-        assert_eq!(&lines[1][53..], "a");
+    fn skill_copy_rows_一行一份且组名每行都印() {
+        let groups = [SkillGroup {
+            name: "dup".into(),
+            state: DupState::Drifted,
+            copies: vec![
+                copy_at("claude-code", "/x/a", None),
+                copy_at("claude-code", "/x/b", Some(now_ms())),
+            ],
+            diff: None,
+            warnings: vec![],
+        }];
+        let (header, lines) = skill_copy_rows_at(&groups, 200);
+        assert!(header.starts_with("SKILL"), "{header}");
+        assert_eq!(lines.len(), 2, "两份副本就是两行: {lines:?}");
+        for line in &lines {
+            assert!(line.starts_with("dup"), "组名每行都要印: {line}");
+        }
+        assert!(lines[0].contains("/x/a") && lines[1].contains("/x/b"), "{lines:?}");
     }
 
-    /// AGENTS 列单元格的逐字契约:按 `copies` 的出现顺序去重、不同 agent
-    /// 用 ` · ` 连接、同一 agent 多份在它自己的名字上标 `×N`(分组键是声明
-    /// 的 skill 名,claude-code 同名装两份就得说成两份,不许去重成「1」)、
-    /// 单份不标。顺序稳定可 diff——同一份数据渲染两次得同一条字符串。
+    /// LAST USED 列与 CLI 打印表同口径:None → `never`(没有时间戳证据,
+    /// 不是「1970 年用过」),有值 → 相对时间。表头恒在 SKILL 表头之后、
+    /// PATH 之前——PATH 留作吃余量的尾列。
     #[test]
-    fn agents_cell_出现顺序去重且多份标次数() {
-        // 两个不同 agent:按出现顺序,` · ` 连接。
-        assert_eq!(agents_cell(&[copy("a"), copy("b")]), "a · b");
-        // 同一 agent 两份:标 ×2。
-        assert_eq!(agents_cell(&[copy("a"), copy("a")]), "a ×2");
-        // 同一 agent 三份:×3。
-        assert_eq!(agents_cell(&[copy("a"), copy("a"), copy("a")]), "a ×3");
-        // 混合:a 两份 + b 一份;×N 挂在 a 自己的名字上,b 照旧裸名。
-        assert_eq!(agents_cell(&[copy("a"), copy("b"), copy("a")]), "a ×2 · b");
-        // 单份:裸 agent 名,不标。
-        assert_eq!(agents_cell(&[copy("a")]), "a");
-        // 顺序稳定:去重只按首次出现,绝不重排——输入顺序变了输出跟着变。
-        assert_eq!(agents_cell(&[copy("b"), copy("a")]), "b · a");
-        assert_eq!(agents_cell(&[copy("a"), copy("b")]), "a · b");
-        // 空组:空串(表里没有行,但纯函数不许 panic)。
-        assert_eq!(agents_cell(&[]), "");
+    fn skill_copy_rows_last_used_列_never_与相对时间() {
+        let groups = [SkillGroup {
+            name: "dup".into(),
+            state: DupState::Drifted,
+            copies: vec![
+                copy_at("claude-code", "/x/a", None),
+                copy_at("codex", "/x/b", Some(now_ms())),
+            ],
+            diff: None,
+            warnings: vec![],
+        }];
+        let (header, lines) = skill_copy_rows_at(&groups, 200);
+        let last_used_at = header.find("LAST USED").expect("LAST USED 表头要在: {header}");
+        let path_at = header.find("PATH").expect("PATH 表头要在: {header}");
+        assert!(last_used_at < path_at, "{header}");
+        assert!(lines[0].contains("never"), "{lines:?}");
+        assert!(lines[1].contains("just now"), "{lines:?}");
+    }
+
+    /// 墙钟无关的「刚刚」:行宽与渲染测试都要一个真实的时间戳,取当前
+    /// 时刻造一个,`relative_time` 正好落进 `just now` 档。
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
     }
 
     /// 组详情下钻的动作表:link + delete(「对比两份副本」已随统一列表
     /// 流撤下,要比就拿详情表里的两条 PATH 去喂系统 diff);back 没有条目
     /// ——Esc 就是返回。数量与措辞逐字钉死。
+    /// delete 那句必须跟着副本形态走。skill 删除不归档(见 core 的
+    /// [`duster_core::skill_ops::remove`] 文档):真目录整棵删、软链副本
+    /// 删的只是链接本身。所以只有两档——全是软链(含悬空)说只摘链接,
+    /// 其余(含混着)都说「直接删、不留副本」,这句对每一份副本都是实话。
     #[test]
     fn skill_group_actions_只有link和delete且无back() {
+        let group = |copies: Vec<duster_core::skill_ops::SkillCopy>| SkillGroup {
+            name: "s".into(),
+            state: DupState::Drifted,
+            copies,
+            diff: None,
+            warnings: vec![],
+        };
+        let with_state = |st: DupState| {
+            let mut c = copy_at("claude-code", "/x/a", None);
+            c.state = st;
+            c
+        };
+
+        // 真目录副本:直接删、不留副本,不再提归档。
         assert_eq!(
-            skill_group_actions(),
+            skill_group_actions(&group(vec![with_state(DupState::Identical)])),
             [
                 "link this skill into another agent (one copy on disk)",
-                "delete a copy (it is archived into ~/agent-duster-exports/ first)",
+                "delete a copy (deleted outright — no archive, nothing to restore from)",
             ]
+        );
+
+        // 全是软链(含悬空):只摘链接,一个字都不许提归档。
+        for st in [DupState::Linked, DupState::Broken] {
+            let actions = skill_group_actions(&group(vec![with_state(st)]));
+            assert_eq!(
+                actions[1], "delete a copy (only the link is removed — the content it points to stays)",
+                "{st:?}"
+            );
+        }
+
+        // 混着:跟真目录同档——「直接删、不留副本」对每一份都是实话,
+        // 软链那份的「内容留在别处」留给逐份确认那一句。
+        let mixed = group(vec![
+            with_state(DupState::Identical),
+            with_state(DupState::Broken),
+        ]);
+        assert_eq!(
+            skill_group_actions(&mixed)[1],
+            "delete a copy (deleted outright — no archive, nothing to restore from)"
         );
     }
 
@@ -4059,6 +4368,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 卸载同意门那一句必须自己说清三件事:删谁、丢什么(带数字)、
+    /// **什么都不归档且不可撤销**。
+    ///
+    /// 这是这条流程唯一的一道门——范围表勾完就只剩它了,所以它漏一个字
+    /// 都是用户没被告知。旧版把「an archive goes to ~/agent-duster-exports
+    /// first」印在这里,那是句谎话:菜单这条路 `archive: Some(false)`,
+    /// 一个包都不打。这条测试防的就是有人把那句安慰话加回来。
+    #[test]
+    fn 卸载确认句_说清不归档且不可撤销() {
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("session".to_string(), 340u64);
+        counts.insert("skill".to_string(), 12u64);
+        let a = AgentStatus {
+            agent_id: "qoder".into(),
+            display_name: None,
+            last_scan_ms: None,
+            bytes: 1_288_490_188,
+            kind_counts: counts,
+            kind_bytes: std::collections::BTreeMap::new(),
+            clean_bytes: std::collections::BTreeMap::new(),
+        };
+
+        let only_data = UninstallScope { data: true, software: false, binary_inside_owns: false }.confirm_line(&a);
+        assert!(only_data.contains("Delete qoder for good"), "{only_data}");
+        assert!(only_data.contains("340 conversations"), "{only_data}");
+        assert!(only_data.contains("12 skills"), "{only_data}");
+        assert!(
+            only_data.contains("nothing is archived, this cannot be undone"),
+            "{only_data}"
+        );
+        // 没勾软件本体就不许暗示会去动它。
+        assert!(!only_data.contains("software"), "{only_data}");
+        // 旧口径一个字都不许回来。
+        assert!(!only_data.contains("agent-duster-exports"), "{only_data}");
+
+        // 勾了软件本体:代跑包管理器这件事必须写在同一句里。
+        let with_sw = UninstallScope { data: true, software: true, binary_inside_owns: false }.confirm_line(&a);
+        assert!(
+            with_sw.contains("the software itself is uninstalled too"),
+            "{with_sw}"
+        );
+    }
+    /// 二进制落在 owns 树内时,确认句必须明说第一格连 binary 一起删除;
+    /// 这是跳过单项勾选表后的等价断言。
+    #[test]
+    fn 卸载确认句_说明数据树包含二进制() {
+        let a = AgentStatus {
+            agent_id: "opencode".into(),
+            display_name: None,
+            last_scan_ms: None,
+            bytes: 1,
+            kind_counts: std::collections::BTreeMap::new(),
+            kind_bytes: std::collections::BTreeMap::new(),
+            clean_bytes: std::collections::BTreeMap::new(),
+        };
+        let line = UninstallScope { data: true, software: false, binary_inside_owns: true }.confirm_line(&a);
+        assert!(line.contains("binary itself"), "{line}");
     }
 
     /// 尾巴那个固定后缀「 reclaimable」是文案不是数据:flex 列按余量截断,

@@ -107,12 +107,6 @@ pub enum SessionCmd {
         /// Write a Markdown copy of each one before compressing it
         #[arg(long)]
         export_first: bool,
-        /// Pack a copy into ~/agent-duster-exports before compressing
-        #[arg(long)]
-        archive: bool,
-        /// Compress without packing a copy first
-        #[arg(long, conflicts_with = "archive")]
-        no_archive: bool,
         /// Do it. Without this you only get the plan
         #[arg(long)]
         yes: bool,
@@ -183,8 +177,6 @@ pub fn run(mode: OutputMode, index: Option<&Path>, action: SessionCmd) -> i32 {
             agents,
             older_than,
             export_first,
-            archive,
-            no_archive,
             yes,
             dry_run,
         } => run_prune(
@@ -195,7 +187,6 @@ pub fn run(mode: OutputMode, index: Option<&Path>, action: SessionCmd) -> i32 {
                 agents,
                 older_than,
                 export_first,
-                archive: crate::archive_choice(archive, no_archive),
                 execute: crate::consent_of(yes, dry_run) == crate::Consent::Granted,
             },
         ),
@@ -704,7 +695,6 @@ struct PruneArgs {
     agents: Vec<String>,
     older_than: Option<String>,
     export_first: bool,
-    archive: Option<bool>,
     execute: bool,
 }
 
@@ -740,7 +730,6 @@ fn run_prune(mode: OutputMode, index: Option<&Path>, home: Option<&Path>, args: 
         // 注入了假 home 就连导出目录一起注入:测试不许写进真实
         // `~/agent-duster-exports`。真实运行给 None,由 core 用默认目录。
         export_dir: home.map(|h| h.join("agent-duster-exports")),
-        archive: args.archive,
         dry_run: !args.execute,
         yes: args.execute,
         json: mode == OutputMode::Json,
@@ -1253,7 +1242,6 @@ mod tests {
                 agents: Vec::new(),
                 older_than: Some("30d".into()),
                 export_first: true,
-                archive: None,
                 execute: false,
             },
         );
@@ -1274,7 +1262,6 @@ mod tests {
                     agents: Vec::new(),
                     older_than: older,
                     export_first: false,
-                    archive: None,
                     execute: true,
                 },
             );

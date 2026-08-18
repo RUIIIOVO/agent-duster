@@ -109,6 +109,14 @@ pub struct MemoryEntry {
     pub path: PathBuf,
     pub bytes: u64,
     pub mtime_ms: i64,
+    /// 「上次使用」的时间证据（Unix 毫秒），取索引行的 mtime；`None` =
+    /// 没有证据（scan 当时没取到时间戳），渲染成 `never`，绝不是 1970。
+    ///
+    /// 语义是**最后修改**时间，不是「最后被 agent 加载」——磁盘上只有这
+    /// 一个可得信号。判据与 [`duster_index::query::ResourceRecord::last_used_ms`]
+    /// 同一份实现：四张列表的 LAST USED 列与 prune 的陈旧判定共用它，
+    /// 这里不再抄一遍 `mtime_ns <= 0` 的判定。
+    pub last_used_ms: Option<i64>,
 }
 
 /// 归一视图。
@@ -133,7 +141,7 @@ pub fn list(index_path: Option<&Path>, home: Option<&Path>) -> Result<MemoryList
     let mut entries: Vec<MemoryEntry> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    for (agent_id, path) in &roots {
+    for (agent_id, path, last_used_ms) in &roots {
         // 索引是派生物，可能比磁盘旧一步。缺文件只记一条 warning——
         // 「哪些索引行悬空」是 doctor 的活，视图这边不该替它下结论。
         let Ok(meta) = std::fs::metadata(path) else {
@@ -141,11 +149,18 @@ pub fn list(index_path: Option<&Path>, home: Option<&Path>) -> Result<MemoryList
             continue;
         };
         if meta.is_dir() {
-            expand_dir(agent_id, path, &mut entries, &mut warnings);
+            expand_dir(agent_id, *last_used_ms, path, &mut entries, &mut warnings);
         } else if foreign::is_sqlite(path) {
-            expand_sqlite(agent_id, path, &meta, &mut entries, &mut warnings);
+            expand_sqlite(
+                agent_id,
+                *last_used_ms,
+                path,
+                &meta,
+                &mut entries,
+                &mut warnings,
+            );
         } else {
-            entries.push(file_entry(agent_id, None, None, path, &meta));
+            entries.push(file_entry(agent_id, None, None, *last_used_ms, path, &meta));
         }
     }
 
@@ -176,7 +191,11 @@ pub fn list(index_path: Option<&Path>, home: Option<&Path>) -> Result<MemoryList
 pub fn show(index_path: Option<&Path>, home: Option<&Path>, key: &str) -> Result<String> {
     let declared = resolve_index(index_path, home);
     let db = freshness::ensure_exists(Some(&declared))?;
-    let roots = memory_roots(&db)?;
+    // 归属判定只看 (agent, 路径) 两元；last_used_ms 是 list 的渲染证据。
+    let roots: Vec<(String, PathBuf)> = memory_roots(&db)?
+        .into_iter()
+        .map(|(a, p, _)| (a, p))
+        .collect();
 
     let (path, rowid) = split_key(key);
     if owner_of(&path, rowid.is_some(), &roots).is_none() {
@@ -324,7 +343,10 @@ pub fn migrate(
     let db = freshness::ensure_exists(Some(&declared))?;
 
     // from= 写进哨兵的是索引反查出来的所有权，不是调用方嘴上说的 agent。
-    let roots = memory_roots(&db)?;
+    let roots: Vec<(String, PathBuf)> = memory_roots(&db)?
+        .into_iter()
+        .map(|(a, p, _)| (a, p))
+        .collect();
     let (src_path, rowid) = split_key(key);
     let Some(from_agent) = owner_of(&src_path, rowid.is_some(), &roots).map(str::to_string)
     else {
@@ -502,14 +524,18 @@ fn writable_memory(m: &Manifest) -> Option<&ResourceSection> {
         .find(|r| r.kind == ResourceKind::Memory && r.mapper != MapperName::StatsOnly)
 }
 
-/// 索引里全部非 stats-only 的 memory 资源根：`(agent_id, 路径)`。
+/// 索引里全部非 stats-only 的 memory 资源根：`(agent_id, 路径, last_used_ms)`。
 ///
 /// `mapper = "stats-only"` 的行（settings.json / cc-switch.db 这类）只承担
 /// **体积记账**，不是记忆内容：list 不展开、show 不认、migrate 不当源。
 /// 字节数不受影响——行还在索引里，status 的 MEMORY 汇总按 kind 求和照旧。
 /// NULL 的语义是「未知」（v6 就地升级来的老行还没重扫），按「不是
 /// stats-only」处理，绝不因升级整屏消失。
-fn memory_roots(db: &Path) -> Result<Vec<(String, PathBuf)>> {
+///
+/// 第三元是 [`ResourceRecord::last_used_ms`] 的判定结果：`None` = 没有
+/// 证据，不是「1970 年用过」。list 把它带进每条 [`MemoryEntry`]，其余
+/// 调用方（show / migrate / rm 的勘察）只认前两元。
+fn memory_roots(db: &Path) -> Result<Vec<(String, PathBuf, Option<i64>)>> {
     let idx = Index::open_readonly(db)
         .with_context(|| format!("failed to open index read-only: {}", db.display()))?;
     let rows = query::list_resources(
@@ -523,7 +549,10 @@ fn memory_roots(db: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(rows
         .into_iter()
         .filter(|r| r.mapper.as_deref() != Some("stats-only"))
-        .map(|r| (r.agent_id, PathBuf::from(r.path)))
+        .map(|r| {
+            let last_used_ms = r.last_used_ms();
+            (r.agent_id, PathBuf::from(r.path), last_used_ms)
+        })
         .collect())
 }
 
@@ -577,7 +606,10 @@ pub fn inspect_remove(
 ) -> Result<RemoveInspection> {
     let declared = resolve_index(index_path, home);
     let db = freshness::ensure_exists(Some(&declared))?;
-    let roots = memory_roots(&db)?;
+    let roots: Vec<(String, PathBuf)> = memory_roots(&db)?
+        .into_iter()
+        .map(|(a, p, _)| (a, p))
+        .collect();
 
     let (path, rowid) = split_key(key);
     let Some(agent) = owner_of(&path, rowid.is_some(), &roots) else {
@@ -1492,8 +1524,13 @@ fn resolve_index(index_path: Option<&Path>, home: Option<&Path>) -> PathBuf {
 ///
 /// 目录里的非 Markdown 文件不计入——它们不是记忆（qoder 的 `memories`
 /// 下就只有 `.md`）。跳过 `node_modules` / `.git` / `dist`。
+///
+/// LAST USED 的判据是**资源根**（索引里那一条 memory 行）的 mtime——整个
+/// 目录共享同一份证据：索引没有逐文件的 mtime，这里也不该为渲染去重查
+/// 一遍磁盘（那会把「索引是唯一事实」这条规矩拆成两半）。
 fn expand_dir(
     agent_id: &str,
+    last_used_ms: Option<i64>,
     root: &Path,
     entries: &mut Vec<MemoryEntry>,
     warnings: &mut Vec<String>,
@@ -1525,7 +1562,7 @@ fn expand_dir(
             .or_else(|_| f.strip_prefix(root))
             .unwrap_or(f);
         let (project, category) = locate(rel);
-        let mut e = file_entry(agent_id, project, category, f, &meta);
+        let mut e = file_entry(agent_id, project, category, last_used_ms, f, &meta);
         e.store = MemoryStore::MarkdownDir;
         entries.push(e);
     }
@@ -1558,10 +1595,15 @@ fn locate(rel: &Path) -> (Option<String>, Option<String>) {
 }
 
 /// 单文件一条。Markdown 才去解析标题，其余（`settings.json` 之类）用文件名。
+///
+/// `last_used_ms` 是索引行的判定结果（资源根 mtime），不是这里现读的：
+/// 文件本身此刻的 mtime 已进 `mtime_ms`，两个时间各说各的——前者是
+/// 「上次使用」列的口径，后者是详情屏的字节事实。
 fn file_entry(
     agent_id: &str,
     project: Option<String>,
     category: Option<String>,
+    last_used_ms: Option<i64>,
     path: &Path,
     meta: &std::fs::Metadata,
 ) -> MemoryEntry {
@@ -1587,6 +1629,7 @@ fn file_entry(
         path: path.to_path_buf(),
         bytes: meta.len(),
         mtime_ms: mtime_ms_of(meta),
+        last_used_ms,
     }
 }
 
@@ -1594,8 +1637,12 @@ fn file_entry(
 ///
 /// 降级而不是跳过，是因为跳过会让这个库的字节数从视图里凭空消失，
 /// 用户看到的 total 与 `duster status` 对不上，还找不到原因。
+///
+/// LAST USED 取**库文件**的 mtime（索引行的判据），与行内 `generated_at`
+/// 分开：前者是「上次使用」列的统一口径，后者继续作 `mtime_ms` 的展示。
 fn expand_sqlite(
     agent_id: &str,
+    last_used_ms: Option<i64>,
     db: &Path,
     meta: &std::fs::Metadata,
     entries: &mut Vec<MemoryEntry>,
@@ -1613,6 +1660,7 @@ fn expand_sqlite(
                     path: PathBuf::from(format!("{}{ROWID_SEP}{rowid}", db.display())),
                     bytes,
                     mtime_ms: ts,
+                    last_used_ms,
                 });
             }
         }
@@ -1635,6 +1683,7 @@ fn expand_sqlite(
                 path: db.to_path_buf(),
                 bytes: meta.len(),
                 mtime_ms: mtime_ms_of(meta),
+                last_used_ms,
             });
         }
     }
@@ -1860,6 +1909,86 @@ mod tests {
         // Index 持有单实例写锁，读之前必须放手。
         drop(idx);
         db
+    }
+
+    /// 同 [`seed`]，但每行可以带一个 mtime_ns——测 LAST USED 列的证据
+    /// 传递要用真实时间戳（`seed` 恒写 0，那正是「无证据」那一档）。
+    fn seed_mtime(
+        home: &Path,
+        rows: &[(&str, &str, PathBuf, Option<&str>, i64)],
+    ) -> PathBuf {
+        let db = home.join(".agent-duster").join("index.db");
+        let idx = Index::open(&db).unwrap();
+        for (agent, key, path, mapper, mtime_ns) in rows {
+            upsert::upsert_agent(
+                idx.conn(),
+                &duster_model::AgentInfo {
+                    id: (*agent).to_string(),
+                    display_name: (*agent).to_string(),
+                    root: home.join(format!(".{agent}")),
+                    version: None,
+                },
+                0,
+            )
+            .unwrap();
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            upsert::upsert_resource(
+                idx.conn(),
+                &ResourceRow {
+                    agent_id: (*agent).to_string(),
+                    kind: "memory".to_string(),
+                    scope: "global".to_string(),
+                    key: (*key).to_string(),
+                    path: path.display().to_string(),
+                    size,
+                    mtime_ns: *mtime_ns,
+                    hash_content: None,
+                    cheap_print: None,
+                    clean_level: None,
+                    reclaimable: None,
+                    install_bytes: None,
+                    mapper: mapper.map(str::to_string),
+                },
+            )
+            .unwrap();
+        }
+        drop(idx);
+        db
+    }
+
+    /// 验收：LAST USED 的证据来自**索引行的 mtime**（`ResourceRecord::
+    /// last_used_ms` 的判定），一路带进 [`MemoryEntry`]，渲染层不再重查
+    /// 库。`mtime_ns <= 0` = 没有证据，`None`（渲染成 `never`），绝不是
+    /// 1970——这与 prune 的陈旧判定共用同一份判据。
+    #[test]
+    fn list_把索引的_last_used_ms_带进条目_无证据为_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude/CLAUDE.md");
+        write(&claude, "# Claude\n");
+        let codex = home.join(".codex/AGENTS.md");
+        write(&codex, "# Codex\n");
+        // codex 行的 mtime_ns 有真实值（2023-11-14 22:13:20.123 UTC）；
+        // claude-code 行是 0——scan 当时没取到时间戳。
+        let db = seed_mtime(
+            home,
+            &[
+                ("claude-code", "CLAUDE.md", claude.clone(), Some("memory/markdown"), 0),
+                (
+                    "codex",
+                    "AGENTS.md",
+                    codex.clone(),
+                    Some("memory/markdown"),
+                    1_700_000_000_123_000_000,
+                ),
+            ],
+        );
+
+        let list = list(Some(&db), Some(home)).unwrap();
+        let claude_e = list.entries.iter().find(|e| e.agent_id == "claude-code").unwrap();
+        assert_eq!(claude_e.last_used_ms, None, "无证据必须 None，不是 1970");
+        let codex_e = list.entries.iter().find(|e| e.agent_id == "codex").unwrap();
+        assert_eq!(codex_e.last_used_ms, Some(1_700_000_000_123));
     }
 
     fn write(path: &Path, body: &str) -> u64 {

@@ -23,7 +23,8 @@ use duster_core::session::SessionDetail;
 use duster_core::skill_ops::{self, DupState, LinkMode, LinkReport, SkillGroup, link};
 use duster_core::status::{StatusReport, status};
 use duster_core::uninstall::{
-    PackageOutcome, PreflightCheck, SharedAction, SharedEditOutcome, UninstallOptions, uninstall,
+    PackageOutcome, PreflightCheck, ResidueAction, ResidueOutcome, SharedAction, SharedEditOutcome,
+    UninstallOptions, uninstall,
 };
 use duster_fs::path::display_tilde;
 use duster_model::CleanLevel;
@@ -185,12 +186,6 @@ enum Command {
         /// How old is old enough, in days: 30d, 60d, 90d (required)
         #[arg(long, value_name = "AGE")]
         older_than: Option<String>,
-        /// Pack a copy into ~/agent-duster-exports before deleting
-        #[arg(long)]
-        archive: bool,
-        /// Delete without packing a copy first
-        #[arg(long, conflicts_with = "archive")]
-        no_archive: bool,
         /// Do it. Without this you only get the plan
         #[arg(long)]
         yes: bool,
@@ -293,7 +288,8 @@ enum SkillCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Delete one copy of a skill, after packing it into ~/agent-duster-exports
+    /// Delete one copy of a skill outright — the named copy is removed for
+    /// good, no archive is made (duster prune is the path that keeps a copy)
     Rm {
         /// Skill name as `duster skill list` prints it
         name: String,
@@ -305,9 +301,6 @@ enum SkillCmd {
         /// when one agent keeps this skill in several directories
         #[arg(long, value_name = "PATH")]
         path: Option<String>,
-        /// Delete without packing a copy first (for scripts)
-        #[arg(long)]
-        no_archive: bool,
         /// Print what would be deleted and stop
         #[arg(long)]
         dry_run: bool,
@@ -345,8 +338,6 @@ fn main() {
         Some(Command::Prune {
             agents,
             older_than,
-            archive,
-            no_archive,
             yes,
             dry_run,
             keep_generations,
@@ -355,7 +346,6 @@ fn main() {
             index,
             agents.clone(),
             older_than.clone(),
-            archive_choice(*archive, *no_archive),
             consent_of(*yes, *dry_run),
             *keep_generations,
         ),
@@ -401,18 +391,8 @@ fn main() {
                 name,
                 agent,
                 path,
-                no_archive,
                 dry_run,
-            } => cmd_skill_rm(
-                mode,
-                index,
-                None,
-                name,
-                agent.as_deref(),
-                path.as_deref(),
-                !*no_archive,
-                *dry_run,
-            ),
+            } => cmd_skill_rm(mode, index, None, name, agent.as_deref(), path.as_deref(), *dry_run),
         },
         Some(Command::Memory { action }) => cmd::memory::run(mode, index, action),
         Some(Command::Mcp { action }) => cmd::mcp::run(mode, index, action.clone()),
@@ -1363,6 +1343,8 @@ fn settle(mode: OutputMode, consent: Consent) -> Consent {
 
 /// `--archive` / `--no-archive` 收敛成三态:两个都没给 = 未表态(None)。
 /// 未表态且归档预估超阈值时由 core 拒绝执行——外壳不替用户猜。
+///
+/// 只剩 `uninstall` 一个调用方：prune 恒归档、旗标已删除，不经过这里。
 fn archive_choice(archive: bool, no_archive: bool) -> Option<bool> {
     match (archive, no_archive) {
         (true, _) => Some(true),
@@ -1501,6 +1483,11 @@ fn action_phrase(raw: &str) -> String {
 
 /// 归档标记:每条都要说清"这份东西在归档包里有没有"——没有回收站之后,
 /// 归档包是唯一的还原来源。`install` 行改标 not cleanable。
+///
+/// prune 恒归档,`archived == true` 是硬承诺(先打包成功才删,见
+/// `duster_core::prune::prune`);会话走原地压缩,内容不进 tar 但也不丢,
+/// 标「压缩后保留」而不是「没有归档副本」——旗标没了之后,后者会被读成
+/// "内容会丢"。
 fn archive_mark(item: &PlanItem) -> String {
     if !item.cleanable {
         return style(NOT_CLEANABLE).yellow().to_string();
@@ -1512,6 +1499,11 @@ fn archive_mark(item: &PlanItem) -> String {
             muted().apply_to("kept as a fallback").to_string()
         }
         (false, Action::Keep) => muted().apply_to("kept as the last copy").to_string(),
+        // 会话压缩存档:内容原地瘦身、逐字节校验可读回,不进归档包也不删。
+        (false, Action::CompressFile) => {
+            muted().apply_to("kept, compressed in place").to_string()
+        }
+        // clean / uninstall 的可删项:可再生缓存或软件本体,本就不打包。
         (false, _) => style("no archive copy").yellow().to_string(),
     }
 }
@@ -1828,7 +1820,6 @@ fn cmd_prune(
     index: Option<&Path>,
     agents: Vec<String>,
     older_than: Option<String>,
-    archive: Option<bool>,
     consent: Consent,
     keep_generations: bool,
 ) -> i32 {
@@ -1854,7 +1845,6 @@ fn cmd_prune(
         agents: agents.clone(),
         older_than_days: days,
         keep_generations,
-        archive,
         export_dir: None,
         dry_run: !execute,
         yes: execute,
@@ -2056,11 +2046,17 @@ fn cmd_uninstall(
 
     // 残留即"卸载不干净",算部分成功而不是成功——这是这个动词的验收点。
     // 被拒的共享改键同理:文件一个字节没动,那个键还指着已经被删掉的程序。
+    // 删不掉的 residue 同理:残留还在,这次卸载就没完成。
     let failures = report.leftovers.len()
         + report
             .shared
             .iter()
             .filter(|s| s.action == SharedAction::Refused)
+            .count()
+        + report
+            .residues
+            .iter()
+            .filter(|r| matches!(r.action, ResidueAction::Failed(_)))
             .count();
     let mut warnings = merge_warnings(&report.plan.warnings, &report.warnings);
     let next = format!("duster uninstall {a} --confirm {a}", a = args.agent);
@@ -2075,6 +2071,7 @@ fn cmd_uninstall(
             // 明细在前、总结在后:那一行 ✔ 是这次卸载的最后一句话,
             // 它前面必须已经交代完"别人家的文件动了哪一处、包管理器怎么办"。
             render_shared(&report.shared);
+            render_residues(&report.residues);
             render_packages(&report.packages);
             render_leftovers(&report.leftovers);
             if report.executed {
@@ -2149,6 +2146,53 @@ fn render_shared(edits: &[SharedEditOutcome]) {
         println!("      {}", muted().apply_to(&e.reason));
         if let Some(d) = &e.detail {
             println!("      {}", muted().apply_to(d));
+        }
+    }
+}
+
+/// 声明化的残留（shell 行 / SQLite 行）。删掉了就直说删掉了;删不掉必须
+/// 如实报 `failed`——残留还在,这次卸载就不算干净,agent 也会继续列在列表里。
+///
+/// **`NotFound` 不印。** 一条 `shell_line` 声明往往挂着四个候选 rc 文件
+/// (`.zshrc` / `.zprofile` / `.bashrc` / `.bash_profile`),机器上通常只存在
+/// 一个——把另外三个「not found」印出来,等于每次卸载都刷三行废话,把真正
+/// removed 的那一行淹掉。声明的残留不在这台机器上是**无事可做**,不是结果。
+///
+/// 全部 `NotFound` 时整节不印:这一节的存在理由是「duster 替你动了别人家的
+/// 文件」,什么都没动就没有理由占版面。
+fn render_residues(residues: &[ResidueOutcome]) {
+    let shown: Vec<&ResidueOutcome> = residues
+        .iter()
+        .filter(|r| !matches!(r.action, ResidueAction::NotFound))
+        .collect();
+    if shown.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "  {}",
+        Style::new()
+            .bold()
+            .apply_to("Residue the installer left behind")
+    );
+    for r in shown {
+        let (mark, verb) = match &r.action {
+            ResidueAction::Removed => (ok_mark().to_string(), "removed"),
+            ResidueAction::Planned => (muted().apply_to("·").to_string(), "will be removed"),
+            ResidueAction::NotFound => unreachable!("NotFound 已在上面滤掉"),
+            ResidueAction::Failed(_) => (warn_mark().to_string(), "failed"),
+        };
+        println!(
+            "    {mark} {}  {}",
+            accent().apply_to(&r.what),
+            muted().apply_to(format!(
+                "{verb} · {}",
+                truncate_width(&r.path.display().to_string(), 44)
+            ))
+        );
+        println!("      {}", muted().apply_to(&r.why));
+        if let ResidueAction::Failed(detail) = &r.action {
+            println!("      {}", muted().apply_to(detail));
         }
     }
 }
@@ -2258,6 +2302,10 @@ fn render_skill_groups(groups: &[SkillGroup]) -> String {
     if show_installed {
         headers.push("INSTALLED");
     }
+    // LAST USED 恒在 PATH 前:它内容短(「3d ago」/「never」这个量级),
+    // 按内容宽放就行;PATH 必须留在行尾吃终端余量(flex 列只有尾巴有
+    // 余量可吃),与 session 列表同一列名同一口径。
+    headers.push("LAST USED");
     headers.push("PATH");
     // PATH 恒为最后一列:flex_col 吃的是终端余量,只有尾巴才有余量可吃。
     let path_col = headers.len() - 1;
@@ -2291,9 +2339,12 @@ fn render_skill_groups(groups: &[SkillGroup]) -> String {
             if show_installed {
                 row.push(human_bytes(c.install_bytes));
             }
+            row.push(relative_time(c.last_used_ms));
             // 路径不截断:截断交给 flex_col,重定向成文件时它整条留下,
             // 路径要能原样复制去核对(截掉的那一截正是要核对的那一截)。
-            row.push(c.path.display().to_string());
+            // 折 `~`:`/Users/<你>/` 那 13 列零信息量,而这一列最宽;
+            // `skill rm --path` 两种写法都认,复制粘贴照样对得上。
+            row.push(display_tilde(&c.path));
             t.push_row(row);
         }
     }
@@ -2438,12 +2489,14 @@ fn render_link(report: &LinkReport, dry_run: bool) {
 }
 
 /// `duster skill rm`：删除一个 skill 的一份副本。全部业务在
-/// [`duster_core::skill_ops::remove`]——软链只 unlink 不归档、真实目录
-/// 归档后整棵删、删完清索引，都在那边。这里只翻旗标、渲染回执、映射退出码。
+/// [`duster_core::skill_ops::remove`]——软链只 unlink、真目录整棵删、
+/// 删完清索引，都在那边。这里只翻旗标、渲染回执、映射退出码。
 ///
 /// 一个 skill 名装在多家时 `--agent` 必选，同一家装了多份时 `--path` 再必选：
-/// 缺了都报错列出候选，**绝不默认删全部**（见 core 的文档）。归档默认开；
-/// `--no-archive` 是脚本用的显式关闭。`--dry-run` 只报将删什么。
+/// 缺了都报错列出候选，**绝不默认删全部**（见 core 的文档）。skill 删除
+/// **不归档**：`skill rm` 对着的是点名的副本（`--agent`/`--path`/y/N 三道
+/// 指名），显式删除不需要暗中留副本；批量按龄清理的 `duster prune` 才会
+/// 给 skill 打包进 `~/agent-duster-exports/`。`--dry-run` 只报将删什么。
 ///
 /// `home` 只给测试注入：真实运行恒为 None（= 真实用户主目录）。
 pub(crate) fn cmd_skill_rm(
@@ -2453,14 +2506,15 @@ pub(crate) fn cmd_skill_rm(
     name: &str,
     agent: Option<&str>,
     path: Option<&str>,
-    archive: bool,
     dry_run: bool,
 ) -> i32 {
     let report = match skill_ops::remove(
         &DeleteOptions {
             index_path: index.map(Path::to_path_buf),
             home: home.map(Path::to_path_buf),
-            archive,
+            // skill 路径不读这一位（字段是 session/memory 的 rm 在用）：
+            // 填 false 是「skill 删除不归档」这一语义的字面表达。
+            archive: false,
             dry_run,
         },
         name,
@@ -2484,8 +2538,11 @@ pub(crate) fn cmd_skill_rm(
 
 /// 删除回执的人读排版。整块返回而不是边算边印：这样它能被测试逐字核对。
 ///
-/// 干跑与真跑分行文：预览说 `would delete` 并把归档去处也预告出来；
-/// 真跑说 `deleted` + 释放字节，归档包路径必须亮出来——那是用户唯一的退路。
+/// 干跑与真跑分行文：预览说 `would delete`，真跑说 `deleted` + 释放字节。
+/// skill 删除不归档（见 [`cmd_skill_rm`]），所以这里没有归档包路径可亮，
+/// 也没有「--no-archive」可提——真删就是真删，一句「不留副本」把话说到位。
+/// 软链副本「只摘链接、内容留在别处」这句在交互确认里逐份说清；命令行回执
+/// 不区分副本形态，不能假装有归档这回事。
 fn render_skill_rm(report: &DeleteReport, dry_run: bool) -> String {
     let mut out = format!(
         "\n  {} {} {}\n",
@@ -2513,31 +2570,14 @@ fn render_skill_rm(report: &DeleteReport, dry_run: bool) -> String {
                 .join(", ")
         )
     );
-    // 四种收场各说各话。干跑里 `archived` 读作「将归档到哪」(目录,不是
-    // 编造的包名),`None` 则说明这一批全是软链副本——它们只 unlink、没有
-    // 自己的内容可归档,笼统说「会归档」就是假话。
-    match (&report.archived, dry_run) {
-        (Some(dir), true) => out.push_str(&format!(
-            "  {} {}\n",
-            muted().apply_to("would archive into"),
-            accent().apply_to(display_tilde(dir))
-        )),
-        (Some(archived), false) => out.push_str(&format!(
-            "  {} {}\n",
-            muted().apply_to("archived to"),
-            accent().apply_to(display_tilde(archived))
-        )),
-        (None, true) => out.push_str(&format!(
-            "  {}\n",
-            muted().apply_to(
-                "nothing to archive — a symlink copy is only unlinked, its target is left alone"
-            )
-        )),
-        (None, false) => out.push_str(&format!(
-            "  {}\n",
-            muted().apply_to("no archive was made (--no-archive, or a symlink copy that has nothing of its own)")
-        )),
-    }
+    out.push_str(&format!(
+        "  {}\n",
+        muted().apply_to(if dry_run {
+            "would delete outright — no archive, nothing to restore from"
+        } else {
+            "deleted outright — no archive, nothing to restore from"
+        })
+    ));
     out
 }
 
@@ -2770,26 +2810,26 @@ mod tests {
     }
 
     /// `--archive` / `--no-archive` 是三态输入的两个开关,同时给必须被 clap 挡住:
-    /// "既打包又不打包"没有含义,替用户挑一个才是危险的。
+    /// "既打包又不打包"没有含义,替用户挑一个才是危险的。prune 恒归档,两个
+    /// 旗标只属于 uninstall——prune 再给它们必须直接报错。
     #[test]
     fn archive_与_no_archive_互斥() {
         assert!(
-            Cli::try_parse_from([
-                "duster",
-                "prune",
-                "--older-than",
-                "30d",
-                "--archive",
-                "--no-archive",
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from(["duster", "prune", "--older-than", "30d", "--archive"]).is_ok()
-        );
-        assert!(
             Cli::try_parse_from(["duster", "uninstall", "qoder", "--archive", "--no-archive"])
                 .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["duster", "uninstall", "qoder", "--archive"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["duster", "uninstall", "qoder", "--no-archive"]).is_ok()
+        );
+        // prune 没有这两个旗标:想跳过打包的输入不存在。
+        assert!(
+            Cli::try_parse_from(["duster", "prune", "--older-than", "30d", "--archive"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["duster", "prune", "--older-than", "30d", "--no-archive"]).is_err()
         );
         // 三态收敛:未表态就是未表态,不许默认成任何一边。
         assert_eq!(archive_choice(true, false), Some(true));
@@ -2822,7 +2862,11 @@ mod tests {
     fn 拒绝执行文案映射退出码_4() {
         for msg in [
             "refusing to execute prune in --json mode without --yes",
-            "archive estimate is 900 MiB ... above the 200 MiB auto-archive limit",
+            // prune 的「超阈值拒绝」随旗标撤了(恒归档、只报数);uninstall
+            // 的三态门槛还在,用它的超限文案顶替这条。
+            "352 MB of sessions + memory to pack, above the 200 MiB auto-archive limit. \
+             duster will not decide this for you: pass `--archive` to pack it anyway, \
+             or `--no-archive` to accept losing it",
             "confirmation required: type the agent id verbatim, `--confirm qoder`",
             "uninstall preflight failed (1 of 3 checks); nothing was removed:",
         ] {
@@ -3120,7 +3164,14 @@ mod tests {
 
     /// 一份测试用的副本。install_bytes 由调用方给——「INSTALLED 列该不该
     /// 出现」只取决于它。state 是占位,`group()` 按组级结果统一改写。
-    fn copy(agent: &str, path: &str, bytes: u64, install_bytes: u64) -> SkillCopy {
+    /// `last_used_ms` 由调用方给:None 的那份在 LAST USED 列印 `never`。
+    fn copy(
+        agent: &str,
+        path: &str,
+        bytes: u64,
+        install_bytes: u64,
+        last_used_ms: Option<i64>,
+    ) -> SkillCopy {
         SkillCopy {
             agent_id: agent.into(),
             path: PathBuf::from(path),
@@ -3129,6 +3180,7 @@ mod tests {
             tree_hash: "abc".into(),
             bytes,
             install_bytes,
+            last_used_ms,
         }
     }
 
@@ -3166,8 +3218,8 @@ mod tests {
         let all_zero = render_skill_groups(&[group(
             "foo",
             vec![
-                copy("claude-code", "/a/foo", 100, 0),
-                copy("codex", "/b/foo", 100, 0),
+                copy("claude-code", "/a/foo", 100, 0, None),
+                copy("codex", "/b/foo", 100, 0, None),
             ],
         )]);
         assert!(!all_zero.contains("INSTALLED"), "{all_zero}");
@@ -3178,12 +3230,36 @@ mod tests {
         let one_nonzero = render_skill_groups(&[group(
             "foo",
             vec![
-                copy("claude-code", "/a/foo", 100, 0),
-                copy("codex", "/b/foo", 100, 4096),
+                copy("claude-code", "/a/foo", 100, 0, None),
+                copy("codex", "/b/foo", 100, 4096, None),
             ],
         )]);
         assert!(one_nonzero.contains("INSTALLED"), "{one_nonzero}");
         assert!(one_nonzero.contains("4 KB"), "{one_nonzero}");
+    }
+
+    /// LAST USED 列恒在 INSTALLED 与 PATH 之间:None 印 `never`(没有时间戳
+    /// 证据,不是「1970 年用过」),有值印相对时间——与 session 列表同一列名
+    /// 同一口径。「哪一份早就不用了」正是删副本时的判据。
+    #[test]
+    fn last_used_列_never_与相对时间() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let out = render_skill_groups(&[group(
+            "foo",
+            vec![
+                copy("claude-code", "/a/foo", 100, 0, None),
+                copy("codex", "/b/foo", 100, 0, Some(now_ms)),
+            ],
+        )]);
+        // 表头顺序:LAST USED 在 PATH 前(PATH 留作吃余量的尾列)。
+        let last_used_at = out.find("LAST USED").expect("LAST USED 列要在: {out}");
+        let path_at = out.find("PATH").expect("PATH 列要在: {out}");
+        assert!(last_used_at < path_at, "{out}");
+        assert!(out.contains("never"), "{out}");
+        assert!(out.contains("just now"), "{out}");
     }
 
     /// 单份组不再被滤掉,表要容得下「一组一行」。状态列印的是 `only copy`,
@@ -3191,7 +3267,7 @@ mod tests {
     /// (名字在整块里只出现一次)。
     #[test]
     fn 单份组渲染成一行且状态是_only_copy() {
-        let out = render_skill_groups(&[group("solo", vec![copy("claude-code", "/a/x", 100, 0)])]);
+        let out = render_skill_groups(&[group("solo", vec![copy("claude-code", "/a/x", 100, 0, None)])]);
         assert!(out.contains("only copy"), "{out}");
         assert!(!out.contains("identical"), "{out}");
         assert_eq!(out.matches("solo").count(), 1, "{out}");
@@ -3202,12 +3278,12 @@ mod tests {
     #[test]
     fn 合计行同时报出总数与装在多处的个数() {
         let out = render_skill_groups(&[
-            group("solo", vec![copy("claude-code", "/a/x", 100, 0)]),
+            group("solo", vec![copy("claude-code", "/a/x", 100, 0, None)]),
             group(
                 "twins",
                 vec![
-                    copy("claude-code", "/a/y", 100, 0),
-                    copy("codex", "/b/y", 100, 0),
+                    copy("claude-code", "/a/y", 100, 0, None),
+                    copy("codex", "/b/y", 100, 0, None),
                 ],
             ),
         ]);
@@ -3471,8 +3547,8 @@ mod tests {
     }
 
     /// `skill rm` 的 CLI 接线:同名两家未指名报错列出候选且一份不删;
-    /// 指名后只删那家;干跑不动盘。核心逻辑的逐字节断言在 duster-core 的
-    /// skill_ops::remove 测试里,这里只钉外壳的接线与退出码。
+    /// 指名后只删那家;干跑不动盘;真删不留归档。核心逻辑的逐字节断言在
+    /// duster-core 的 skill_ops::remove 测试里,这里只钉外壳的接线与退出码。
     #[test]
     fn skill_rm_接线() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3503,14 +3579,13 @@ mod tests {
             "foo",
             None,
             None,
-            true,
             false,
         );
         assert_eq!(code, EXIT_ERROR, "多家未指名必须报错");
         assert!(home.join(".claude/skills/foo").is_dir());
         assert!(home.join(".codex/skills/foo").is_dir());
 
-        // 指名 claude-code:只删那家,codex 分毫不动,归档包出现。
+        // 指名 claude-code:只删那家,codex 分毫不动,真删不留归档。
         let code = cmd_skill_rm(
             OutputMode::Human,
             Some(&index),
@@ -3518,20 +3593,17 @@ mod tests {
             "foo",
             Some("claude-code"),
             None,
-            true,
             false,
         );
         assert_eq!(code, EXIT_OK);
         assert!(!home.join(".claude/skills/foo").exists(), "被点名的那份要删");
         assert!(home.join(".codex/skills/foo").is_dir(), "没点名的那份不动");
-        let archives: Vec<_> = std::fs::read_dir(home.join("agent-duster-exports"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "zst"))
-            .collect();
-        assert_eq!(archives.len(), 1, "真实内容必须先归档: {archives:?}");
+        assert!(
+            !home.join("agent-duster-exports").exists(),
+            "skill rm 真删不留归档,导出目录根本不该存在"
+        );
 
-        // 干跑:不归档、不删。
+        // 干跑:不删,也不会有归档。
         let code = cmd_skill_rm(
             OutputMode::Human,
             Some(&index),
@@ -3540,14 +3612,12 @@ mod tests {
             Some("codex"),
             None,
             true,
-            true,
         );
         assert_eq!(code, EXIT_OK);
         assert!(home.join(".codex/skills/foo").is_dir(), "预览不许删");
-        assert_eq!(
-            std::fs::read_dir(home.join("agent-duster-exports")).unwrap().count(),
-            1,
-            "预览不许新增归档包"
+        assert!(
+            !home.join("agent-duster-exports").exists(),
+            "干跑同样不许写导出目录"
         );
     }
 }

@@ -443,7 +443,48 @@ fn check_home(home: &Path, findings: &mut Vec<Finding>) -> Result<()> {
         "export directory",
         findings,
     );
+    report_exports(&home.join("agent-duster-exports"), findings);
     Ok(())
+}
+
+/// 归档目录现在有几个包、占多少。
+///
+/// duster 按设计不 GC 它、不做 restore、不在任何视图里管理它
+/// （[`duster_fs::archive`] 开头那段）——它归用户。但「不替你清」不等于
+/// 「不告诉你它多大」：删前先归档，本质上就是把内容挪到另一个还得由人来清
+/// 的地方，而一个看不见体量的地方谁也不会去清。doctor 报出来，是这条所有权
+/// 划分成立的前提，也是它没有悄悄长成一个无人管的回收站的唯一证据。
+///
+/// 只数一层：归档目录是平的（`<label>-<ts>.tar.zst` 和导出的 `.md`），
+/// 不递归就够，也不会因为用户往里塞了别的目录而把 doctor 拖慢。
+fn report_exports(dir: &Path, findings: &mut Vec<Finding>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let (mut files, mut bytes) = (0u64, 0u64);
+    for e in entries.flatten() {
+        if let Ok(m) = e.metadata()
+            && m.is_file()
+        {
+            files += 1;
+            bytes += m.len();
+        }
+    }
+    if files == 0 {
+        return;
+    }
+    findings.push(finding(
+        CHECK_HOME,
+        Severity::Info,
+        dir.display().to_string(),
+        format!(
+            "{files} archive(s), {} — what rm / prune / uninstall packed before deleting. \
+             It belongs to you: duster never deletes anything in here, so it only ever grows. \
+             `tar -xf` restores; delete the ones you no longer want",
+            crate::plan::human_bytes(bytes)
+        ),
+        None,
+    ));
 }
 
 /// 一个 duster 迟早要往里写东西的目录，现在写不写得进去。
@@ -1396,6 +1437,48 @@ mod tests {
         let fix = f.fix.as_deref().expect("要给修法");
         assert!(fix.starts_with("chmod u+w "), "{fix}");
         assert!(fix.contains(&state.display().to_string()), "{fix}");
+    }
+
+    /// 归档目录攒了包就必须报出来。
+    ///
+    /// 「删前先归档」在磁盘上就是把内容挪去另一个还得由人来清的地方，而
+    /// duster 按设计永不清它。那么它至少要**看得见**：一个连体量都不报的
+    /// 目录，谁也不会去清，它就真长成一个无人管的回收站了。这条测试防的
+    /// 就是有人日后把这段报告当噪声删掉。
+    #[test]
+    fn 自检_归档目录攒了包要报出体量() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exports = tmp.path().join("agent-duster-exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        std::fs::write(exports.join("skill-rm-20260817.tar.zst"), vec![0u8; 2048]).unwrap();
+        std::fs::write(exports.join("claude-s1.md"), vec![0u8; 1024]).unwrap();
+
+        let r = self_check(Some(&tmp.path().join(".agent-duster/index.db"))).unwrap();
+
+        let f = r
+            .findings
+            .iter()
+            .find(|f| f.check == CHECK_HOME && f.subject == exports.display().to_string())
+            .expect("归档目录非空就要有一条");
+        assert_eq!(f.severity, Severity::Info, "它不是毛病，是一笔账");
+        assert!(f.detail.contains("2 archive"), "{}", f.detail);
+        assert!(f.detail.contains("3.0 KB"), "{}", f.detail);
+        assert!(f.detail.contains("only ever grows"), "{}", f.detail);
+    }
+
+    /// 空目录 / 不存在时不报——「还没归档过」不是一笔账，报它是噪声。
+    #[test]
+    fn 自检_归档目录为空时不报() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("agent-duster-exports")).unwrap();
+
+        let r = self_check(Some(&tmp.path().join(".agent-duster/index.db"))).unwrap();
+
+        assert!(
+            !r.findings.iter().any(|f| f.detail.contains("archive(s)")),
+            "{:?}",
+            r.findings
+        );
     }
 
     /// version 这一项**恒有输出**。一份「什么都没发现」的自检报告与
